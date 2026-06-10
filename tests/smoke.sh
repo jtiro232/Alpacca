@@ -49,8 +49,9 @@ printf 'test license — MIT' > "$tmp/srv/license.txt"
 
 "$python" "$repo_root/tests/mock_registry.py" "$tmp/srv" "$tmp/port" &
 server_pid=$!
-for _ in $(seq 1 50); do
+for _ in $(seq 1 300); do   # slow CI runners can take a while to start python
     [ -s "$tmp/port" ] && break
+    kill -0 "$server_pid" 2>/dev/null || { echo "FAIL mock registry died on startup"; exit 1; }
     sleep 0.1
 done
 port=$(cat "$tmp/port")

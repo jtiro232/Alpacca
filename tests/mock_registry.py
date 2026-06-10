@@ -16,9 +16,20 @@ Binds 127.0.0.1 on a free port and writes the port number to <port_file>.
 import hashlib
 import json
 import re
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+class QuickBindServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind calls socket.getfqdn(), which can stall for
+    seconds on macOS CI runners (reverse-DNS). Skip it."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 SERVE_DIR = Path(sys.argv[1])
 
@@ -102,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = QuickBindServer(("127.0.0.1", 0), Handler)
     Path(sys.argv[2]).write_text(str(server.server_address[1]))
     server.serve_forever()
 
