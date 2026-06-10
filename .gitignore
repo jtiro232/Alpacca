@@ -1,12 +1,16 @@
-# build trees
+# python
+__pycache__/
+*.pyc
+*.egg-info/
 build/
-build-*/
-cmake-build-*/
+dist/
+.venv/
 
 # editors
 .vscode/
 .idea/
 *.swp
 
-# local model downloads (never commit weights)
+# local test artifacts and model downloads (never commit weights)
+.smoke-home/
 *.gguf

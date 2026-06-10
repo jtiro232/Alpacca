@@ -1,8 +1,8 @@
 name: release
 
-# Tag a version (e.g. v0.1.0) to build portable CPU binaries for the three
-# platforms and attach them to a GitHub release. GPU builds are best done
-# on the target machine via the installers (scripts/install.sh|ps1).
+# Tag a version (e.g. v0.2.0) to attach a source archive with SHA-256
+# checksums to a GitHub release. Alpacca is pure Python — the archive IS
+# the program; no build step, no binaries, fully offline install.
 on:
   push:
     tags: ["v*"]
@@ -11,41 +11,21 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: alpacca-linux-x64
-          - os: macos-latest
-            name: alpacca-macos-arm64
-          - os: windows-latest
-            name: alpacca-windows-x64
-    runs-on: ${{ matrix.os }}
+  release:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Fetch pinned llama.cpp (shallow)
-        run: git submodule update --init --depth 1
-
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
-        shell: bash
-
-      - name: Build
-        run: cmake --build build --config Release --parallel 4
-        shell: bash
-
-      - name: Package
+      - name: Package source archive
         run: |
-          mkdir -p dist/${{ matrix.name }}
-          cp build/bin/* dist/${{ matrix.name }}/
-          cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/${{ matrix.name }}/
-          cd dist && 7z a ../${{ matrix.name }}.zip ${{ matrix.name }}
-        shell: bash
+          name="alpacca-${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" "$GITHUB_REF_NAME"
+          sha256sum "$name.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.name }}.zip
+          files: |
+            alpacca-*.tar.gz
+            SHA256SUMS

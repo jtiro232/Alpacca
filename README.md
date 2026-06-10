@@ -1,197 +1,140 @@
 # Alpacca 🦙
 
-**llama.cpp in your terminal, with Ollama-style model management — and zero
-overhead on inference.**
+**LLMs in your terminal — a from-scratch, 100% Python inference engine for
+GGUF models, with Ollama-style model management. Zero dependencies.**
 
-Alpacca is a terminal LLM tool built directly on
-[llama.cpp](https://github.com/ggml-org/llama.cpp). It gives you the
-conveniences people love from [Ollama](https://github.com/ollama/ollama) —
-`pull` a model by name, `run` it, `list` what you have, auto-download on
-first use — while inference itself is the stock llama.cpp binaries,
-untouched and at full speed.
+Alpacca is not a wrapper around llama.cpp, PyTorch, or anything else. The
+entire stack is implemented in this repository, in Python, on the standard
+library alone:
+
+| Layer | Where | What's implemented |
+| --- | --- | --- |
+| GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
+| Quantization | `alpacca/quants.py` | F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
+| Tokenizers | `alpacca/tokenizer.py` | SentencePiece-style (Viterbi + byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
+| Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache |
+| Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
+| Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, interactive REPL |
+| API server | `alpacca/serve.py` | OpenAI-compatible `/v1/chat/completions` (incl. SSE streaming) on `http.server` |
+| Model manager | `alpacca/store.py`, `alpacca/pull.py` | Ollama-registry protocol + Hugging Face pulls via `urllib`, resumable, SHA-256 verified |
+
+If NumPy happens to be installed it is auto-detected and used as a math
+accelerator (10–100× faster); without it everything still runs, just slowly.
+Set `ALPACCA_PURE=1` to force the stdlib path. Both backends produce
+identical results and verify each other in CI.
 
 ```text
-$ alpacca pull llama3.2:1b           # straight from the Ollama registry
-$ alpacca run llama3.2:1b            # interactive chat
+$ alpacca pull llama3.2:1b            # straight from the Ollama registry
+$ alpacca run llama3.2:1b             # interactive chat
 $ alpacca run llama3.2:1b "why is the sky blue?"
-$ alpacca serve llama3.2:1b          # OpenAI-compatible API on :8080
+$ alpacca serve llama3.2:1b           # OpenAI-compatible API on :8080
 ```
 
-## How it stays fast
+## Install — offline by design
 
-Alpacca never sits between you and the model. The `alpacca` binary resolves
-the model name, builds the right command line, then **execs the real
-llama.cpp binary** (`llama-cli`, `llama-server`, …) — the wrapper process is
-*replaced*, so by the time tokens flow there is nothing of Alpacca left in
-the process. Model management (downloads, manifests, integrity checks)
-happens strictly before inference starts.
-
-```text
-alpacca run llama3.2:1b
-   │  resolve name → ~/.alpacca/models/…/model.gguf   (alpacca)
-   │  map saved params → llama.cpp flags              (alpacca)
-   └─ exec llama-cli -m model.gguf …                  (100% stock llama.cpp)
-```
-
-The llama.cpp sources are vendored **unmodified** as a git submodule pinned
-to an upstream release tag, so every upstream capability and optimization is
-here: CPU (AVX/NEON), CUDA, Metal, Vulkan, ROCm/HIP, quantization,
-speculative decoding, multimodal, the full tool suite.
-
-## Install
-
-After installing, open a **new** terminal and just type `alpacca`.
-
-**Linux / macOS** — one-liner (or run `scripts/install.sh` from a clone):
+There is nothing to compile and nothing to download beyond this repository
+itself. Get the code (git clone, or a release tarball verified against its
+published SHA-256), then either:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jtiro232/Alpacca/main/scripts/install.sh | sh
+# 1. no install at all:
+python3 -m alpacca doctor
+
+# 2. or put an `alpacca` launcher on your PATH (offline, creates one file):
+scripts/install.sh          # Linux/macOS   (PREFIX=... to relocate)
+.\scripts\install.ps1     # Windows PowerShell
 ```
 
-Requirements: git, CMake ≥ 3.14, a C++17 compiler (`apt install build-essential
-cmake git` / `xcode-select --install`). Installs to `~/.local/bin` (override
-with `PREFIX=`) and adds it to your PATH (opt out with `NO_MODIFY_PATH=1`).
-
-**Windows (PowerShell)** — one-liner (or run `scripts\install.ps1` from a clone):
-
-```powershell
-irm https://raw.githubusercontent.com/jtiro232/Alpacca/main/scripts/install.ps1 | iex
-```
-
-One-time requirements: `winget install Git.Git Kitware.CMake` and the
-Visual Studio 2022 Build Tools with the C++ workload. Installs to
-`%LOCALAPPDATA%\Alpacca\bin` and adds it to your user PATH.
-
-**By hand:**
-
-```sh
-git clone https://github.com/jtiro232/Alpacca && cd Alpacca
-git submodule update --init --depth 1
-cmake -B build && cmake --build build --parallel
-build/bin/alpacca doctor
-```
-
-GPU backends are llama.cpp's own — pass the flags straight through:
-
-```sh
-CMAKE_FLAGS="-DGGML_CUDA=ON"   scripts/install.sh   # NVIDIA
-CMAKE_FLAGS="-DGGML_VULKAN=ON" scripts/install.sh   # Vulkan (AMD/Intel/NVIDIA)
-# Metal is on by default on Apple Silicon; same flags work with install.ps1
-```
+Requires Python ≥ 3.10. Optional: `pip install numpy` for fast generation —
+that is the only thing that would ever touch a package index, it's off by
+default, and Alpacca works without it. `pip install .` also works if you
+prefer a normal Python install.
 
 ## Getting models
 
-Models live in `~/.alpacca/models` (override with `$ALPACCA_HOME`). Three
-ways to reference a model:
+Models live in `~/.alpacca/models` (override: `$ALPACCA_HOME`). Reference
+them three ways:
 
-| Reference                        | Source                                  |
-| -------------------------------- | --------------------------------------- |
-| `llama3.2:1b`, `qwen3:4b`        | Ollama registry (`registry.ollama.ai`)  |
-| `ollama:user/model:tag`          | Ollama registry, user namespace         |
-| `hf:org/repo` or `org/repo`      | Hugging Face — picks the best GGUF quant |
-| `hf:org/repo:Q5_K_M`             | Hugging Face — specific quant or file    |
-| `./path/to/model.gguf`           | any local GGUF file                      |
+| Reference | Source |
+| --- | --- |
+| `llama3.2:1b`, `qwen2.5:0.5b` | Ollama registry (`registry.ollama.ai`) |
+| `ollama:user/model:tag` | Ollama registry, user namespace |
+| `hf:org/repo` or `org/repo` | Hugging Face — picks the best GGUF quant |
+| `hf:org/repo:Q4_K_M` (or a filename) | Hugging Face — specific quant/file |
+| `./path/to/model.gguf` | any local GGUF |
+
+`alpacca pull` speaks the Ollama registry protocol directly (manifest +
+content-addressed layers — weights, parameters, system prompt, license) and
+the Hugging Face API (quant selection, `-GGUF` sibling-repo fallback,
+`HF_TOKEN` for gated repos). Downloads resume after interruption and are
+verified against the publisher's SHA-256 digests. `alpacca run` auto-pulls
+on first use.
 
 ```sh
-alpacca pull llama3.2:1b                         # Ollama library model
-alpacca pull hf:ggml-org/gemma-3-4b-it-GGUF      # best quant from HF
-alpacca pull hf:bartowski/Qwen2.5-7B-Instruct-GGUF:Q5_K_M
 alpacca list
-alpacca show llama3.2:1b
+alpacca show llama3.2:1b --metadata
 alpacca rm llama3.2:1b
+alpacca tokenize -m llama3.2:1b -p "hello world"
 ```
-
-Downloads resume if interrupted and are verified against the publisher's
-SHA-256 digests. Gated Hugging Face repos work with `HF_TOKEN` set.
-Multi-part (split) GGUFs and multimodal projector files (`mmproj`) are
-detected and handled automatically. `alpacca run` auto-pulls a model that
-isn't installed yet — just like Ollama.
 
 ## Running models
 
 ```sh
-alpacca run llama3.2:1b                          # interactive chat
-alpacca run llama3.2:1b "summarize: ..."         # one-shot, then exit
-alpacca run llama3.2:1b --temp 0.2 -c 8192       # any llama.cpp flag works
-alpacca run ./local-model.gguf
+alpacca run llama3.2:1b                          # interactive (/exit, /clear)
+alpacca run llama3.2:1b "one-shot question"      # answers and exits
+alpacca run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
+alpacca serve llama3.2:1b --port 8080
 ```
 
-Everything after the model name (and optional prompt) is passed verbatim to
-`llama-cli`, so the *entire* llama.cpp option surface is available. Saved
-model parameters (temperature, context size, stop sequences, system prompt —
-e.g. from an Ollama-published model) are applied as defaults; your flags win.
+The server is OpenAI-compatible — point any OpenAI client at
+`http://127.0.0.1:8080/v1` (chat completions, streaming included), or use
+the llama.cpp-style `POST /completion`.
 
-### Serving an API
+Supported architectures: llama (1/2/3, TinyLlama, Mistral-family), qwen2/3,
+stablelm, gemma. Chat templates are detected from the model's metadata.
 
-```sh
-alpacca serve llama3.2:1b                 # OpenAI-compatible, 127.0.0.1:8080
-alpacca serve llama3.2:1b --port 11434 --api-key secret
-```
+### Honest performance expectations
 
-`alpacca serve` execs `llama-server` — chat completions, embeddings,
-parallel requests, continuous batching, all upstream features.
+This engine values clarity, auditability, and zero dependencies over raw
+speed. Weights are held in float32. Rules of thumb:
 
-### The whole llama.cpp toolbox
+- **with NumPy**: 1B-class models chat comfortably; 7–8B models work but
+  need ~35 GB RAM and patience.
+- **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow.
+  Good for air-gapped checks, not long conversations.
 
-Any other subcommand is dispatched to the matching `llama-*` tool, with
-model names resolved for `-m`:
-
-```sh
-alpacca bench -m llama3.2:1b              # llama-bench
-alpacca quantize in.gguf out.gguf Q4_K_M  # llama-quantize
-alpacca tokenize -m llama3.2:1b -p "hi"   # llama-tokenize
-alpacca perplexity -m llama3.2:1b -f txt  # llama-perplexity
-alpacca cli --help                        # raw llama-cli
-alpacca server --help                     # raw llama-server
-```
-
-## Environment
-
-| Variable                 | Meaning                                        |
-| ------------------------ | ---------------------------------------------- |
-| `ALPACCA_HOME`           | data dir (default `~/.alpacca`)                |
-| `ALPACCA_HOST` / `ALPACCA_PORT` | defaults for `alpacca serve`            |
-| `ALPACCA_LLAMA_BIN_DIR`  | where to find `llama-*` binaries               |
-| `HF_TOKEN`               | Hugging Face token for gated repos             |
-| `ALPACCA_OLLAMA_REGISTRY`| alternate Ollama-compatible registry           |
-| `ALPACCA_HF_ENDPOINT`    | alternate Hugging Face endpoint (mirrors)      |
+If you need llama.cpp-class speed, you need llama.cpp-class native kernels —
+that's a different project (and an explicit non-goal here).
 
 ## Testing
 
 ```sh
-tests/smoke.sh               # offline: mock registry + tiny GGUF, full
-                             # pull/list/show/run/rm cycle (CI runs this on
-                             # Linux, macOS and Windows)
-tests/hermes_acceptance.sh   # real 8B model from Hugging Face, headless
-                             # one-shot factual question (needs network,
-                             # ~5 GB disk, ~6 GB RAM)
+python3 tests/smoke.py            # offline: 29 checks — mock registry pulls,
+                                  # real inference, API server, store mgmt
+python3 tests/real_model_test.py  # downloads a 19 MB real model (network),
+                                  # asserts it generates coherent English
+python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
+                                  # birthday; --model ... for bigger models
 ```
 
-## Updating llama.cpp
+CI runs the offline suite on Linux/macOS/Windows, with and without NumPy,
+plus the real-model gate.
 
-The submodule is pinned to a release tag for reproducible builds. To move
-to a newer upstream release:
+## Security & supply chain
 
-```sh
-cd vendor/llama.cpp
-git fetch --depth 1 origin tag b<NEW>     # pick a tag from upstream releases
-git checkout b<NEW>
-cd ../.. && cmake --build build --parallel
-git add vendor/llama.cpp && git commit -m "bump llama.cpp to b<NEW>"
-```
+- **No install-time network access**: the repo is the program. No package
+  index, no build step, no binary artifacts, no submodules.
+- Release archives ship with SHA-256 checksums.
+- Model downloads (`alpacca pull`) are the only network feature, are
+  explicit, and verify the publisher's digests. Models carry their own
+  licenses — when the publisher provides one, it is stored next to the
+  weights.
 
 ## Credits & licensing
 
-Alpacca is MIT licensed (see [LICENSE](LICENSE)) and is built **totally
-free and proper** on:
-
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT, © The ggml
-  authors) — vendored unmodified; it does all the actual inference. Thank
-  you, ggml community.
-- **[Ollama](https://github.com/ollama/ollama)** (MIT) — inspiration for
-  the model-management UX, and Alpacca speaks its public registry protocol
-  (independent implementation, no Ollama code included).
-
-Details in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Model weights
-you download have their own licenses — `alpacca show <model>` keeps the
-publisher's license text next to the weights.
+Alpacca is MIT licensed (see [LICENSE](LICENSE)). All code here is written
+from scratch in Python. It interoperates with formats and protocols designed
+by others, with thanks — see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md): the GGUF format and
+quantization schemes (ggml/llama.cpp project), the Ollama registry protocol,
+and the SentencePiece/BPE tokenization algorithms.

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpacca"
+version = "0.2.0"
+description = "LLMs in your terminal — a from-scratch, pure-Python GGUF inference engine with Ollama-style model management"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# Intentionally empty: alpacca runs on the standard library alone.
+# NumPy, if installed, is auto-detected and used as an accelerator.
+dependencies = []
+
+[project.optional-dependencies]
+fast = ["numpy"]
+
+[project.scripts]
+alpacca = "alpacca.cli:main"
+
+[tool.setuptools]
+packages = ["alpacca"]

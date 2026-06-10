@@ -1,34 +1,48 @@
 # Third-party notices
 
-Alpacca stands on the shoulders of excellent free software. This file
-records what we use and on what terms — everything here is properly
-licensed for this use, free of charge.
+Alpacca contains **no third-party code**: every module in `alpacca/` is an
+original Python implementation, and the runtime depends only on the Python
+standard library (NumPy is an optional, auto-detected accelerator and is
+never required or fetched).
 
-## llama.cpp (vendored, unmodified)
+It does, however, *interoperate* with file formats, protocols and
+algorithms designed by others. Credit where it's due:
 
-- What: all model loading and inference — `llama-cli`, `llama-server`,
-  `llama-quantize` and the other tools Alpacca drives.
-- Where: `vendor/llama.cpp` (git submodule pinned to an upstream release
-  tag; the code is not modified).
-- Upstream: <https://github.com/ggml-org/llama.cpp>
-- License: MIT — Copyright (c) 2023-2024 The ggml authors. The full
-  license text ships with the submodule at `vendor/llama.cpp/LICENSE`.
+## GGUF format & quantization schemes
 
-## Ollama (ideas and protocol, no code)
+`alpacca/gguf.py` and `alpacca/quants.py` implement, from the published
+specification and format documentation, the GGUF model file format and its
+quantization block formats (Q4_0 … Q6_K). GGUF and these schemes were
+designed by the **ggml / llama.cpp project** (MIT, © The ggml authors,
+<https://github.com/ggml-org/llama.cpp>). No ggml or llama.cpp source code
+is included or linked.
 
-- What: Alpacca's model-management UX (`pull` / `run` / `list` / `rm`,
-  `name:tag` references, auto-pull on first run) is modeled on Ollama, and
-  `alpacca pull` speaks the public Ollama registry protocol
-  (`registry.ollama.ai`) so Ollama-published models work here. The
-  client in `src/pull.cpp` is an independent implementation; no Ollama
-  source code is included in this repository.
-- Upstream: <https://github.com/ollama/ollama>
-- License: MIT — Copyright (c) Ollama Inc.
+## Ollama registry protocol
+
+`alpacca/pull.py` speaks the public model-distribution protocol of
+**Ollama** (MIT, © Ollama Inc., <https://github.com/ollama/ollama>) —
+OCI-style manifests with content-addressed layers served from
+`registry.ollama.ai` — and Alpacca's model-management UX (`pull` / `run` /
+`list` / `rm`, `name:tag` references) is openly inspired by Ollama's. The
+client is an independent implementation; no Ollama source code is included.
+
+## Tokenization algorithms
+
+`alpacca/tokenizer.py` implements the SentencePiece-style subword
+segmentation used by llama-family models (Kudo & Richardson, 2018) and
+byte-level BPE with a GPT-2 style pre-tokenizer (Radford et al., 2019;
+extended by Llama 3). These are published algorithms; the implementations
+here are original.
+
+## Hugging Face Hub API
+
+`alpacca/pull.py` uses Hugging Face's public HTTP API
+(<https://huggingface.co>) to list and download community-hosted GGUF
+files. No Hugging Face libraries are included.
 
 ## Models
 
-Model weights are not part of Alpacca. Each model you `alpacca pull`
-carries its own license from its publisher; when a model ships a license
-file, Alpacca stores it next to the weights (`license.txt`, see
-`alpacca show <model>`) — review it before redistribution or commercial
-use.
+Model weights are not part of Alpacca. Every model you `alpacca pull`
+carries its publisher's own license; when the source provides a license
+file, Alpacca stores it next to the weights (see `alpacca show <model>`).
+Review it before redistribution or commercial use.
