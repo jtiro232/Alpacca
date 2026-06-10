@@ -1,0 +1,31 @@
+name: release
+
+# Tag a version (e.g. v0.2.0) to attach a source archive with SHA-256
+# checksums to a GitHub release. Alpacca is pure Python — the archive IS
+# the program; no build step, no binaries, fully offline install.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Package source archive
+        run: |
+          name="alpacca-${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" "$GITHUB_REF_NAME"
+          sha256sum "$name.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            alpacca-*.tar.gz
+            SHA256SUMS

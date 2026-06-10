@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  PYTHONUTF8: "1"   # Windows runners default to cp1252 pipes
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.os }}, ${{ matrix.deps }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deps: [stdlib, numpy]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install NumPy (accelerated variant only)
+        if: matrix.deps == 'numpy'
+        run: python -m pip install numpy
+
+      - name: Offline smoke suite (mock registry + tiny models)
+        run: python tests/smoke.py
+
+  real-model:
+    # True correctness gate: real trained weights through the whole engine.
+    name: real model (stories15M from Hugging Face)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install numpy
+
+      - name: Pull and generate
+        run: python tests/real_model_test.py
