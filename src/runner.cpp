@@ -301,6 +301,7 @@ int cmd_doctor() {
 
 int cmd_version() {
     printf("alpacca %s\n", ALPACCA_VERSION);
+    fflush(stdout); // keep ordering ahead of llama-cli's stderr output
     std::string cli = find_llama_tool("llama-cli");
     if (!cli.empty()) {
         std::vector<std::string> v = { cli, "--version" };
