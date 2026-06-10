@@ -213,6 +213,14 @@ def _add_model_flags(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to legacy code pages (cp1252); model output
+    # is arbitrary UTF-8 and must never crash the CLI.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     ap = argparse.ArgumentParser(
         prog="alpacca",
         description="alpacca — LLMs in your terminal, implemented in pure Python",

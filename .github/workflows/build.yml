@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+env:
+  PYTHONUTF8: "1"   # Windows runners default to cp1252 pipes
+
 jobs:
   smoke:
     name: smoke (${{ matrix.os }}, ${{ matrix.deps }})
