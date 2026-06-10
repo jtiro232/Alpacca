@@ -13,15 +13,19 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Fetch pinned llama.cpp (shallow)
         run: git submodule update --init --depth 1
 
       - name: Install gguf-py for the tiny test model
         run: |
-          pip3 install numpy
-          pip3 install --no-deps ./vendor/llama.cpp/gguf-py
+          python -m pip install numpy
+          python -m pip install --no-deps ./vendor/llama.cpp/gguf-py
         shell: bash
 
       - name: Configure
