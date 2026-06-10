@@ -1,0 +1,51 @@
+name: release
+
+# Tag a version (e.g. v0.1.0) to build portable CPU binaries for the three
+# platforms and attach them to a GitHub release. GPU builds are best done
+# on the target machine via the installers (scripts/install.sh|ps1).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: alpacca-linux-x64
+          - os: macos-latest
+            name: alpacca-macos-arm64
+          - os: windows-latest
+            name: alpacca-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned llama.cpp (shallow)
+        run: git submodule update --init --depth 1
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+        shell: bash
+
+      - name: Package
+        run: |
+          mkdir -p dist/${{ matrix.name }}
+          cp build/bin/* dist/${{ matrix.name }}/
+          cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/${{ matrix.name }}/
+          cd dist && 7z a ../${{ matrix.name }}.zip ${{ matrix.name }}
+        shell: bash
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.name }}.zip
