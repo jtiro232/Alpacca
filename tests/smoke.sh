@@ -12,7 +12,7 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 bin_dir=${1:-"$repo_root/build/bin"}
 alpacca="$bin_dir/alpacca"
 [ -x "$alpacca.exe" ] && alpacca="$alpacca.exe"   # Windows (git-bash)
-python=$(command -v python3 || command -v python)
+python=${PYTHON:-$(command -v python3 || command -v python)}
 
 [ -x "$alpacca" ] || { echo "FAIL: $alpacca not built"; exit 1; }
 

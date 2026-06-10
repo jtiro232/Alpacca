@@ -4,7 +4,8 @@
 The output loads and generates (gibberish) with llama.cpp, which is all the
 smoke test needs. Requires the vendored gguf-py:
 
-    pip install numpy && pip install --no-deps ./vendor/llama.cpp/gguf-py
+    pip install numpy pyyaml tqdm
+    pip install --no-deps ./vendor/llama.cpp/gguf-py
     python3 tests/make_tiny_model.py /tmp/tiny.gguf
 """
 import sys

@@ -24,7 +24,7 @@ jobs:
 
       - name: Install gguf-py for the tiny test model
         run: |
-          python -m pip install numpy
+          python -m pip install numpy pyyaml tqdm
           python -m pip install --no-deps ./vendor/llama.cpp/gguf-py
         shell: bash
 
