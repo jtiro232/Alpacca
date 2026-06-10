@@ -3,7 +3,7 @@
 
 Downloads TinyLlama-stories (stories15M, ~19 MB Q4_0 GGUF) through
 alpacca's own Hugging Face pull path, then runs greedy generation with the
-alpacca engine and checks the output is coherent English — which exercises
+alpacca engine and checks the output is coherent English - which exercises
 the GGUF parser, Q4_0 dequantizer, SPM tokenizer, transformer and sampler
 against weights trained by someone else.
 

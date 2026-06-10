@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alpacca"
 version = "0.2.0"
-description = "LLMs in your terminal — a from-scratch, pure-Python GGUF inference engine with Ollama-style model management"
+description = "LLMs in your terminal - a from-scratch, pure-Python GGUF inference engine with Ollama-style model management"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

@@ -1,4 +1,4 @@
-# Alpacca installer (Windows / PowerShell) — fully offline once the repo
+# Alpacca installer (Windows / PowerShell) - fully offline once the repo
 # is on disk. Alpacca is pure Python with zero dependencies, so installing
 # just means creating an `alpacca` launcher on your user PATH that runs
 # this checkout. Nothing is downloaded or compiled.

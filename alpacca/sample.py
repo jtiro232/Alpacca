@@ -1,4 +1,4 @@
-# Alpacca — token sampling: greedy, temperature, top-k, top-p, repeat
+# Alpacca - token sampling: greedy, temperature, top-k, top-p, repeat
 # penalty. Deterministic for a given seed. MIT License. See LICENSE.
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class SamplerParams:
     top_p: float = 0.95
     repeat_penalty: float = 1.1
     repeat_last_n: int = 64
-    seed: int = -1  # -1 → random
+    seed: int = -1  # -1 -> random
 
 
 @dataclass

@@ -1,4 +1,4 @@
-# Alpacca — the transformer, implemented from scratch in Python.
+# Alpacca - the transformer, implemented from scratch in Python.
 # Llama-class decoder: RMSNorm, rotary embeddings, grouped-query attention,
 # SwiGLU MLP, KV cache. Runs on NumPy when available, pure Python otherwise.
 # MIT License. See LICENSE.
@@ -70,7 +70,7 @@ class Model:
             if int(gf.get("split.count", 1) or 1) > 1:
                 raise ValueError(
                     "multi-part (split) GGUFs are not supported by the python "
-                    "engine yet — pick a single-file quantization")
+                    "engine yet - pick a single-file quantization")
             arch = gf.architecture
             if arch not in SUPPORTED_ARCHES:
                 raise ValueError(

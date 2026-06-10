@@ -1,4 +1,4 @@
-# Alpacca — GGUF file reader/writer, implemented from the format spec.
+# Alpacca - GGUF file reader/writer, implemented from the format spec.
 # (GGUF is the model file format defined by the ggml project; this is an
 # independent pure-Python implementation, no ggml code involved.)
 # MIT License. See LICENSE.

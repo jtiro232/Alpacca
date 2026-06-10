@@ -1,4 +1,4 @@
-# Alpacca — chat formatting and generation loops.
+# Alpacca - chat formatting and generation loops.
 # MIT License. See LICENSE.
 from __future__ import annotations
 
@@ -141,13 +141,16 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
              ) -> GenerationResult:
     """Generate until EOG / n_predict / a stop string. `stream` is an
     optional callable receiving text fragments as they decode."""
+    if not prompt_ids:
+        if model.tok.bos_id < 0:
+            raise ValueError("prompt produced no tokens and the tokenizer has no BOS token")
+        prompt_ids = [model.tok.bos_id]
     sampler = Sampler(params)
     for t in prompt_ids:
         sampler.accept(t)
     logits = model.prefill(prompt_ids)
 
     dec = StreamDecoder(model.tok)
-    pieces: list[str] = []
     emitted = 0
     n_tokens = 0
     t0 = time.time()
@@ -189,7 +192,7 @@ def chat_once(model: Model, messages: list[dict], params: SamplerParams,
 def interactive(model: Model, params: SamplerParams, system: str = "",
                 n_predict: int = -1) -> None:
     fmt = ChatFormat(model, detect_format(model.metadata))
-    print(f"alpacca chat — {model.describe()}", file=sys.stderr)
+    print(f"alpacca chat - {model.describe()}", file=sys.stderr)
     print("type /exit to quit, /clear to reset the conversation\n", file=sys.stderr)
     messages: list[dict] = []
     if system:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Create a tiny random-weight llama-architecture GGUF using Alpacca's own
-GGUF writer — no third-party packages needed.
+GGUF writer - no third-party packages needed.
 
 The model is gibberish but loads and generates, which is what the tests
 need. usage: python3 tests/make_tiny_model.py out.gguf [dtype]
-(dtype: F32 (default), F16, Q8_0 or Q4_0 — quantized variants exercise the
+(dtype: F32 (default), F16, Q8_0 or Q4_0 - quantized variants exercise the
 dequantizers.)
 """
 from __future__ import annotations
@@ -43,12 +43,12 @@ def main(path: str, dtype: str = "F32") -> None:
     for b in range(256):
         add(f"<0x{b:02X}>", -1000.0, 6)
     # a tiny "vocabulary" so the SPM tokenizer has real pieces to work with
-    words = ["▁the", "▁a", "▁and", "▁to", "▁of", "▁in", "▁is", "▁it",
-             "▁hello", "▁world", "▁test", "▁ok", "he", "llo", "wor", "ld",
-             "ing", "ed", "er", "es", "▁s", "▁b", "an", "at", "on", "or",
-             "▁c", "▁d", "▁f", "▁g", "▁h", "▁l", "▁m", "▁n", "▁p", "▁r",
-             "▁t", "▁w", "th", "en", "re", "nd", "st", "ar", "ou", "le",
-             "▁I", "▁you"]
+    words = ["\u2581the", "\u2581a", "\u2581and", "\u2581to", "\u2581of", "\u2581in", "\u2581is", "\u2581it",
+             "\u2581hello", "\u2581world", "\u2581test", "\u2581ok", "he", "llo", "wor", "ld",
+             "ing", "ed", "er", "es", "\u2581s", "\u2581b", "an", "at", "on", "or",
+             "\u2581c", "\u2581d", "\u2581f", "\u2581g", "\u2581h", "\u2581l", "\u2581m", "\u2581n", "\u2581p", "\u2581r",
+             "\u2581t", "\u2581w", "th", "en", "re", "nd", "st", "ar", "ou", "le",
+             "\u2581I", "\u2581you"]
     for i, w in enumerate(words[:N_EXTRA]):
         add(w, -float(i + 1), 1)
 
@@ -80,7 +80,7 @@ def main(path: str, dtype: str = "F32") -> None:
     def ones(n: int) -> list[float]:
         return [1.0] * n
 
-    # note: GGUF shape order is (cols, rows) — shape[0] is the input dim
+    # note: GGUF shape order is (cols, rows) - shape[0] is the input dim
     w.add_tensor("token_embd.weight", (N_EMBD, n_vocab), rand(n_vocab * N_EMBD), dtype)
     for i in range(N_LAYER):
         p = f"blk.{i}."

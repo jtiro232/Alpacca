@@ -1,4 +1,4 @@
-# Alpacca — OpenAI-compatible HTTP API on the standard library only.
+# Alpacca - OpenAI-compatible HTTP API on the standard library only.
 # Endpoints: /health, /v1/models, /v1/chat/completions (incl. streaming),
 # and a llama.cpp-style /completion. MIT License. See LICENSE.
 from __future__ import annotations
@@ -25,14 +25,50 @@ class _Server(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
+def _body_value(body: dict, key: str, default):
+    value = body.get(key, default)
+    return default if value is None else value
+
+
+def _float_param(body: dict, key: str, default: float) -> float:
+    try:
+        return float(_body_value(body, key, default))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{key} must be a number") from e
+
+
+def _int_param(body: dict, keys: tuple[str, ...], default: int) -> int:
+    key_used = keys[0]
+    for key in keys:
+        if key in body and body[key] is not None:
+            key_used = key
+            value = body[key]
+            break
+    else:
+        value = default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{key_used} must be an integer") from e
+
+
 def _params_from(body: dict, defaults: SamplerParams) -> SamplerParams:
     return SamplerParams(
-        temperature=float(body.get("temperature", defaults.temperature)),
-        top_k=int(body.get("top_k", defaults.top_k)),
-        top_p=float(body.get("top_p", defaults.top_p)),
-        repeat_penalty=float(body.get("repeat_penalty", defaults.repeat_penalty)),
-        seed=int(body.get("seed", defaults.seed)),
+        temperature=_float_param(body, "temperature", defaults.temperature),
+        top_k=_int_param(body, ("top_k",), defaults.top_k),
+        top_p=_float_param(body, "top_p", defaults.top_p),
+        repeat_penalty=_float_param(body, "repeat_penalty", defaults.repeat_penalty),
+        seed=_int_param(body, ("seed",), defaults.seed),
     )
+
+
+def _stop_from(body: dict) -> list[str]:
+    stop = body.get("stop") or []
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list):
+        return [str(s) for s in stop if s is not None]
+    return []
 
 
 def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 8080,
@@ -79,17 +115,20 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
         def do_POST(self):
             path = self.path.split("?")[0]
             body = self.read_body()
-            if path == "/v1/chat/completions":
-                return self.chat_completions(body)
-            if path == "/completion":
-                return self.completion(body)
-            self.send_json({"error": "not found"}, 404)
+            try:
+                if path == "/v1/chat/completions":
+                    return self.chat_completions(body)
+                if path == "/completion":
+                    return self.completion(body)
+                self.send_json({"error": "not found"}, 404)
+            except (TypeError, ValueError) as e:
+                self.send_json({"error": str(e)}, 400)
 
         def completion(self, body: dict):
             prompt = str(body.get("prompt", ""))
             params = _params_from(body, defaults)
-            n_predict = int(body.get("n_predict", body.get("max_tokens", 256)))
-            stop = body.get("stop") or []
+            n_predict = _int_param(body, ("n_predict", "max_tokens"), 256)
+            stop = _stop_from(body)
             with lock:
                 model.reset()
                 ids = model.tok.encode(prompt)
@@ -106,10 +145,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             if not isinstance(messages, list) or not messages:
                 return self.send_json({"error": "messages required"}, 400)
             params = _params_from(body, defaults)
-            n_predict = int(body.get("max_tokens") or body.get("max_completion_tokens") or 512)
-            stop = body.get("stop") or []
-            if isinstance(stop, str):
-                stop = [stop]
+            n_predict = _int_param(body, ("max_tokens", "max_completion_tokens"), 512)
+            stop = _stop_from(body)
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 

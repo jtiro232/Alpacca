@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alpacca offline smoke test — no network, no third-party packages.
+"""Alpacca offline smoke test - no network, no third-party packages.
 
 Exercises the full cycle against a local mock of the Ollama registry and
 the Hugging Face API, with tiny generated GGUFs: pull -> list -> show ->
@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -68,6 +69,18 @@ def main() -> None:
         toks = pretokenize("Hello there, world! It's 2026...\n  indented")
         check("BPE pretokenizer splits text", "".join(toks) == "Hello there, world! It's 2026...\n  indented",
               str(toks))
+
+        from alpacca.pull import _hf_choose, _hf_collect_parts
+        hf_files = [
+            {"path": "toy-Q4_K_M-00001-of-00002.gguf", "size": 1, "sha256": ""},
+            {"path": "toy-Q4_K_M-00002-of-00002.gguf", "size": 1, "sha256": ""},
+            {"path": "toy-Q4_0.gguf", "size": 1, "sha256": ""},
+        ]
+        chosen = _hf_choose(hf_files, "")
+        check("HF picker prefers single-file GGUF", chosen["path"] == "toy-Q4_0.gguf")
+        split = _hf_choose(hf_files[:2], "")
+        check("HF split GGUF parts are detected",
+              len(_hf_collect_parts(hf_files[:2], split)) == 2)
 
         # ---- tiny models -------------------------------------------------
         print("== building tiny models (own GGUF writer) ==")
@@ -151,7 +164,7 @@ def main() -> None:
                     env={**env, "ALPACCA_PURE": "1"})
         check("run with pure-python backend", "tokens," in r.stderr)
         r = run_cli("tokenize", "-m", "tiny", "-p", "hello", env=env)
-        check("tokenize via model name", "▁hello" in r.stdout or "hello" in r.stdout)
+        check("tokenize via model name", "\u2581hello" in r.stdout or "hello" in r.stdout)
 
         # ---- hugging-face path (incl. -GGUF fallback) ---------------------
         print("== hugging-face path ==")
@@ -205,6 +218,25 @@ def main() -> None:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read())
             check("serve /completion", "content" in body)
+            req = urllib.request.Request(
+                base + "/completion",
+                data=json.dumps({"prompt": "", "n_predict": 4,
+                                 "temperature": None, "stop": "\n"}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read())
+            check("serve /completion empty prompt", "content" in body)
+            req = urllib.request.Request(
+                base + "/v1/chat/completions",
+                data=json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                                 "top_k": "not-an-int"}).encode(),
+                headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=60)
+                bad_param_is_400 = False
+            except urllib.error.HTTPError as e:
+                bad_param_is_400 = e.code == 400
+            check("serve rejects invalid params", bad_param_is_400)
         finally:
             sp.terminate()
             sp.wait(timeout=10)

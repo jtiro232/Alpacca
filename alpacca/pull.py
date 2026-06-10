@@ -1,8 +1,8 @@
-# Alpacca — model downloads from the Ollama registry and Hugging Face,
+# Alpacca - model downloads from the Ollama registry and Hugging Face,
 # using only the Python standard library (urllib + hashlib).
 #
 # Protocol notes: Ollama models live in an OCI-style registry
-# (https://registry.ollama.ai) — a JSON manifest lists content-addressed
+# (https://registry.ollama.ai) - a JSON manifest lists content-addressed
 # layers; the GGUF weights layer has media type
 # "application/vnd.ollama.image.model". This is an independent
 # implementation of that protocol. Hugging Face models are plain files
@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -108,17 +109,17 @@ def _download(url: str, dest: Path, expected_size: int = 0, sha256: str = "",
         else:
             raise RuntimeError(
                 f"download failed (HTTP {e.code}): {url}\n"
-                f"  partial data kept at {partial} — rerun to resume") from e
+                f"  partial data kept at {partial} - rerun to resume") from e
     except OSError as e:
         raise RuntimeError(
             f"download failed: {url} ({e})\n"
-            f"  partial data kept at {partial} — rerun to resume") from e
+            f"  partial data kept at {partial} - rerun to resume") from e
 
     got = partial.stat().st_size if partial.exists() else 0
     if expected_size and got != expected_size:
         raise RuntimeError(
             f"size mismatch for {dest.name}: expected {expected_size}, got {got}\n"
-            f"  partial data kept at {partial} — rerun to resume")
+            f"  partial data kept at {partial} - rerun to resume")
     if verify and sha256:
         print("verifying sha256... ", end="", file=sys.stderr, flush=True)
         actual = _sha256_file(partial)
@@ -235,26 +236,31 @@ def _is_mmproj(path: str) -> bool:
     return _basename(path).lower().startswith("mmproj")
 
 
+def _is_split_gguf(path: str) -> bool:
+    return re.match(r"^.*-\d{5}-of-\d{5}\.gguf$", path, re.IGNORECASE) is not None
+
+
 def _hf_choose(files: list[dict], selector: str) -> dict | None:
     weights = [f for f in files if not _is_mmproj(f["path"])]
     if not weights:
         return None
+    single_file_weights = [f for f in weights if not _is_split_gguf(f["path"])]
+    candidates = single_file_weights or weights
     if selector:
-        for f in weights:
+        for f in candidates:
             if f["path"] == selector or _basename(f["path"]) == selector:
                 return f
         sel = selector.lower()
-        matches = [f for f in weights if sel in _basename(f["path"]).lower()]
+        matches = [f for f in candidates if sel in _basename(f["path"]).lower()]
         return min(matches, key=lambda f: len(f["path"])) if matches else None
     for q in _QUANT_PREFERENCE:
-        for f in weights:
+        for f in candidates:
             if q in _basename(f["path"]).lower():
                 return f
-    return weights[0]
+    return candidates[0]
 
 
 def _hf_collect_parts(files: list[dict], chosen: dict) -> list[dict]:
-    import re
     m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", chosen["path"], re.IGNORECASE)
     if not m:
         return [chosen]
@@ -275,7 +281,7 @@ def _pull_hf(ref: ModelRef, force: bool, verify: bool) -> LocalModel:
     if not files and not repo.lower().endswith("-gguf"):
         # safetensors repos usually have a "<repo>-GGUF" sibling
         alt = repo + "-GGUF"
-        print(f"no GGUF files in {ref.ns}/{repo} — trying {ref.ns}/{alt}", file=sys.stderr)
+        print(f"no GGUF files in {ref.ns}/{repo} - trying {ref.ns}/{alt}", file=sys.stderr)
         try:
             files = _hf_list_gguf(ref.ns, alt)
             if files:
@@ -284,13 +290,18 @@ def _pull_hf(ref: ModelRef, force: bool, verify: bool) -> LocalModel:
             pass
     if not files:
         raise RuntimeError(
-            f"no .gguf files in {ref.ns}/{ref.name} — alpacca runs GGUF models "
+            f"no .gguf files in {ref.ns}/{ref.name} - alpacca runs GGUF models "
             f"(try a -GGUF repo, e.g. from ggml-org or bartowski)")
 
     chosen = _hf_choose(files, ref.tag)
     if chosen is None:
         raise RuntimeError(f"no GGUF in {ref.ns}/{repo} matches '{ref.tag}'")
     parts = _hf_collect_parts(files, chosen)
+    if len(parts) > 1:
+        raise RuntimeError(
+            f"{chosen['path']} is a multi-part GGUF ({len(parts)} parts), but "
+            "the python engine can only load single-file GGUFs right now; "
+            "choose a single-file quantization or a smaller model")
     total_size = sum(p["size"] for p in parts)
     extra = f", {len(parts)} parts" if len(parts) > 1 else ""
     print(f"selected {chosen['path']} ({human_size(total_size)}{extra})", file=sys.stderr)

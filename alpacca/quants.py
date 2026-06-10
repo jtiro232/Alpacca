@@ -1,4 +1,4 @@
-# Alpacca — GGUF quantization formats, implemented from the spec in pure
+# Alpacca - GGUF quantization formats, implemented from the spec in pure
 # Python (with optional NumPy fast paths). MIT License. See LICENSE.
 """Dequantize GGUF tensor data to float32, and quantize for the writer.
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import struct
 
-try:  # optional accelerator only — everything works without it
+try:  # optional accelerator only - everything works without it
     import numpy as _np
 except Exception:  # pragma: no cover
     _np = None

@@ -1,4 +1,4 @@
-# Alpacca — local model store (~/.alpacca/models) and model references.
+# Alpacca - local model store (~/.alpacca/models) and model references.
 # MIT License. See LICENSE.
 from __future__ import annotations
 

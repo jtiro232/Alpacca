@@ -12,17 +12,17 @@ algorithms designed by others. Credit where it's due:
 
 `alpacca/gguf.py` and `alpacca/quants.py` implement, from the published
 specification and format documentation, the GGUF model file format and its
-quantization block formats (Q4_0 … Q6_K). GGUF and these schemes were
-designed by the **ggml / llama.cpp project** (MIT, © The ggml authors,
+quantization block formats (Q4_0 ... Q6_K). GGUF and these schemes were
+designed by the **ggml / llama.cpp project** (MIT, (c) The ggml authors,
 <https://github.com/ggml-org/llama.cpp>). No ggml or llama.cpp source code
 is included or linked.
 
 ## Ollama registry protocol
 
 `alpacca/pull.py` speaks the public model-distribution protocol of
-**Ollama** (MIT, © Ollama Inc., <https://github.com/ollama/ollama>) —
+**Ollama** (MIT, (c) Ollama Inc., <https://github.com/ollama/ollama>) -
 OCI-style manifests with content-addressed layers served from
-`registry.ollama.ai` — and Alpacca's model-management UX (`pull` / `run` /
+`registry.ollama.ai` - and Alpacca's model-management UX (`pull` / `run` /
 `list` / `rm`, `name:tag` references) is openly inspired by Ollama's. The
 client is an independent implementation; no Ollama source code is included.
 

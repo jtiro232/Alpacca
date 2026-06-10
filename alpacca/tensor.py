@@ -1,11 +1,11 @@
-# Alpacca — minimal tensor backend: NumPy when available, pure Python
+# Alpacca - minimal tensor backend: NumPy when available, pure Python
 # otherwise (set ALPACCA_PURE=1 to force the pure path).
 # MIT License. See LICENSE.
 """The handful of dense operations the transformer needs.
 
 Vectors are NumPy 1-D float32 arrays or Python lists of floats; matrices
 are NumPy 2-D arrays or lists of row-lists. The pure path is exact but
-slow — it exists so the engine runs with zero dependencies, and so the two
+slow - it exists so the engine runs with zero dependencies, and so the two
 implementations can verify each other in tests.
 """
 

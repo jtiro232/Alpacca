@@ -1,4 +1,4 @@
-# Alpacca — tokenizers implemented from scratch: SentencePiece-style
+# Alpacca - tokenizers implemented from scratch: SentencePiece-style
 # (Viterbi over piece scores, byte fallback) and byte-level BPE with a
 # GPT-2/llama-3 style pre-tokenizer built on unicodedata (no regex deps).
 # MIT License. See LICENSE.
@@ -7,7 +7,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass, field
 
-SPM_SPACE = "▁"  # ▁
+SPM_SPACE = "\u2581"  # \u2581
 
 # token types stored in tokenizer.ggml.token_type
 TT_NORMAL, TT_UNKNOWN, TT_CONTROL, TT_USER_DEFINED, TT_UNUSED, TT_BYTE = 1, 2, 3, 4, 5, 6

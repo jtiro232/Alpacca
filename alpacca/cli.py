@@ -1,4 +1,4 @@
-# Alpacca — command-line interface. MIT License. See LICENSE.
+# Alpacca - command-line interface. MIT License. See LICENSE.
 from __future__ import annotations
 
 import argparse
@@ -37,7 +37,7 @@ def _resolve_or_pull(name: str, auto_pull: bool = True) -> LocalModel:
     if not auto_pull:
         raise SystemExit(f"alpacca: {ref.display()} is not installed "
                          f"(try `alpacca pull {name}`)")
-    print(f"{ref.display()} is not installed yet — pulling it first", file=sys.stderr)
+    print(f"{ref.display()} is not installed yet - pulling it first", file=sys.stderr)
     return pull_model(ref)
 
 
@@ -91,7 +91,7 @@ def cmd_pull(args) -> int:
 def cmd_list(_args) -> int:
     models = list_models()
     if not models:
-        print("no models installed — try: alpacca pull llama3.2:1b")
+        print("no models installed - try: alpacca pull llama3.2:1b")
         return 0
     width = max(4, max(len(m["name"]) for m in models))
     print(f"{'NAME':<{width}}  {'SOURCE':<8}  {'SIZE':<10}  PULLED")
@@ -131,7 +131,7 @@ def cmd_show(args) -> int:
             print("\nGGUF metadata:")
             for k, v in gf.metadata.items():
                 s = str(v)
-                print(f"  {k} = {s[:80] + '…' if len(s) > 80 else s}")
+                print(f"  {k} = {s[:80] + '...' if len(s) > 80 else s}")
     return 0
 
 
@@ -184,7 +184,7 @@ def cmd_doctor(_args) -> int:
         ok = f"NOT WRITABLE ({e})"
     print(f"models dir:  {root} ({ok})")
     n = len(list_models())
-    print(f"installed:   {n} model(s)" + ("" if n else " — try `alpacca pull llama3.2:1b`"))
+    print(f"installed:   {n} model(s)" + ("" if n else " - try `alpacca pull llama3.2:1b`"))
     return 0
 
 
@@ -196,7 +196,7 @@ def cmd_tokenize(args) -> int:
         tok = Tokenizer.from_gguf(gf.metadata)
     ids = tok.encode(args.text)
     for i in ids:
-        print(f"{i:>8}  {tok.piece(i)!r}")
+        print(f"{i:>8}  {ascii(tok.piece(i))}")
     return 0
 
 
@@ -223,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
     ap = argparse.ArgumentParser(
         prog="alpacca",
-        description="alpacca — LLMs in your terminal, implemented in pure Python",
+        description="alpacca - LLMs in your terminal, implemented in pure Python",
         epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", "-v", action="version",
                     version=f"alpacca {__version__}")

@@ -1,4 +1,4 @@
-# Alpacca — a from-scratch, pure-Python LLM runtime for GGUF models.
+# Alpacca - a from-scratch, pure-Python LLM runtime for GGUF models.
 # MIT License. See LICENSE.
 """Alpacca: llama-class language models in your terminal, implemented in
 100% Python (standard library only; NumPy is used automatically as an

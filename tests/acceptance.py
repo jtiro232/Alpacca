@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alpacca acceptance test — pull a real instruct model, ask it a factual
+"""Alpacca acceptance test - pull a real instruct model, ask it a factual
 question headlessly, and check the answer.
 
     python3 tests/acceptance.py                       # llama3.2:1b (default)
@@ -8,7 +8,7 @@ question headlessly, and check the answer.
 The default is a 1B model (~770 MB download, ~6 GB RAM with NumPy).
 The 8B Hermes model works but the pure-Python engine keeps weights in
 float32: expect a ~4.6 GB download, 35+ GB of RAM, and slow generation
-without NumPy — the script checks RAM and warns before committing.
+without NumPy - the script checks RAM and warns before committing.
 Needs network access to the model source on first run.
 """
 from __future__ import annotations
@@ -58,7 +58,7 @@ def main() -> None:
                   file=sys.stderr)
             sys.exit(2)
     if not tensor.HAS_NUMPY:
-        print("warning: NumPy not installed — generation will be very slow "
+        print("warning: NumPy not installed - generation will be very slow "
               "(pip install numpy)", file=sys.stderr)
 
     ref = parse_model_ref(args.model)
