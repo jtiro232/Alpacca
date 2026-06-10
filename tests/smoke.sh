@@ -18,8 +18,10 @@ python=$(command -v python3 || command -v python)
 
 tmp=$(mktemp -d)
 server_pid=""
+serve_pid=""
 cleanup() {
     [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+    [ -n "$serve_pid" ] && kill "$serve_pid" 2>/dev/null || true
     rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -93,6 +95,35 @@ check "run hf model"         "$alpacca" run hf:test/tiny "hi" --grammar "$gramma
 
 echo "== tool passthrough with model-name resolution =="
 check "tokenize via name" "$alpacca" tokenize -m tiny -p "hello"
+
+echo "== serve (OpenAI-compatible llama-server) =="
+serve_port=$("$python" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+"$alpacca" serve tiny --port "$serve_port" > "$tmp/serve.log" 2>&1 < /dev/null &
+serve_pid=$!
+serve_up=""
+for _ in $(seq 1 150); do
+    if curl -fs "http://127.0.0.1:$serve_port/health" > /dev/null 2>&1; then
+        serve_up=1
+        break
+    fi
+    kill -0 "$serve_pid" 2>/dev/null || break
+    sleep 0.2
+done
+if [ -n "$serve_up" ]; then
+    echo "ok   serve comes up healthy"
+    pass=$((pass + 1))
+else
+    echo "FAIL serve comes up healthy"
+    sed 's/^/     | /' "$tmp/serve.log"
+    exit 1
+fi
+check "serve answers /completion" \
+    curl -fs -X POST "http://127.0.0.1:$serve_port/completion" \
+         -H "Content-Type: application/json" \
+         -d '{"prompt": "hi", "n_predict": 4, "grammar": "root ::= \"ok\""}'
+kill "$serve_pid" 2>/dev/null || true
+wait "$serve_pid" 2>/dev/null || true
+serve_pid=""
 
 echo "== removal =="
 check "rm tiny"     "$alpacca" rm tiny
