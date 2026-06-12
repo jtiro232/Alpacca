@@ -75,13 +75,34 @@ def _apply_manifest_defaults(local: LocalModel, args) -> None:
         args.system = local.manifest["system"]
 
 
+def _cgroup_limit_remaining_mb() -> float | None:
+    """Remaining memory under a cgroup limit (containers), if any."""
+    try:  # cgroup v2
+        raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        if raw != "max":
+            used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+            return max(0.0, (int(raw) - used) / (1024.0 * 1024.0))
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text())
+        if limit < (1 << 60):  # v1 reports ~2^63 when unlimited
+            used = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text())
+            return max(0.0, (limit - used) / (1024.0 * 1024.0))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _available_ram_mb() -> float | None:
     """Best-effort available physical RAM in MiB, standard library only."""
     try:
         if sys.platform.startswith("linux"):
             for line in Path("/proc/meminfo").read_text().splitlines():
                 if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / 1024.0
+                    meminfo_mb = int(line.split()[1]) / 1024.0
+                    cg = _cgroup_limit_remaining_mb()
+                    return min(meminfo_mb, cg) if cg is not None else meminfo_mb
         elif sys.platform == "win32":
             import ctypes
 
@@ -110,19 +131,20 @@ def _available_ram_mb() -> float | None:
     return None
 
 
-def _auto_dense_budget_mb(avail_mb: float, file_mb: float) -> int:
+def _auto_dense_budget_mb(avail_mb: float, file_mb: float, n_ctx: int = 0) -> int:
     """Dense-weight budget (MiB) that fits beside the quantized residue,
     KV cache, and runtime baseline, with headroom kept free.
 
     Conservative on purpose: it reserves the full quantized size even
     though densified matrices never allocate their quantized form, and
-    spends 85% of what is left.
+    spends 85% of what is left. The KV/runtime reserve scales with
+    explicitly requested context windows beyond the default 4096 clamp.
     """
-    reserve = 1.2 * file_mb + 2048.0  # quant residue + KV/runtime reserve
+    reserve = 1.2 * file_mb + 2048.0 * max(1.0, n_ctx / 4096.0)
     return max(0, int(0.85 * (avail_mb - reserve)))
 
 
-def _maybe_auto_dense_budget(local: LocalModel) -> None:
+def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
     """Default `alpacca run`/`serve` to the fastest storage this machine
     affords: size ALPACCA_DENSE_WEIGHT_MB from available RAM unless the
     user pinned it (any value - `0` keeps everything quantized). This is
@@ -142,7 +164,7 @@ def _maybe_auto_dense_budget(local: LocalModel) -> None:
         file_mb = local.model_path.stat().st_size / (1024.0 * 1024.0)
     except OSError:
         return
-    budget = _auto_dense_budget_mb(avail, file_mb)
+    budget = _auto_dense_budget_mb(avail, file_mb, n_ctx)
     if budget <= 0:
         return
     os.environ["ALPACCA_DENSE_WEIGHT_MB"] = str(budget)
@@ -154,7 +176,7 @@ def _maybe_auto_dense_budget(local: LocalModel) -> None:
 
 def _load_model(local: LocalModel, args):
     from .model import Model
-    _maybe_auto_dense_budget(local)
+    _maybe_auto_dense_budget(local, args.ctx)
     print(f"loading {local.model_path.name}...", file=sys.stderr)
     m = Model.load(str(local.model_path), n_ctx=args.ctx)
     print(m.describe(), file=sys.stderr)

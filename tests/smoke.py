@@ -396,6 +396,13 @@ def main() -> None:
               int(0.85 * (16000.0 - 1.2 * 600.0 - 2048.0)))
         check("auto dense budget formula floors at zero on tight RAM",
               _auto_dense_budget_mb(2500.0, 600.0) == 0)
+        check("auto dense budget reserve scales with requested context",
+              _auto_dense_budget_mb(16000.0, 600.0, 16384) ==
+              int(0.85 * (16000.0 - 1.2 * 600.0 - 2048.0 * 4.0)))
+        from alpacca.cli import _cgroup_limit_remaining_mb
+        v = _cgroup_limit_remaining_mb()
+        check("cgroup limit detection returns a sane value or None",
+              v is None or v >= 0, str(v))
         detected_ram = _available_ram_mb()
         check("available-RAM detection returns a sane value or None",
               detected_ram is None or detected_ram > 0,
