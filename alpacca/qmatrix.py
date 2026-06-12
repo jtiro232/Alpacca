@@ -16,6 +16,11 @@ NumPy backend
     Both compute out = sum_s d_eff[:, s] * (codes[:, s] @ x_s) (+ offsets),
     which is bit-equivalent algebra to dequantize-then-GEMV.
 
+    The optional hot-cache budget globals (``ALPACCA_HOT_WEIGHT_MB``) are not
+    synchronized for concurrent matvec callers: alpacca's own server
+    serializes generation behind a lock, but embedders doing concurrent
+    inference with the budget set should serialize calls or leave it unset.
+
 Pure backend
     Owns a copy of the raw block bytes and decodes rows on the fly with the
     pure decoders in :mod:`alpacca.quants`. Slow but dependency-free; the
@@ -44,7 +49,8 @@ HAS_NUMPY = _np is not None
 QUANTIZED_MATVEC_DTYPES = frozenset(QUANT_GEOMETRY)
 
 # below this many elements the batched-matmul kernel beats the einsum kernel
-# (measured crossover is around 1M elements; see tests/bench.py history)
+# (crossover measured around 1M elements on a 4-core AVX2 box; re-measure
+# before changing)
 _SMALL_MATVEC_ELEMS = 1 << 20
 
 _HOT_WEIGHT_ENV = "ALPACCA_HOT_WEIGHT_MB"
@@ -192,7 +198,7 @@ class QuantMatrix:
         q3 = self._q3
         for r0 in range(0, self.rows, tile_rows):
             r1 = min(self.rows, r0 + tile_rows)
-            tile = q3[r0:r1].astype(_np.float32)
+            tile = _np.ascontiguousarray(q3[r0:r1], dtype=_np.float32)
             tile *= self._d[r0:r1, :, None]
             out[:, r0:r1] = X @ tile.reshape(r1 - r0, self.cols).T
             if self._m is not None:

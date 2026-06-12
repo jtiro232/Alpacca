@@ -150,6 +150,15 @@ def main() -> None:
                 packed = q6_k_bytes(n)
             qmat = T.quantized_matrix(packed, fmt, rows, cols)
             dense = T.matrix(quants.dequantize(packed, n, fmt), rows, cols)
+            if T.HAS_NUMPY:
+                # break the circular oracle: check the numpy decode against
+                # the independent pure spec decoder on the same bytes
+                pure_ref = quants._PURE_DECODERS[fmt](packed, n)
+                np_deq = quants.dequantize(packed, n, fmt)
+                err = max(abs(float(a) - float(b))
+                          for a, b in zip(np_deq, pure_ref))
+                check(f"{fmt} numpy dequantize matches pure spec decoder (diff {err:.2e})",
+                      err < 1e-6)
             qout = T.to_list(T.matvec(qmat, T.vector(x)))
             dout = T.to_list(T.matvec(dense, T.vector(x)))
             err = max(abs(a - b) for a, b in zip(qout, dout))
@@ -215,6 +224,31 @@ def main() -> None:
                         check("hot-cache accounting releases on matrix GC",
                               stats["matrices"] == 0 and stats["used_bytes"] == 0,
                               str(stats))
+                        # late env: budget set only after the matrix already
+                        # served a matvec without any budget configured
+                        os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
+                        T._reset_hot_cache_state()
+                        late_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                        T.matvec(late_mat, T.vector(x))
+                        check("hot-cache absent env builds no cache",
+                              late_mat._dense_cache is None,
+                              str(T.hot_cache_stats()))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        late = T.to_list(T.matvec(late_mat, T.vector(x)))
+                        lerr = max(abs(a - b) for a, b in zip(late, dout))
+                        stats = T.hot_cache_stats()
+                        check("hot-cache late env var is picked up "
+                              f"(diff {lerr:.2e})",
+                              late_mat._dense_cache is not None and
+                              stats["matrices"] == 1 and lerr < 2e-3,
+                              str(stats))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        T.matvec(late_mat, T.vector(x))
+                        stats = T.hot_cache_stats()
+                        check("hot-cache late env budget zero clears cache",
+                              late_mat._dense_cache is None and
+                              stats["matrices"] == 0 and stats["used_bytes"] == 0,
+                              str(stats))
                 finally:
                     if old_hot_mb is None:
                         os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
@@ -241,6 +275,12 @@ def main() -> None:
             except IndexError:
                 oob_raises = True
             check(f"{fmt} row gather rejects out-of-range index", oob_raises)
+            try:
+                T.matrix_rows(qmat, [-1])
+                neg_raises = False
+            except IndexError:
+                neg_raises = True
+            check(f"{fmt} row gather rejects negative index", neg_raises)
             if T.HAS_NUMPY:
                 nbytes = qmat.storage_nbytes()
                 dense_bytes = rows * cols * 4
@@ -274,6 +314,31 @@ def main() -> None:
                                           T.matvec(big_dense, xb))))
             check(f"Q8_0 large-matrix einsum matvec matches dense (diff {big_err:.2e})",
                   big_rows * big_cols >= 1 << 20 and big_err < 1e-3)
+            # cover the >=1M-element einsum kernel branch for an affine
+            # format (Q4_K, exercises m_eff) and the 16-wide-sub-block Q6_K
+            for big_fmt, brows, bcols in (("Q4_K", 2112, 512),
+                                          ("Q6_K", 2112, 512)):
+                bn = brows * bcols
+                bpacked = (q4_k_bytes(bn) if big_fmt == "Q4_K"
+                           else q6_k_bytes(bn))
+                bq = T.quantized_matrix(bpacked, big_fmt, brows, bcols)
+                bdense = T.matrix(quants.dequantize(bpacked, bn, big_fmt),
+                                  brows, bcols)
+                xb2 = T.vector([((i * 19) % 67) / 23.0 - 1.4
+                                for i in range(bcols)])
+                berr2 = float(np.max(np.abs(T.matvec(bq, xb2) -
+                                            T.matvec(bdense, xb2))))
+                check(f"{big_fmt} large-matrix einsum matvec matches dense "
+                      f"(diff {berr2:.2e})",
+                      brows * bcols >= 1 << 20 and berr2 < 1e-3)
+                X2 = np.stack([np.asarray(xb2),
+                               np.asarray(xb2) * 0.5 - 0.1], axis=0)
+                bbatch = T.matmul_t(X2, bq)
+                bstacked = np.stack([T.matvec(bq, row) for row in X2], axis=0)
+                bberr = float(np.max(np.abs(bbatch - bstacked)))
+                check(f"{big_fmt} large-matrix matmul_t matches stacked "
+                      f"matvecs (diff {bberr:.2e})",
+                      bberr < 1e-3)
         dense = T.matrix([1.0, -2.0, 0.5, 3.0, 4.0, -1.0], 2, 3)
         dy = T.to_list(T.matvec(dense, T.vector([2.0, -1.0, 4.0])))
         check("dense matvec fallback still works",
