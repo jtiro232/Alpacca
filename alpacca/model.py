@@ -35,6 +35,33 @@ _KNOWN_QUANT_DTYPES = {
     "IQ3_XXS", "IQ4_NL", "IQ4_XS",
 }
 
+# ALPACCA_DENSE_WEIGHT_MB densification order: NumPy's quantized matvec has
+# no BLAS-class kernel, so spending RAM on dense float32 buys decode speed
+# roughly in proportion to how much of a token's matvec work a matrix does.
+# FFN projections dominate llama-class decode, attention q/output come next,
+# k/v are smaller (GQA), and the output projection is amortized by the
+# last-token-only prefill. The token embedding is only ever row-gathered, so
+# it is densified solely when it doubles as a tied output projection.
+_DENSIFY_TIERS: tuple[tuple[str, ...], ...] = (
+    ("ffn_gate", "ffn_up", "ffn_down"),
+    ("attn_q", "attn_output"),
+    ("attn_k", "attn_v"),
+    ("output",),
+)
+
+
+def _dense_budget_bytes() -> int:
+    raw = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        mb = float(raw.strip())
+    except ValueError:
+        return 0
+    if not math.isfinite(mb) or mb <= 0.0:
+        return 0
+    return int(mb * 1024 * 1024)
+
 
 @dataclass
 class Hyperparams:
@@ -67,7 +94,8 @@ class Model:
         self.out_norm = None
         self.output = None
         self.metadata: dict = {}
-        self.weight_storage: dict = {"dense": 0, "quantized": {}, "fallback": {}}
+        self.weight_storage: dict = {"dense": 0, "quantized": {}, "fallback": {},
+                                     "densified": [], "densified_bytes": 0}
         self.cached_ids: list[int] = []
         self.last_prefill_forwarded = 0
         self._rope_inv_freq = None
@@ -127,6 +155,37 @@ class Model:
             dense_matrices = 0
             quantized_matrices: dict[str, int] = {}
             fallback_matrices: dict[str, int] = {}
+            densified_names: list[str] = []
+
+            # ALPACCA_DENSE_WEIGHT_MB: pick which quantizable matrices to
+            # expand to dense float32 at load (BLAS-speed decode), spending
+            # the budget tier by tier; everything else stays quantized.
+            densify_plan: set[str] = set()
+            densified_bytes = 0
+            budget = 0
+            if T.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+                budget = _dense_budget_bytes()
+            if budget > 0:
+                tied_output = "output.weight" not in gf.tensors
+                for tier in _DENSIFY_TIERS:
+                    for role in tier:
+                        if role == "output":
+                            names = ["token_embd.weight" if tied_output
+                                     else "output.weight"]
+                        else:
+                            names = [f"blk.{i}.{role}.weight"
+                                     for i in range(hp.n_layer)]
+                        for nm in names:
+                            info = gf.tensors.get(nm)
+                            if info is None or len(info.shape) < 2:
+                                continue
+                            if not T.can_quantized_matvec(
+                                    info.dtype, int(info.shape[0])):
+                                continue  # loads dense anyway, costs no budget
+                            nbytes = info.n_elements * 4
+                            if densified_bytes + nbytes <= budget:
+                                densify_plan.add(nm)
+                                densified_bytes += nbytes
 
             def tensor_mat(name, rows, cols, required=True):
                 nonlocal dense_matrices
@@ -140,11 +199,14 @@ class Model:
                         f"tensor {name} has {info.n_elements} elements, "
                         f"expected {rows * cols}")
                 if (T.HAS_NUMPY and not os.environ.get("ALPACCA_F32") and
+                        name not in densify_plan and
                         T.can_quantized_matvec(info.dtype, cols)):
                     quantized_matrices[info.dtype] = (
                         quantized_matrices.get(info.dtype, 0) + 1)
                     return T.quantized_matrix(gf.tensor_bytes(name), info.dtype, rows, cols)
-                if info.dtype in _KNOWN_QUANT_DTYPES:
+                if name in densify_plan:
+                    densified_names.append(name)
+                elif info.dtype in _KNOWN_QUANT_DTYPES:
                     fallback_matrices[info.dtype] = (
                         fallback_matrices.get(info.dtype, 0) + 1)
                 dense_matrices += 1
@@ -195,6 +257,8 @@ class Model:
                 "dense": dense_matrices,
                 "quantized": dict(sorted(quantized_matrices.items())),
                 "fallback": dict(sorted(fallback_matrices.items())),
+                "densified": sorted(densified_names),
+                "densified_bytes": densified_bytes,
             }
 
             m.n_ctx = min(n_ctx, hp.n_ctx_train) if n_ctx else min(hp.n_ctx_train, 4096)
@@ -522,6 +586,7 @@ class Model:
         q = self.weight_storage.get("quantized", {})
         dense = int(self.weight_storage.get("dense", 0) or 0)
         fallback = self.weight_storage.get("fallback", {})
+        densified = self.weight_storage.get("densified") or []
         if q:
             q_desc = "/".join(q.keys())
             total_q = sum(q.values())
@@ -533,4 +598,8 @@ class Model:
         if fallback:
             fb_desc = "/".join(fallback.keys())
             parts.append(f"dense fallback {fb_desc}")
+        if densified:
+            mb = self.weight_storage.get("densified_bytes", 0) / (1024 * 1024)
+            size = f"{mb / 1024:.1f} GiB" if mb >= 1024 else f"{mb:.1f} MiB"
+            parts.append(f"dense budget {len(densified)} matrices ({size})")
         return ", ".join(parts)

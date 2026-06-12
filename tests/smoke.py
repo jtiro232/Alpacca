@@ -440,6 +440,21 @@ def main() -> None:
               len(f16_logits) == f16_model.hp.n_vocab and
               all(v == v for v in f16_logits[:8]))
 
+        if not T.HAS_NUMPY:
+            old_budget = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+            try:
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                inert = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                check("dense budget is inert on the pure backend",
+                      inert.weight_storage["densified"] == [] and
+                      inert.weight_storage["dense"] == 16,
+                      str(inert.weight_storage))
+            finally:
+                if old_budget is None:
+                    os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                else:
+                    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = old_budget
+
         if T.HAS_NUMPY:
             def greedy_trace(model, prompt: str, steps: int) -> tuple[list[int], list[list[float]]]:
                 ids = model.tok.encode(prompt, add_bos=True)
@@ -481,6 +496,70 @@ def main() -> None:
                       logit_diff < 1e-2,
                       f"quant={qtoks} dense={dtoks} diff={logit_diff:.2e} "
                       f"qstore={q_model.weight_storage} dstore={d_model.weight_storage}")
+
+            old_budget = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+            try:
+                # tiny-q4: 6 ffn matrices of 32768B + 4 attn q/output of
+                # 16384B = exactly 0.25 MiB; wk/wv/embd/output must stay
+                # quantized
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0.25"
+                hybrid = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                expect_dense = {f"blk.{i}.{role}.weight"
+                                for i in range(2)
+                                for role in ("ffn_gate", "ffn_up", "ffn_down",
+                                             "attn_q", "attn_output")}
+                check("dense budget densifies FFN tier then attn q/output",
+                      set(hybrid.weight_storage["densified"]) == expect_dense and
+                      hybrid.weight_storage["quantized"] == {"Q4_0": 6} and
+                      hybrid.weight_storage["densified_bytes"] == 262144 and
+                      not hybrid.weight_storage["fallback"],
+                      str(hybrid.weight_storage))
+                check("describe reports the dense budget",
+                      "dense budget 10 matrices" in hybrid.describe(),
+                      hybrid.describe())
+                os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                qfull = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                htoks, hlogits = greedy_trace(hybrid, "hello world", 6)
+                ftoks, flogits = greedy_trace(qfull, "hello world", 6)
+                hdiff = max(abs(a - b)
+                            for ha, fa in zip(hlogits, flogits)
+                            for a, b in zip(ha, fa))
+                check(f"dense-budget hybrid matches quantized generation (diff {hdiff:.2e})",
+                      htoks == ftoks and len(hlogits) == len(flogits) and
+                      hdiff < 1e-2,
+                      f"hybrid={htoks} quant={ftoks}")
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                roomy = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                check("dense budget never densifies an untied token embedding",
+                      len(roomy.weight_storage["densified"]) == 15 and
+                      "token_embd.weight" not in roomy.weight_storage["densified"] and
+                      roomy.weight_storage["quantized"] == {"Q4_0": 1},
+                      str(roomy.weight_storage))
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "not-a-number"
+                ignored = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                check("invalid dense budget is ignored",
+                      ignored.weight_storage["quantized"] == {"Q4_0": 16} and
+                      not ignored.weight_storage["densified"],
+                      str(ignored.weight_storage))
+                r = subprocess.run(
+                    [sys.executable, str(REPO / "tests" / "make_bench_model.py"),
+                     str(srv / "tied-bench.gguf"), "Q4_0", "--vocab", "320",
+                     "--embd", "64", "--heads", "4", "--layers", "2",
+                     "--ff", "128"],
+                    capture_output=True, text=True)
+                check("write tiny tied bench model", r.returncode == 0, r.stderr)
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                tied = Model.load(str(srv / "tied-bench.gguf"), progress=False)
+                check("dense budget densifies a tied embedding as the output matrix",
+                      "token_embd.weight" in tied.weight_storage["densified"] and
+                      len(tied.weight_storage["densified"]) == 15 and
+                      not tied.weight_storage["quantized"],
+                      str(tied.weight_storage))
+            finally:
+                if old_budget is None:
+                    os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                else:
+                    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = old_budget
 
             old_f32 = os.environ.get("ALPACCA_F32")
             try:

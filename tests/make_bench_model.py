@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Create a stories15M-shaped synthetic GGUF for offline benchmarking.
+"""Create a synthetic llama-architecture GGUF for offline benchmarking.
 
-Same architecture hyperparameters as the public stories15M checkpoint
-(vocab 32000, embd 288, 6 layers, 6 heads, ff 768, tied embeddings), but
-with deterministic random weights, so prefill/decode cost and weight-memory
-behaviour match the real model without needing network access. The output
-is gibberish; only use it for performance measurements.
+The default shape matches the public stories15M checkpoint (vocab 32000,
+embd 288, 6 layers, 6 heads, ff 768, tied embeddings); shape flags let you
+mimic larger models, e.g. a TinyLlama-1.1B-like GQA shape:
 
-usage: python3 tests/make_bench_model.py out.gguf [F32|Q8_0|Q4_0]
+    python3 tests/make_bench_model.py /tmp/b1.gguf Q4_0 \\
+        --embd 2048 --ff 5632 --layers 22 --heads 32 --kv 4 --untied
+
+Weights are deterministic random values, so prefill/decode cost and
+weight-memory behaviour match a real model of the same shape without
+needing network access. The output is gibberish; only use it for
+performance measurements.
+
+usage: python3 tests/make_bench_model.py out.gguf [F32|Q8_0|Q4_0] [shape flags]
 
 NumPy is used to quantize quickly when available; the pure fallback works
-but takes minutes for the 15M-parameter default shape.
+but takes minutes per 15M parameters.
 """
 from __future__ import annotations
 
+import argparse
 import struct
 import sys
 from pathlib import Path
@@ -59,9 +66,15 @@ def _np_quantize_q4_0(vals) -> bytes:
     return out.tobytes()
 
 
-def main(path: str, dtype: str = "Q4_0") -> None:
+def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
+         n_embd: int = N_EMBD, n_head: int = N_HEAD, n_kv: int = 0,
+         n_layer: int = N_LAYER, n_ff: int = N_FF, n_ctx: int = N_CTX,
+         tied: bool = True) -> None:
     if dtype not in ("F32", "Q8_0", "Q4_0"):
         raise SystemExit(f"unsupported bench dtype {dtype}")
+    n_kv = n_kv or n_head
+    head_dim = n_embd // n_head
+    kv_dim = n_kv * head_dim
 
     tokens: list[str] = ["<unk>", "<s>", "</s>"]
     scores: list[float] = [0.0, 0.0, 0.0]
@@ -70,22 +83,22 @@ def main(path: str, dtype: str = "Q4_0") -> None:
         tokens.append(f"<0x{b:02X}>")
         scores.append(-1000.0)
         types.append(6)
-    for i in range(N_VOCAB - len(tokens)):
+    for i in range(n_vocab - len(tokens)):
         tokens.append(f"▁w{i:05d}")
         scores.append(-float(i + 1))
         types.append(1)
 
     w = gguf.GGUFWriter(path, "llama")
-    w.add("general.name", gguf.T_STRING, "alpacca-bench-stories15m-shape")
-    w.add("llama.context_length", gguf.T_UINT32, N_CTX)
-    w.add("llama.embedding_length", gguf.T_UINT32, N_EMBD)
-    w.add("llama.block_count", gguf.T_UINT32, N_LAYER)
-    w.add("llama.feed_forward_length", gguf.T_UINT32, N_FF)
-    w.add("llama.attention.head_count", gguf.T_UINT32, N_HEAD)
-    w.add("llama.attention.head_count_kv", gguf.T_UINT32, N_HEAD)
+    w.add("general.name", gguf.T_STRING, "alpacca-bench-synthetic")
+    w.add("llama.context_length", gguf.T_UINT32, n_ctx)
+    w.add("llama.embedding_length", gguf.T_UINT32, n_embd)
+    w.add("llama.block_count", gguf.T_UINT32, n_layer)
+    w.add("llama.feed_forward_length", gguf.T_UINT32, n_ff)
+    w.add("llama.attention.head_count", gguf.T_UINT32, n_head)
+    w.add("llama.attention.head_count_kv", gguf.T_UINT32, n_kv)
     w.add("llama.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32, 1e-5)
-    w.add("llama.rope.dimension_count", gguf.T_UINT32, N_EMBD // N_HEAD)
-    w.add("llama.vocab_size", gguf.T_UINT32, N_VOCAB)
+    w.add("llama.rope.dimension_count", gguf.T_UINT32, head_dim)
+    w.add("llama.vocab_size", gguf.T_UINT32, n_vocab)
     w.add("tokenizer.ggml.model", gguf.T_STRING, "llama")
     w.add_array("tokenizer.ggml.tokens", gguf.T_STRING, tokens)
     w.add_array("tokenizer.ggml.scores", gguf.T_FLOAT32, scores)
@@ -126,29 +139,48 @@ def main(path: str, dtype: str = "Q4_0") -> None:
                 w.add_raw_tensor(name, shape, "Q4_0", quants.quantize_q4_0(vals))
 
     def add_norm(name: str) -> None:
-        w.add_tensor(name, (N_EMBD,), [1.0] * N_EMBD, "F32")
+        w.add_tensor(name, (n_embd,), [1.0] * n_embd, "F32")
 
-    # tied embeddings (no output.weight), like the real stories15M GGUF
-    add_matrix("token_embd.weight", (N_EMBD, N_VOCAB))
-    for i in range(N_LAYER):
+    # tied embeddings by default (no output.weight), like stories15M;
+    # --untied adds a separate output matrix, like llama-3-class models
+    add_matrix("token_embd.weight", (n_embd, n_vocab))
+    for i in range(n_layer):
         p = f"blk.{i}."
         add_norm(p + "attn_norm.weight")
-        add_matrix(p + "attn_q.weight", (N_EMBD, N_EMBD))
-        add_matrix(p + "attn_k.weight", (N_EMBD, N_EMBD))
-        add_matrix(p + "attn_v.weight", (N_EMBD, N_EMBD))
-        add_matrix(p + "attn_output.weight", (N_EMBD, N_EMBD))
+        add_matrix(p + "attn_q.weight", (n_embd, n_embd))
+        add_matrix(p + "attn_k.weight", (n_embd, kv_dim))
+        add_matrix(p + "attn_v.weight", (n_embd, kv_dim))
+        add_matrix(p + "attn_output.weight", (n_embd, n_embd))
         add_norm(p + "ffn_norm.weight")
-        add_matrix(p + "ffn_gate.weight", (N_EMBD, N_FF))
-        add_matrix(p + "ffn_up.weight", (N_EMBD, N_FF))
-        add_matrix(p + "ffn_down.weight", (N_FF, N_EMBD))
+        add_matrix(p + "ffn_gate.weight", (n_embd, n_ff))
+        add_matrix(p + "ffn_up.weight", (n_embd, n_ff))
+        add_matrix(p + "ffn_down.weight", (n_ff, n_embd))
     add_norm("output_norm.weight")
+    if not tied:
+        add_matrix("output.weight", (n_embd, n_vocab))
 
     w.write()
     size_mb = Path(path).stat().st_size / (1024 * 1024)
-    print(f"wrote {path} ({dtype}, stories15M shape, {size_mb:.1f} MiB)")
+    print(f"wrote {path} ({dtype}, embd {n_embd} ff {n_ff} layers {n_layer} "
+          f"heads {n_head}/{n_kv} vocab {n_vocab} "
+          f"{'tied' if tied else 'untied'}, {size_mb:.1f} MiB)")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        raise SystemExit(__doc__)
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "Q4_0")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("out")
+    ap.add_argument("dtype", nargs="?", default="Q4_0")
+    ap.add_argument("--vocab", type=int, default=N_VOCAB)
+    ap.add_argument("--embd", type=int, default=N_EMBD)
+    ap.add_argument("--heads", type=int, default=N_HEAD)
+    ap.add_argument("--kv", type=int, default=0, help="kv heads (default: --heads)")
+    ap.add_argument("--layers", type=int, default=N_LAYER)
+    ap.add_argument("--ff", type=int, default=N_FF)
+    ap.add_argument("--ctx", type=int, default=N_CTX)
+    ap.add_argument("--untied", action="store_true",
+                    help="write a separate output.weight matrix")
+    args = ap.parse_args()
+    main(args.out, args.dtype, n_vocab=args.vocab, n_embd=args.embd,
+         n_head=args.heads, n_kv=args.kv, n_layer=args.layers, n_ff=args.ff,
+         n_ctx=args.ctx, tied=not args.untied)

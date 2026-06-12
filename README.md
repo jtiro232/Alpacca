@@ -152,11 +152,46 @@ What quantized storage does and does not buy here, measured honestly:
   quantized weights needs native SIMD dot-product kernels
   (llama.cpp-class), which is an explicit non-goal here.
 
+### Spending RAM for speed: the dense-weight budget
+
+Because dense BLAS is the fast path and quantized storage is the small
+path, the practical dial for 1B-8B models is `ALPACCA_DENSE_WEIGHT_MB=N`:
+at load time Alpacca expands up to `N` MiB of the most decode-critical
+matrices to dense float32 and keeps the rest quantized. Matrices are
+picked in measured-benefit order - FFN projections first (they dominate
+llama-class decode), then attention q/output, then k/v, then the output
+projection; a token embedding is only densified when it doubles as a tied
+output matrix. Chosen matrices never keep their quantized copy, so unlike
+`ALPACCA_HOT_WEIGHT_MB` nothing is stored twice.
+
+Measured on the same Linux container with a 1.26B-parameter
+TinyLlama-shaped synthetic Q4_0 model (GQA 32/4 heads, untied output;
+`tests/make_bench_model.py --embd 2048 --ff 5632 --layers 22 --heads 32
+--kv 4 --untied`), 32-token prompt / 16-token decode:
+
+| `ALPACCA_DENSE_WEIGHT_MB` | Storage | Prefill | Decode | Peak RSS |
+| --- | --- | ---: | ---: | ---: |
+| unset (all quantized) | 156 quant | 18.1 tok/s | 1.29 tok/s | 1.85 GB |
+| `3100` (FFN stack dense) | 76 quant + 80 dense | 34.6 tok/s | 3.81 tok/s | 4.07 GB |
+| `4000` (all but embedding) | 1 quant + 155 dense | 49.3 tok/s | 7.34 tok/s | 4.79 GB |
+| `ALPACCA_F32=1` (everything) | 156 dense | 53.4 tok/s | 7.37 tok/s | 4.97 GB |
+
+Decode scales almost linearly with how much of the per-token matvec work
+runs through BLAS: the FFN-only budget buys 3.0x decode for ~2.2 GB, and
+the everything-but-embedding budget matches full float32 speed while the
+embedding stays quantized. For an 8B model (e.g. Hermes-3-Llama-3.1-8B
+Q4), the FFN stack is ~22.5 GiB dense, so
+`ALPACCA_DENSE_WEIGHT_MB=24000` is the "fast decode if you have ~35 GB
+total RAM" setting, and smaller budgets degrade gracefully - every MiB
+goes to the highest-impact matrices first. `tests/bench.py` prints the
+resulting storage split per run.
+
 Rules of thumb:
 
 - **with NumPy**: tiny and 1B-class models are the practical target. Use
-  quantized weights when RAM is the constraint, `ALPACCA_F32=1` when decode
-  speed is and the float32 expansion fits comfortably.
+  quantized weights when RAM is the constraint, `ALPACCA_DENSE_WEIGHT_MB`
+  to spend whatever RAM you can spare on decode speed, and `ALPACCA_F32=1`
+  when the full float32 expansion fits comfortably anyway.
 - **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow. Good
   for air-gapped checks, not long conversations.
 - **chat/server reuse**: repeated turns or requests with a shared prompt prefix
@@ -165,13 +200,18 @@ Rules of thumb:
 Useful environment knobs:
 
 - `ALPACCA_PURE=1`: force the standard-library backend.
-- `ALPACCA_F32=1`: force the NumPy loader to expand quantized matrices to
-  float32, useful for A/B checks and small models where BLAS wins.
+- `ALPACCA_DENSE_WEIGHT_MB=N`: densify up to `N` MiB of the most
+  decode-critical matrices at load time (FFN first) and keep the rest
+  quantized - the main RAM-for-speed dial; see the table above.
+- `ALPACCA_F32=1`: force the NumPy loader to expand all quantized matrices
+  to float32, useful for A/B checks and small models where BLAS wins.
 - `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
 - `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense float32 cache for quantized
-  matrices, capped at `N` MiB - a RAM-for-speed dial on top of the quantized
-  storage. (`ALPACCA_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is
-  now the default storage and needs no budget.)
+  matrices, capped at `N` MiB. Unlike the dense budget this caches at first
+  use and keeps the quantized copy too; prefer `ALPACCA_DENSE_WEIGHT_MB`
+  unless you specifically want runtime-populated caching.
+  (`ALPACCA_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is now the
+  default storage and needs no budget.)
 
 ## Roadmap
 

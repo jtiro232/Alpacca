@@ -99,8 +99,10 @@ def main() -> None:
     rss = _rss_mb()
     rss_text = "n/a" if rss is None else f"{rss:.1f}"
 
+    densified_mb = model.weight_storage.get("densified_bytes", 0) / (1024 * 1024)
     print(f"model: {path}")
     print(f"backend: {T.backend_name()}")
+    print(f"storage: {model._storage_description()}")
     print(f"load seconds: {getattr(model, 'load_seconds', 0.0):.3f}")
     print(f"prefill: {len(prompt)} tokens in {prefill_s:.3f}s = {prefill_tps:.2f} tok/s")
     print(f"decode: {decoded} tokens in {decode_s:.3f}s = {decode_tps:.2f} tok/s")
@@ -110,7 +112,7 @@ def main() -> None:
         f"model={path.name} backend={T.backend_name()} "
         f"load_s={getattr(model, 'load_seconds', 0.0):.3f} "
         f"prefill_tps={prefill_tps:.3f} decode_tps={decode_tps:.3f} "
-        f"rss_mb={rss_text}"
+        f"rss_mb={rss_text} dense_budget_mb={densified_mb:.1f}"
     )
 
 
