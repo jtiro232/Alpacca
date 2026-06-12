@@ -390,6 +390,17 @@ def main() -> None:
         check("BPE pretokenizer splits text", "".join(toks) == "Hello there, world! It's 2026...\n  indented",
               str(toks))
 
+        from alpacca.cli import _auto_dense_budget_mb, _available_ram_mb
+        check("auto dense budget formula spends what is left after reserves",
+              _auto_dense_budget_mb(16000.0, 600.0) ==
+              int(0.85 * (16000.0 - 1.2 * 600.0 - 2048.0)))
+        check("auto dense budget formula floors at zero on tight RAM",
+              _auto_dense_budget_mb(2500.0, 600.0) == 0)
+        detected_ram = _available_ram_mb()
+        check("available-RAM detection returns a sane value or None",
+              detected_ram is None or detected_ram > 0,
+              str(detected_ram))
+
         from alpacca.pull import _hf_choose, _hf_collect_parts
         hf_files = [
             {"path": "toy-Q4_K_M-00001-of-00002.gguf", "size": 1, "sha256": ""},
@@ -787,6 +798,22 @@ def main() -> None:
         r = run_cli("run", "hf:test/tiny-GGUF:tiny-q4.gguf", "hi", "-n", "4",
                     "--seed", "1", env=env)
         check("run Q4_0 hf model", "tokens," in r.stderr)
+        if T.HAS_NUMPY:
+            check("run defaults to an auto dense-weight budget",
+                  "auto dense-weight budget:" in r.stderr and
+                  "dense budget 15 matrices" in r.stderr,
+                  r.stderr[-500:])
+            r0 = run_cli("run", "hf:test/tiny-GGUF:tiny-q4.gguf", "hi", "-n", "4",
+                         "--seed", "1",
+                         env={**env, "ALPACCA_DENSE_WEIGHT_MB": "0"})
+            check("ALPACCA_DENSE_WEIGHT_MB=0 keeps the CLI fully quantized",
+                  "auto dense-weight budget:" not in r0.stderr and
+                  "weights quantized Q4_0 (16 matrices)" in r0.stderr,
+                  r0.stderr[-500:])
+        else:
+            check("pure backend skips the auto dense-weight budget",
+                  "auto dense-weight budget:" not in r.stderr,
+                  r.stderr[-500:])
 
         # ---- serve ---------------------------------------------------------
         print("== serve (OpenAI-compatible API) ==")

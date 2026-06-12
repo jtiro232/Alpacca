@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -74,8 +75,86 @@ def _apply_manifest_defaults(local: LocalModel, args) -> None:
         args.system = local.manifest["system"]
 
 
+def _available_ram_mb() -> float | None:
+    """Best-effort available physical RAM in MiB, standard library only."""
+    try:
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+        elif sys.platform == "win32":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32),
+                            ("dwMemoryLoad", ctypes.c_uint32),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            status = _MemStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.ullAvailPhys / (1024.0 * 1024.0)
+        elif sys.platform == "darwin":
+            # macOS has no MemAvailable equivalent in the stdlib; use half
+            # of physical RAM as a conservative stand-in
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            return total / (1024.0 * 1024.0) / 2.0
+    except Exception:
+        return None
+    return None
+
+
+def _auto_dense_budget_mb(avail_mb: float, file_mb: float) -> int:
+    """Dense-weight budget (MiB) that fits beside the quantized residue,
+    KV cache, and runtime baseline, with headroom kept free.
+
+    Conservative on purpose: it reserves the full quantized size even
+    though densified matrices never allocate their quantized form, and
+    spends 85% of what is left.
+    """
+    reserve = 1.2 * file_mb + 2048.0  # quant residue + KV/runtime reserve
+    return max(0, int(0.85 * (avail_mb - reserve)))
+
+
+def _maybe_auto_dense_budget(local: LocalModel) -> None:
+    """Default `alpacca run`/`serve` to the fastest storage this machine
+    affords: size ALPACCA_DENSE_WEIGHT_MB from available RAM unless the
+    user pinned it (any value - `0` keeps everything quantized). This is
+    CLI policy; the library default (Model.load) stays opt-in."""
+    from . import tensor
+    if not tensor.HAS_NUMPY or os.environ.get("ALPACCA_F32"):
+        return
+    if os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None:
+        return
+    avail = _available_ram_mb()
+    if avail is None:
+        print("alpacca: could not detect available RAM; keeping weights "
+              "quantized (set ALPACCA_DENSE_WEIGHT_MB to choose a dense "
+              "budget)", file=sys.stderr)
+        return
+    try:
+        file_mb = local.model_path.stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        return
+    budget = _auto_dense_budget_mb(avail, file_mb)
+    if budget <= 0:
+        return
+    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = str(budget)
+    print(f"auto dense-weight budget: {budget} MiB "
+          f"(~{avail:.0f} MiB RAM available; "
+          f"set ALPACCA_DENSE_WEIGHT_MB=0 to keep weights quantized)",
+          file=sys.stderr)
+
+
 def _load_model(local: LocalModel, args):
     from .model import Model
+    _maybe_auto_dense_budget(local)
     print(f"loading {local.model_path.name}...", file=sys.stderr)
     m = Model.load(str(local.model_path), n_ctx=args.ctx)
     print(m.describe(), file=sys.stderr)
@@ -162,7 +241,6 @@ def cmd_serve(args) -> int:
     _apply_manifest_defaults(local, args)
     model = _load_model(local, args)
     from .serve import serve
-    import os
     host = args.host or os.environ.get("ALPACCA_HOST", "127.0.0.1")
     port = args.port if args.port is not None else int(os.environ.get("ALPACCA_PORT", "8080"))
     serve(model, parse_model_ref(args.model).display(), host, port,

@@ -186,6 +186,18 @@ total RAM" setting, and smaller budgets degrade gracefully - every MiB
 goes to the highest-impact matrices first. `tests/bench.py` prints the
 resulting storage split per run.
 
+**Fast is the default for `alpacca run` and `alpacca serve`**: unless
+`ALPACCA_DENSE_WEIGHT_MB` is set, the CLI sizes the budget automatically
+from detected available RAM (it reserves the quantized residue plus a
+KV/runtime allowance, spends 85% of the rest, and prints the chosen value
+at load). Set `ALPACCA_DENSE_WEIGHT_MB=0` for the low-RAM all-quantized
+mode, or an explicit MiB value to pin the budget. RAM detection uses
+`/proc/meminfo` on Linux, `GlobalMemoryStatusEx` on Windows, and a
+conservative half-of-physical heuristic on macOS; if detection fails the
+CLI says so and stays quantized. Library use (`Model.load`) keeps the
+explicit opt-in semantics so embedders and tests get deterministic
+storage.
+
 Rules of thumb:
 
 - **with NumPy**: tiny and 1B-class models are the practical target. Use
@@ -202,7 +214,9 @@ Useful environment knobs:
 - `ALPACCA_PURE=1`: force the standard-library backend.
 - `ALPACCA_DENSE_WEIGHT_MB=N`: densify up to `N` MiB of the most
   decode-critical matrices at load time (FFN first) and keep the rest
-  quantized - the main RAM-for-speed dial; see the table above.
+  quantized - the main RAM-for-speed dial. The CLI auto-sizes this from
+  available RAM when unset; `0` disables densification; library callers
+  opt in explicitly. See the table above.
 - `ALPACCA_F32=1`: force the NumPy loader to expand all quantized matrices
   to float32, useful for A/B checks and small models where BLAS wins.
 - `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
