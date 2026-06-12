@@ -208,10 +208,12 @@ resulting storage split per run.
 
 **Fast is the default for `alpacca run` and `alpacca serve`**: unless
 `ALPACCA_DENSE_WEIGHT_MB` is set, the CLI sizes the budget automatically
-from detected available RAM (it reserves the quantized residue plus a
-KV/runtime allowance that scales with any explicitly requested context
-window, respects cgroup memory limits inside containers, spends 85% of
-the rest, and prints the chosen value at load). Set
+from detected available RAM (cgroup-aware inside containers). When the
+machine can hold every densifiable matrix - checked exactly from the
+GGUF header against the residual quantized storage and the KV cache at
+the requested context - it spends exactly that; otherwise it reserves
+the quantized residue plus a context-scaled KV/runtime allowance and
+spends 85% of the remainder. The chosen value is printed at load. Set
 `ALPACCA_DENSE_WEIGHT_MB=0` for the low-RAM all-quantized mode, or an
 explicit MiB value to pin the budget - any set value pins the budget,
 and unparseable values fall back to all-quantized. RAM detection uses

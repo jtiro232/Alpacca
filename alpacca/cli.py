@@ -164,7 +164,19 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
         file_mb = local.model_path.stat().st_size / (1024.0 * 1024.0)
     except OSError:
         return
-    budget = _auto_dense_budget_mb(avail, file_mb, n_ctx)
+    # exact-fit first: if the machine can hold every densifiable matrix
+    # (checked from the GGUF header against the residual quantized storage
+    # and the KV cache), spend exactly that; otherwise fall back to the
+    # conservative formula
+    from .model import auto_budget_fit_mb
+    budget = 0
+    fit = auto_budget_fit_mb(str(local.model_path), n_ctx)
+    if fit is not None:
+        eligible_mb, fixed_mb = fit
+        if eligible_mb > 0 and avail - 1024.0 >= eligible_mb + fixed_mb:
+            budget = int(eligible_mb) + 1
+    if budget <= 0:
+        budget = _auto_dense_budget_mb(avail, file_mb, n_ctx)
     if budget <= 0:
         return
     os.environ["ALPACCA_DENSE_WEIGHT_MB"] = str(budget)

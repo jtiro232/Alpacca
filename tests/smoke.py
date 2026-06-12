@@ -436,7 +436,17 @@ def main() -> None:
                                capture_output=True, text=True)
             check(f"write tiny {dtype} model", r.returncode == 0, r.stderr)
 
-        from alpacca.model import Model
+        from alpacca.model import Model, auto_budget_fit_mb
+        fit = auto_budget_fit_mb(str(srv / "tiny-q4.gguf"))
+        # tiny-q4 (untied): eligible = 6 ffn x 32768B + 8 attn x 16384B +
+        # output 307*64*4B = 406272 B; fixed = embd residual + KV + 512 base
+        check("auto budget fit sizing matches the header arithmetic",
+              fit is not None and
+              abs(fit[0] * 1024 * 1024 - 406272) < 1.0 and
+              512.0 < fit[1] < 514.0,
+              str(fit))
+        check("auto budget fit sizing is None for unreadable models",
+              auto_budget_fit_mb(str(srv / "does-not-exist.gguf")) is None)
         for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
                           ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
                           ("Q5_1", "tiny-q51.gguf"),

@@ -66,6 +66,68 @@ def _dense_budget_bytes() -> int:
         return 0
 
 
+def auto_budget_fit_mb(path: str, n_ctx: int = 0):
+    """Exact sizing inputs for the CLI's auto dense budget, from the GGUF
+    header alone: (eligible_mb, fixed_mb) where eligible_mb is the dense
+    float32 size of every matrix the densify plan could select, and
+    fixed_mb covers what stays resident regardless - residual quantized
+    storage (~1.3 B/weight upper bound), the KV cache at the effective
+    context, and a runtime baseline. Returns None if the header cannot be
+    read or the architecture is unsupported."""
+    try:
+        gf = GGUFFile.open(path)
+    except Exception:
+        return None
+    try:
+        arch = gf.architecture
+        if arch not in SUPPORTED_ARCHES:
+            return None
+
+        def meta(key, default=None):
+            return gf.get(f"{arch}.{key}", default)
+
+        n_layer = int(meta("block_count", 0) or 0)
+        n_embd = int(meta("embedding_length", 0) or 0)
+        n_head = int(meta("attention.head_count", 1) or 1)
+        n_kv = int(meta("attention.head_count_kv", n_head) or n_head)
+        head_dim = int(meta("attention.key_length", n_embd // max(n_head, 1))
+                       or n_embd // max(n_head, 1))
+        train_ctx = int(meta("context_length", 4096) or 4096)
+        if n_layer <= 0 or n_embd <= 0:
+            return None
+
+        tied = "output.weight" not in gf.tensors
+        eligible = 0
+        residual = 0
+        for tier in _DENSIFY_TIERS:
+            for role in tier:
+                if role == "output":
+                    names = ["token_embd.weight" if tied else "output.weight"]
+                else:
+                    names = [f"blk.{i}.{role}.weight" for i in range(n_layer)]
+                for nm in names:
+                    info = gf.tensors.get(nm)
+                    if info is None or len(info.shape) < 2:
+                        continue
+                    if T.can_quantized_matvec(info.dtype, int(info.shape[0])):
+                        eligible += info.n_elements * 4
+        if not tied:
+            embd = gf.tensors.get("token_embd.weight")
+            if embd is not None and len(embd.shape) >= 2 and \
+                    T.can_quantized_matvec(embd.dtype, int(embd.shape[0])):
+                residual += int(embd.n_elements * 1.3)
+
+        ctx_eff = min(train_ctx, n_ctx) if n_ctx else min(train_ctx, 4096)
+        kv_bytes = 2 * n_layer * max(ctx_eff, 0) * n_kv * head_dim * 4
+        mib = 1024.0 * 1024.0
+        fixed_mb = residual / mib + kv_bytes / mib + 512.0
+        return eligible / mib, fixed_mb
+    except Exception:
+        return None
+    finally:
+        gf.close()
+
+
 @dataclass
 class Hyperparams:
     arch: str
