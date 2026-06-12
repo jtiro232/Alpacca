@@ -3,25 +3,45 @@
 **LLMs in your terminal - a from-scratch, 100% Python inference engine for
 GGUF models, with Ollama-style model management. Zero dependencies.**
 
-Alpacca is not a wrapper around llama.cpp, PyTorch, or anything else. The
-entire stack is implemented in this repository, in Python, on the standard
-library alone:
+## Mission
+
+Alpacca stands on three commitments:
+
+1. **Totally our own software.** Every layer is implemented from scratch
+   in this repository: the GGUF parser, the quantization codecs, the
+   tokenizers, the transformer, the sampler, the chat templates, the
+   OpenAI-compatible server, and the registry clients. It is not a wrapper
+   around llama.cpp, PyTorch, or anything else - no vendored code, no
+   binaries, no submodules. You can read the whole engine in an afternoon.
+2. **Pure Python.** The engine runs on the standard library alone, on any
+   Python >= 3.10. NumPy is the single optional accelerator: auto-detected
+   when installed (10-100x faster math), never required. `ALPACCA_PURE=1`
+   forces the stdlib path. Both backends produce matching results and
+   verify each other in CI.
+3. **Fast and reliable - honestly.** Speed is engineered as far as Python
+   plus NumPy can go: quantized int8 weight storage, a hybrid
+   dense/quantized policy that auto-tunes to your machine's RAM, batched
+   prefill, KV-cache reuse. Every number in this README is measured, and
+   the ceilings are documented next to the wins. Reliability means a CI
+   matrix across Linux/macOS/Windows with and without NumPy (300+ checks)
+   plus a real-model generation gate on every push.
+
+## Structure
 
 | Layer | Where | What's implemented |
 | --- | --- | --- |
 | GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
 | Quantization | `alpacca/quants.py` | F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
+| Quantized weights | `alpacca/qmatrix.py` | int8 codes + folded scales in RAM; matvec/matmul kernels, hot cache |
 | Tokenizers | `alpacca/tokenizer.py` | SentencePiece-style (Viterbi + byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
-| Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache |
+| Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
 | Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
 | Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, interactive REPL |
 | API server | `alpacca/serve.py` | OpenAI-compatible `/v1/chat/completions` (incl. SSE streaming) on `http.server` |
 | Model manager | `alpacca/store.py`, `alpacca/pull.py` | Ollama-registry protocol + Hugging Face pulls via `urllib`, resumable, SHA-256 verified |
-
-If NumPy happens to be installed it is auto-detected and used as a math
-accelerator (10-100x faster); without it everything still runs, just slowly.
-Set `ALPACCA_PURE=1` to force the stdlib path. Both backends produce
-identical results and verify each other in CI.
+| CLI | `alpacca/cli.py` | pull/run/serve/list/show/rm/tokenize/doctor; auto RAM-aware speed defaults |
+| Tests | `tests/` | 300+ checks: offline smoke (mock registry, kernel parity, both backends), real-model gate, benchmarks, synthetic bench-model builders |
+| Tooling | `scripts/` | offline installers for Linux/macOS/Windows |
 
 ```text
 $ alpacca pull llama3.2:1b            # straight from the Ollama registry
@@ -232,30 +252,53 @@ Useful environment knobs:
 
 ## Roadmap
 
-Alpacca's near-term goal is to stay inspectable and Python-first while making
-the fast path more practical. Current status:
+The mission is fixed - pure Python, fast and reliable, all our own code -
+and the roadmap orders the work that serves it.
 
-- **Done**: batched NumPy prefill with last-token-only vocab projection.
-- **Done**: prefix-aware KV-cache reuse across chat turns and serialized server
-  requests.
-- **Done**: quantized matrix storage (int8 codes + per-sub-block scales,
-  unpacked once at load) with matvec/matmul/row dispatch for
-  Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; other formats fall back to dense
-  float32.
-- **Done**: documented the NumPy quantized-decode ceiling with kernel-level
-  measurements (see "Honest performance expectations"); pushing past it
-  requires a native/accelerated backend, below.
-- **Backend selection**: keep the current stdlib and NumPy paths, then add
-  optional accelerated backends behind clear flags. Candidate backends include
-  Numba, CuPy, PyTorch, Triton, or small native kernels exposed through Python.
-- **Kernel fusion**: continue fusing common transformer operations where the
-  selected backend can do so without excessive memory duplication.
-- **Model compatibility gates**: add recurring real-model tests for Q5_K/Q6_K,
-  qwen, gemma, mistral, and larger llama-family GGUFs.
-- **Operational UX**: improve Windows launchers, model selection, and clearer
-  warnings for split GGUFs, unsupported architectures, and memory-heavy runs.
-- **Server compatibility**: broaden OpenAI-compatible API behavior while keeping
-  the standard-library server usable in offline environments.
+**Landed recently**
+
+- Quantized int8 weight storage for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/
+  Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight, nothing
+  re-dequantized per token (2.9x decode over the previous engine); other
+  formats fall back to dense float32.
+- The dense-weight budget (`ALPACCA_DENSE_WEIGHT_MB`): spend RAM on BLAS
+  speed exactly where it pays, FFN projections first - and the CLI sizes
+  it automatically from available RAM (cgroup-aware in containers,
+  scales its reserve with the requested context), so `alpacca run` is as
+  fast as the machine affords by default.
+- Batched prefill with last-token-only vocab projection, prefix-aware
+  KV-cache reuse across chat turns and server requests, decode-overhead
+  trims (grouped attention, precomputed RoPE tables, BLAS-dot rmsnorm).
+- A kernel-level study documenting the NumPy quantized-decode ceiling
+  (see "Honest performance expectations") so the speed story stays
+  honest.
+
+**Next**
+
+- *Reliability:* broaden the real-model CI gates beyond stories15M
+  (K-quant files, qwen2/3, gemma, mistral, 1B-class llama); harden the
+  GGUF parser against malformed files; add a server soak test.
+- *Pure-path memory:* move stdlib-only weight and KV storage from Python
+  lists (~38 bytes per weight, measured) to `array('f')` (~4), with
+  optional raw-quant storage, so air-gapped stdlib mode can hold
+  1B-class models in normal RAM.
+- *Performance within the constraint:* refine the densify ranking with
+  per-matrix measurements, keep shaving prefill and per-token overhead,
+  evaluate an f16 KV cache option if it proves simple and safe.
+- *Operational UX:* clearer RAM/budget messaging, Windows polish, better
+  guidance for split GGUFs and unsupported architectures.
+- *Server:* broaden OpenAI-compatible behavior while staying on
+  `http.server` and usable fully offline.
+
+**Non-goals**
+
+- Wrapping llama.cpp, Ollama, PyTorch, or any third-party inference
+  runtime - that would be someone else's software.
+- Shipping compiled code. If a native fast path ever proves worth it, it
+  would be our own small, optional, clearly-flagged kernels - and the
+  engine must always run, and stay readable, as pure Python.
+- Marketing numbers. When a performance gate is not met, this README
+  says so.
 
 ## Testing
 
@@ -273,8 +316,9 @@ python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
                                   # birthday; --model ... for bigger models
 ```
 
-CI runs the offline suite on Linux/macOS/Windows, with and without NumPy,
-plus the real-model gate.
+CI runs the offline suite on Linux/macOS/Windows, with and without NumPy
+(187 checks on the NumPy backend, 117 pure-stdlib), plus the real-model
+generation gate on every push.
 
 ## Security & supply chain
 
@@ -286,11 +330,11 @@ plus the real-model gate.
   licenses - when the publisher provides one, it is stored next to the
   weights.
 
-## Credits & licensing
+## Credits
 
-Alpacca is MIT licensed (see [LICENSE](LICENSE)). All code here is written
-from scratch in Python. It interoperates with formats and protocols designed
-by others, with thanks - see
+All code here is written from scratch in Python by the Alpacca project.
+It interoperates with formats and protocols designed by others, with
+thanks - see
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md): the GGUF format and
 quantization schemes (ggml/llama.cpp project), the Ollama registry protocol,
 and the SentencePiece/BPE tokenization algorithms.

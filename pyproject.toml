@@ -7,7 +7,7 @@ name = "alpacca"
 version = "0.2.0"
 description = "LLMs in your terminal - a from-scratch, pure-Python GGUF inference engine with Ollama-style model management"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = { text = "MIT" }
 requires-python = ">=3.10"
 # Intentionally empty: alpacca runs on the standard library alone.
 # NumPy, if installed, is auto-detected and used as an accelerator.
