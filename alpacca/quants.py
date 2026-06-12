@@ -309,66 +309,99 @@ _PURE_DECODERS = {
 }
 
 
+# ---- quantized block geometry ---------------------------------------------
+# dtype -> (block_elements, block_bytes, sub_block_len, affine)
+# `sub_block_len` is the run of consecutive elements sharing one effective
+# scale (and offset, when `affine`). Available without NumPy so the pure
+# backend can slice rows out of raw block bytes.
+QUANT_GEOMETRY = {
+    "Q8_0": (QK, 34, 32, False),
+    "Q4_0": (QK, 18, 32, False),
+    "Q4_1": (QK, 20, 32, True),
+    "Q5_0": (QK, 22, 32, False),
+    "Q5_1": (QK, 24, 32, True),
+    "Q4_K": (QK_K, 144, 32, True),
+    "Q5_K": (QK_K, 176, 32, True),
+    "Q6_K": (QK_K, 210, 16, False),
+}
+
+
 # ---- NumPy fast paths ----------------------------------------------------
+#
+# Each unpacker decodes raw blocks into the shared compact representation
+# used by both `dequantize` and `alpacca.qmatrix.QuantMatrix`:
+#   codes int8 (nb, block_elements)  - quant codes in element order
+#   d_eff float32 (nb, n_sub)        - effective scale per sub-block
+#   m_eff float32 (nb, n_sub) | None - effective offset per sub-block
+# so that value = d_eff * code (+ m_eff).
 
 def _np_blocks(data, nb, block_bytes):
-    return _np.frombuffer(bytes(data), dtype=_np.uint8).reshape(nb, block_bytes)
+    return _np.frombuffer(data, dtype=_np.uint8).reshape(nb, block_bytes)
 
 
-def _np_deq_q8_0(data, n):
-    nb = n // QK
-    b = _np_blocks(data, nb, 34)
-    d = b[:, 0:2].copy().view(_np.float16).astype(_np.float32)
-    qs = b[:, 2:34].view(_np.int8).astype(_np.float32)
-    return (d * qs).reshape(-1)
+def _np_f16_col(b, off):
+    return b[:, off:off + 2].copy().view(_np.float16).astype(_np.float32)
 
 
-def _np_deq_q4_0(data, n):
-    nb = n // QK
-    b = _np_blocks(data, nb, 18)
-    d = b[:, 0:2].copy().view(_np.float16).astype(_np.float32)
+def _np_unpack_q8_0(b):
+    d = _np_f16_col(b, 0)
+    q = b[:, 2:34].view(_np.int8).copy()
+    return q, d, None
+
+
+def _np_unpack_q4_0(b):
+    d = _np_f16_col(b, 0)
     qs = b[:, 2:18]
-    lo = (qs & 0x0F).astype(_np.int8) - 8
-    hi = (qs >> 4).astype(_np.int8) - 8
-    out = _np.concatenate([lo, hi], axis=1).astype(_np.float32)
-    return (d * out).reshape(-1)
+    q = _np.empty((b.shape[0], QK), dtype=_np.int8)
+    q[:, :16] = (qs & 0x0F).view(_np.int8)
+    q[:, 16:] = (qs >> 4).view(_np.int8)
+    q -= 8
+    return q, d, None
 
 
-def _np_deq_q4_k(data, n):
-    nb = n // QK_K
-    b = _np_blocks(data, nb, 144)
-    d = b[:, 0:2].copy().view(_np.float16).astype(_np.float32)      # (nb,1)
-    dmin = b[:, 2:4].copy().view(_np.float16).astype(_np.float32)
-    scales = b[:, 4:16]
-    qs = b[:, 16:144]
-    sc = _np.empty((nb, 8), dtype=_np.float32)
-    mn = _np.empty((nb, 8), dtype=_np.float32)
-    for j in range(8):  # unpack 6-bit scale/min pairs
-        if j < 4:
-            sc[:, j] = (scales[:, j] & 63).astype(_np.float32)
-            mn[:, j] = (scales[:, j + 4] & 63).astype(_np.float32)
-        else:
-            sc[:, j] = ((scales[:, j + 4] & 0x0F) | ((scales[:, j - 4] >> 6) << 4)).astype(_np.float32)
-            mn[:, j] = ((scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)).astype(_np.float32)
-    out = _np.empty((nb, QK_K), dtype=_np.float32)
-    for half in range(4):  # 4 chunks of 32 bytes -> 2 sub-blocks each
-        chunk = qs[:, half * 32:(half + 1) * 32]
-        lo = (chunk & 0x0F).astype(_np.float32)
-        hi = (chunk >> 4).astype(_np.float32)
-        j1, j2 = 2 * half, 2 * half + 1
-        out[:, j1 * 32:(j1 + 1) * 32] = d * sc[:, j1:j1 + 1] * lo - dmin * mn[:, j1:j1 + 1]
-        out[:, j2 * 32:(j2 + 1) * 32] = d * sc[:, j2:j2 + 1] * hi - dmin * mn[:, j2:j2 + 1]
-    return out.reshape(-1)
+def _np_unpack_q4_1(b):
+    d = _np_f16_col(b, 0)
+    m = _np_f16_col(b, 2)
+    qs = b[:, 4:20]
+    q = _np.empty((b.shape[0], QK), dtype=_np.int8)
+    q[:, :16] = (qs & 0x0F).view(_np.int8)
+    q[:, 16:] = (qs >> 4).view(_np.int8)
+    return q, d, m
 
 
-def _np_deq_q5_k(data, n):
-    nb = n // QK_K
-    b = _np_blocks(data, nb, 176)
-    d = b[:, 0:2].copy().view(_np.float16).astype(_np.float32)
-    dmin = b[:, 2:4].copy().view(_np.float16).astype(_np.float32)
-    scales = b[:, 4:16]
-    qh = b[:, 16:48]
-    qs = b[:, 48:176]
+def _np_high_bits(qh_u32):
+    """Per-element 5th bit (already shifted to 0x10) from a u32 mask column."""
+    shifts = _np.arange(32, dtype=_np.uint32)
+    return (((qh_u32 >> shifts) & 1) << 4).astype(_np.uint8)
+
+
+def _np_unpack_q5_0(b):
+    d = _np_f16_col(b, 0)
+    qh = b[:, 2:6].copy().view(_np.uint32)
+    hi5 = _np_high_bits(qh)
+    qs = b[:, 6:22]
+    q = _np.empty((b.shape[0], QK), dtype=_np.int8)
+    q[:, :16] = ((qs & 0x0F) | hi5[:, :16]).view(_np.int8)
+    q[:, 16:] = ((qs >> 4) | hi5[:, 16:]).view(_np.int8)
+    q -= 16
+    return q, d, None
+
+
+def _np_unpack_q5_1(b):
+    d = _np_f16_col(b, 0)
+    m = _np_f16_col(b, 2)
+    qh = b[:, 4:8].copy().view(_np.uint32)
+    hi5 = _np_high_bits(qh)
+    qs = b[:, 8:24]
+    q = _np.empty((b.shape[0], QK), dtype=_np.int8)
+    q[:, :16] = ((qs & 0x0F) | hi5[:, :16]).view(_np.int8)
+    q[:, 16:] = ((qs >> 4) | hi5[:, 16:]).view(_np.int8)
+    return q, d, m
+
+
+def _np_unpack_k_scales(scales):
+    """6-bit packed scale/min pairs of Q4_K/Q5_K -> float32 (nb, 8) each."""
+    nb = scales.shape[0]
     sc = _np.empty((nb, 8), dtype=_np.float32)
     mn = _np.empty((nb, 8), dtype=_np.float32)
     for j in range(8):
@@ -378,50 +411,97 @@ def _np_deq_q5_k(data, n):
         else:
             sc[:, j] = ((scales[:, j + 4] & 0x0F) | ((scales[:, j - 4] >> 6) << 4)).astype(_np.float32)
             mn[:, j] = ((scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)).astype(_np.float32)
-    out = _np.empty((nb, QK_K), dtype=_np.float32)
+    return sc, mn
+
+
+def _np_unpack_q4_k(b):
+    d = _np_f16_col(b, 0)
+    dmin = _np_f16_col(b, 2)
+    sc, mn = _np_unpack_k_scales(b[:, 4:16])
+    qs = b[:, 16:144]
+    q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
+    for half in range(4):  # 4 chunks of 32 bytes -> 2 sub-blocks each
+        chunk = qs[:, half * 32:(half + 1) * 32]
+        q[:, half * 64:half * 64 + 32] = (chunk & 0x0F).view(_np.int8)
+        q[:, half * 64 + 32:half * 64 + 64] = (chunk >> 4).view(_np.int8)
+    return q, d * sc, -(dmin * mn)
+
+
+def _np_unpack_q5_k(b):
+    d = _np_f16_col(b, 0)
+    dmin = _np_f16_col(b, 2)
+    sc, mn = _np_unpack_k_scales(b[:, 4:16])
+    qh = b[:, 16:48]
+    qs = b[:, 48:176]
+    q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
     for half in range(4):
         chunk = qs[:, half * 32:(half + 1) * 32]
         j1, j2 = 2 * half, 2 * half + 1
-        hb1 = ((qh >> j1) & 1).astype(_np.float32) * 16.0
-        hb2 = ((qh >> j2) & 1).astype(_np.float32) * 16.0
-        lo = (chunk & 0x0F).astype(_np.float32) + hb1
-        hi = (chunk >> 4).astype(_np.float32) + hb2
-        out[:, j1 * 32:(j1 + 1) * 32] = d * sc[:, j1:j1 + 1] * lo - dmin * mn[:, j1:j1 + 1]
-        out[:, j2 * 32:(j2 + 1) * 32] = d * sc[:, j2:j2 + 1] * hi - dmin * mn[:, j2:j2 + 1]
-    return out.reshape(-1)
+        hb1 = ((qh >> j1) & 1) << 4
+        hb2 = ((qh >> j2) & 1) << 4
+        q[:, j1 * 32:(j1 + 1) * 32] = ((chunk & 0x0F) | hb1).view(_np.int8)
+        q[:, j2 * 32:(j2 + 1) * 32] = ((chunk >> 4) | hb2).view(_np.int8)
+    return q, d * sc, -(dmin * mn)
 
 
-def _np_deq_q6_k(data, n):
-    nb = n // QK_K
-    b = _np_blocks(data, nb, 210)
+def _np_unpack_q6_k(b):
     ql = b[:, 0:128]
     qh = b[:, 128:192]
-    sc = b[:, 192:208].view(_np.int8).astype(_np.float32)
-    d = b[:, 208:210].copy().view(_np.float16).astype(_np.float32)
-    out = _np.empty((nb, QK_K), dtype=_np.float32)
+    sc = b[:, 192:208].view(_np.int8).astype(_np.float32)  # (nb, 16)
+    d = _np_f16_col(b, 208)
+    q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
     for half in range(2):  # two 128-element halves
         qlh = ql[:, half * 64:(half + 1) * 64]
         qhh = qh[:, half * 32:(half + 1) * 32]
-        sch = sc[:, half * 8:(half + 1) * 8]
-        q1 = ((qlh[:, :32] & 0xF) | (((qhh >> 0) & 3) << 4)).astype(_np.int16) - 32
-        q2 = ((qlh[:, 32:] & 0xF) | (((qhh >> 2) & 3) << 4)).astype(_np.int16) - 32
-        q3 = ((qlh[:, :32] >> 4) | (((qhh >> 4) & 3) << 4)).astype(_np.int16) - 32
-        q4 = ((qlh[:, 32:] >> 4) | (((qhh >> 6) & 3) << 4)).astype(_np.int16) - 32
         base = half * 128
-        for sub, q in enumerate((q1, q2, q3, q4)):
-            # each 32-element sub-block uses two scales, one per 16 elements
-            s = _np.repeat(sch[:, [sub * 2, sub * 2 + 1]], 16, axis=1)
-            out[:, base + sub * 32: base + (sub + 1) * 32] = d * s * q.astype(_np.float32)
-    return out.reshape(-1)
+        q[:, base + 0:base + 32] = (
+            ((qlh[:, :32] & 0xF) | (((qhh >> 0) & 3) << 4)).view(_np.int8))
+        q[:, base + 32:base + 64] = (
+            ((qlh[:, 32:] & 0xF) | (((qhh >> 2) & 3) << 4)).view(_np.int8))
+        q[:, base + 64:base + 96] = (
+            ((qlh[:, :32] >> 4) | (((qhh >> 4) & 3) << 4)).view(_np.int8))
+        q[:, base + 96:base + 128] = (
+            ((qlh[:, 32:] >> 4) | (((qhh >> 6) & 3) << 4)).view(_np.int8))
+    q -= 32
+    return q, d * sc, None
 
 
-_NP_DECODERS = {
-    "Q8_0": _np_deq_q8_0,
-    "Q4_0": _np_deq_q4_0,
-    "Q4_K": _np_deq_q4_k,
-    "Q5_K": _np_deq_q5_k,
-    "Q6_K": _np_deq_q6_k,
+_NP_UNPACKERS = {
+    "Q8_0": _np_unpack_q8_0,
+    "Q4_0": _np_unpack_q4_0,
+    "Q4_1": _np_unpack_q4_1,
+    "Q5_0": _np_unpack_q5_0,
+    "Q5_1": _np_unpack_q5_1,
+    "Q4_K": _np_unpack_q4_k,
+    "Q5_K": _np_unpack_q5_k,
+    "Q6_K": _np_unpack_q6_k,
 }
+
+
+def np_unpack(data, n: int, dtype: str):
+    """Unpack `n` elements of raw GGUF blocks into (codes, d_eff, m_eff).
+
+    codes is int8 (nb, block_elements) in element order; d_eff/m_eff are
+    float32 (nb, n_sub) so that value = d_eff * code (+ m_eff) per sub-block
+    of QUANT_GEOMETRY[dtype] sub_block_len elements. Requires NumPy.
+    """
+    if _np is None:
+        raise RuntimeError("np_unpack requires NumPy")
+    if dtype not in _NP_UNPACKERS:
+        raise ValueError(f"np_unpack does not support {dtype}")
+    block_n, block_b, _sub, _aff = QUANT_GEOMETRY[dtype]
+    if n % block_n:
+        raise ValueError(f"{dtype} needs a multiple of {block_n} elements")
+    return _NP_UNPACKERS[dtype](_np_blocks(data, n // block_n, block_b))
+
+
+def _np_assemble(q, d_eff, m_eff, sub_len):
+    nb, block_n = q.shape
+    out = q.astype(_np.float32).reshape(nb, block_n // sub_len, sub_len)
+    out *= d_eff[:, :, None]
+    if m_eff is not None:
+        out += m_eff[:, :, None]
+    return out.reshape(-1)
 
 
 def dequantize(data, n: int, dtype: str):
@@ -435,15 +515,15 @@ def dequantize(data, n: int, dtype: str):
             f"(supported: {', '.join(sorted(_PURE_DECODERS))})")
     if _np is not None:
         if dtype == "F32":
-            return _np.frombuffer(bytes(data), dtype=_np.float32).copy()
+            return _np.frombuffer(data, dtype=_np.float32).copy()
         if dtype == "F16":
-            return _np.frombuffer(bytes(data), dtype=_np.float16).astype(_np.float32)
+            return _np.frombuffer(data, dtype=_np.float16).astype(_np.float32)
         if dtype == "BF16":
-            raw = _np.frombuffer(bytes(data), dtype=_np.uint16).astype(_np.uint32) << 16
+            raw = _np.frombuffer(data, dtype=_np.uint16).astype(_np.uint32) << 16
             return raw.view(_np.float32).copy()
-        fast = _NP_DECODERS.get(dtype)
-        if fast is not None:
-            return fast(data, n)
+        if dtype in _NP_UNPACKERS:
+            q, d_eff, m_eff = np_unpack(data, n, dtype)
+            return _np_assemble(q, d_eff, m_eff, QUANT_GEOMETRY[dtype][2])
         return _np.asarray(_PURE_DECODERS[dtype](data, n), dtype=_np.float32)
     return _PURE_DECODERS[dtype](data, n)
 

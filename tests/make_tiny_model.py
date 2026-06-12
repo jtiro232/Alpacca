@@ -4,8 +4,9 @@ GGUF writer - no third-party packages needed.
 
 The model is gibberish but loads and generates, which is what the tests
 need. usage: python3 tests/make_tiny_model.py out.gguf [dtype]
-(dtype: F32 (default), F16, Q8_0, Q4_0, or raw Q2_K/Q4_K/Q5_K/Q6_K -
-quantized variants exercise the dequantizers and quantized matvec loader paths.)
+(dtype: F32 (default), F16, Q8_0, Q4_0, or raw Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/
+Q5_K/Q6_K - quantized variants exercise the dequantizers and quantized
+matvec loader paths. Raw classic variants keep their norm vectors F32.)
 """
 from __future__ import annotations
 
@@ -132,28 +133,55 @@ def main(path: str, dtype: str = "F32") -> None:
             out += ql + qh + struct.pack("<16b", *scales) + struct.pack("<e", d)
         return bytes(out)
 
+    def raw_q4_1(n: int) -> bytes:
+        if n % 32:
+            raise ValueError("Q4_1 needs a multiple of 32 values")
+        out = bytearray()
+        for block in range(n // 32):
+            d = 0.0078125 + (block % 7) * 0.0009765625
+            m = -0.0625 + (block % 5) * 0.03125
+            qs = bytes(rng.randrange(256) for _ in range(16))
+            out += struct.pack("<ee", d, m) + qs
+        return bytes(out)
+
+    def raw_q5_0(n: int) -> bytes:
+        if n % 32:
+            raise ValueError("Q5_0 needs a multiple of 32 values")
+        out = bytearray()
+        for block in range(n // 32):
+            d = 0.0078125 + (block % 7) * 0.0009765625
+            qh = bytes(rng.randrange(256) for _ in range(4))
+            qs = bytes(rng.randrange(256) for _ in range(16))
+            out += struct.pack("<e", d) + qh + qs
+        return bytes(out)
+
+    def raw_q5_1(n: int) -> bytes:
+        if n % 32:
+            raise ValueError("Q5_1 needs a multiple of 32 values")
+        out = bytearray()
+        for block in range(n // 32):
+            d = 0.0078125 + (block % 7) * 0.0009765625
+            m = -0.0625 + (block % 5) * 0.03125
+            qh = bytes(rng.randrange(256) for _ in range(4))
+            qs = bytes(rng.randrange(256) for _ in range(16))
+            out += struct.pack("<ee", d, m) + qh + qs
+        return bytes(out)
+
+    raw_makers = {"Q2_K": raw_q2_k, "Q4_K": raw_q4_k, "Q5_K": raw_q5_k,
+                  "Q6_K": raw_q6_k, "Q4_1": raw_q4_1, "Q5_0": raw_q5_0,
+                  "Q5_1": raw_q5_1}
+
     def add_weight(name: str, shape: tuple[int, ...], values: list[float],
                    tdtype: str) -> None:
-        if tdtype == "Q2_K":
+        maker = raw_makers.get(tdtype)
+        if maker is not None:
+            if tdtype in ("Q4_1", "Q5_0", "Q5_1") and len(shape) == 1:
+                w.add_tensor(name, shape, values, "F32")  # keep norms sane
+                return
             n = 1
             for dim in shape:
                 n *= dim
-            w.add_raw_tensor(name, shape, tdtype, raw_q2_k(n))
-        elif tdtype == "Q4_K":
-            n = 1
-            for dim in shape:
-                n *= dim
-            w.add_raw_tensor(name, shape, tdtype, raw_q4_k(n))
-        elif tdtype == "Q5_K":
-            n = 1
-            for dim in shape:
-                n *= dim
-            w.add_raw_tensor(name, shape, tdtype, raw_q5_k(n))
-        elif tdtype == "Q6_K":
-            n = 1
-            for dim in shape:
-                n *= dim
-            w.add_raw_tensor(name, shape, tdtype, raw_q6_k(n))
+            w.add_raw_tensor(name, shape, tdtype, maker(n))
         else:
             w.add_tensor(name, shape, values, tdtype)
 

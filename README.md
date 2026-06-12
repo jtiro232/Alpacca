@@ -96,40 +96,66 @@ stablelm, gemma. Chat templates are detected from the model's metadata.
 ### Honest performance expectations
 
 This engine values clarity, auditability, and zero dependencies over raw
-speed. The NumPy path now batches prompt prefill, reuses the KV cache for
-shared prompt prefixes, and can keep Q4_0, Q4_K, Q5_K, Q6_K, and Q8_0 matrix
-weights in their GGUF quantized bytes instead of eagerly expanding every
-matrix to float32. Supported non-matvec quantized formats fall back to
-float32.
+speed. The NumPy path batches prompt prefill, reuses the KV cache for shared
+prompt prefixes, and keeps Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, and
+Q6_K matrix weights quantized in RAM: at load each matrix is unpacked once
+into int8 quant codes plus per-sub-block float32 scales (about 1.1-1.3
+bytes per weight instead of 4), and decode/prefill kernels consume that
+form directly - nothing is re-dequantized per token. F16/BF16 and the
+remaining quant formats load as dense float32 (measured: NumPy's
+float16-to-float32 conversion is far slower than the BLAS GEMV it would
+feed, so wrapping F16 would only slow decode down).
 
-Measured on this Windows/NumPy workstation with
-`tests/bench.py --ctx 128`:
+Measured on a 4-core Intel Xeon 2.80 GHz Linux container, Python 3.11,
+NumPy 2.4.6 (OpenBLAS), with a stories15M-shaped synthetic model from
+`tests/make_bench_model.py` (same architecture dimensions as the real
+stories15M; CI runs the real one):
 
-| Model | Mode | Load | Prefill | Decode | RSS |
+| Run (`tests/bench.py`) | Mode | Load | Prefill | Decode | Peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: |
-| stories15M Q4_0, 64 prompt / 32 decode | quantized weights | 0.028 s | 1,322 tok/s | 26.6 tok/s | n/a on Windows |
-| stories15M Q4_0, same run | `ALPACCA_F32=1` dense weights | 0.086 s | 6,721 tok/s | 301.8 tok/s | n/a on Windows |
-| stories15M Q4_0, 64 prompt / 2 decode | `ALPACCA_PREFILL_CHUNK=1` | 0.028 s | 28.0 tok/s | not comparable | n/a on Windows |
+| Q4_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.088 s | 1,441 tok/s | 55.2 tok/s | 65.4 MB |
+| Q4_0, same run | `ALPACCA_F32=1` dense | 0.136 s | 3,393 tok/s | 123.3 tok/s | 107.1 MB |
+| Q4_0, 256 prompt / 128 decode, ctx 512 | quantized weights | 0.102 s | 3,249 tok/s | 56.1 tok/s | 71.2 MB |
+| Q4_0, same run | `ALPACCA_F32=1` dense | 0.123 s | 4,511 tok/s | 131.1 tok/s | 115.6 MB |
+| Q8_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.072 s | 1,789 tok/s | 58.5 tok/s | 72.4 MB |
+| F32 GGUF, 64 prompt / 32 decode | native dense | 0.091 s | 3,178 tok/s | 127.3 tok/s | 156.5 MB |
 
-That last row is the old prompt-processing shape: token-at-a-time prefill. The
-default batched prefill is about 47x faster on the same small model. Decode is
-more nuanced: for very small models, dense float32 BLAS can still beat Python
-quantized matvec by a wide margin. Quantized storage is mainly a load-time and
-memory tool here, and it becomes more relevant as models grow past comfortable
-float32 RAM sizes. It is not a claim of llama.cpp-style quantized decode speed.
+(The previous revision of this engine decoded the same quantized model at
+19.4 tok/s on this machine - the int8 unpacked storage is a 2.7-2.9x decode
+and ~2.3x prefill improvement - but see the next paragraph before
+expecting quantized to beat float32.)
+
+What quantized storage does and does not buy here, measured honestly:
+
+- **Memory**: weight storage is 17.1 MB vs 60.8 MB float32 for the same
+  model (0.28x, measured). Whole-process RSS at this tiny model size is
+  dominated by the ~50 MB Python+NumPy baseline, so it shows 65 MB vs
+  107 MB (0.61x); the ratio approaches the 0.28x storage ratio as models
+  grow. RSS is reported by `tests/bench.py` on Linux/macOS and is `n/a`
+  on Windows (no `resource` module).
+- **Load time**: 0.088 s vs 0.136 s for float32 expansion (writes ~1.1
+  bytes per weight instead of 4; the advantage grows with model size).
+- **Decode speed**: quantized decode remains ~0.45x of `ALPACCA_F32=1`
+  dense decode. This is a measured NumPy ceiling, not a missing
+  optimization in this codebase: OpenBLAS SGEMV runs multithreaded at
+  memory bandwidth (0.53 ms for the dominant 32000x288 output projection),
+  while NumPy has no mixed int8xf32 GEMV primitive - every strategy
+  (einsum, astype+GEMV, integer matmul) pays a single-threaded conversion
+  pass that costs 4.5-9 ms on the same matrix. Per-token profile of the
+  quantized path: 81% quantized matvec (58% just the output projection),
+  19% everything else. Beating BLAS by 2x with quantized weights needs
+  native SIMD dot-product kernels (llama.cpp-class), which is an explicit
+  non-goal here.
 
 Rules of thumb:
 
-- **with NumPy**: tiny and 1B-class models are the practical target; larger
-  quantized models can load with much less RAM than full float32, but Python
-  quantized matvec remains the limiter.
+- **with NumPy**: tiny and 1B-class models are the practical target. Use
+  quantized weights when RAM is the constraint, `ALPACCA_F32=1` when decode
+  speed is and the float32 expansion fits comfortably.
 - **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow. Good
   for air-gapped checks, not long conversations.
 - **chat/server reuse**: repeated turns or requests with a shared prompt prefix
   skip already-cached K/V work automatically.
-
-If you need llama.cpp-class speed, you need llama.cpp-class native kernels -
-that's a different project (and an explicit non-goal here).
 
 Useful environment knobs:
 
@@ -137,10 +163,10 @@ Useful environment knobs:
 - `ALPACCA_F32=1`: force the NumPy loader to expand quantized matrices to
   float32, useful for A/B checks and small models where BLAS wins.
 - `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
-- `ALPACCA_UNPACKED_WEIGHT_MB=N`: compact Q6_K unpack cache; default 2048 MiB,
-  set `0` to disable.
-- `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense cache for quantized matvec
-  weights, capped at `N` MiB.
+- `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense float32 cache for quantized
+  matrices, capped at `N` MiB - a RAM-for-speed dial on top of the quantized
+  storage. (`ALPACCA_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is
+  now the default storage and needs no budget.)
 
 ## Roadmap
 
@@ -150,10 +176,13 @@ the fast path more practical. Current status:
 - **Done**: batched NumPy prefill with last-token-only vocab projection.
 - **Done**: prefix-aware KV-cache reuse across chat turns and serialized server
   requests.
-- **Done, initial**: quantized matrix storage and matvec/matmul dispatch for
-  Q4_0/Q4_K/Q5_K/Q6_K/Q8_0.
-- **Next**: make quantized decode faster without giving up the no-native-code
-  constraint, or document where that constraint sets the ceiling.
+- **Done**: quantized matrix storage (int8 codes + per-sub-block scales,
+  unpacked once at load) with matvec/matmul/row dispatch for
+  Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; other formats fall back to dense
+  float32.
+- **Done**: documented the NumPy quantized-decode ceiling with kernel-level
+  measurements (see "Honest performance expectations"); pushing past it
+  requires a native/accelerated backend, below.
 - **Backend selection**: keep the current stdlib and NumPy paths, then add
   optional accelerated backends behind clear flags. Candidate backends include
   Numba, CuPy, PyTorch, Triton, or small native kernels exposed through Python.
@@ -174,6 +203,9 @@ python3 tests/smoke.py            # offline suite: mock registry pulls,
 python3 tests/real_model_test.py  # downloads a 19 MB real model (network),
                                   # asserts it generates coherent English
 python3 tests/bench.py --model hf:ggml-org/models:stories15M-q4_0.gguf \
+  --prefill 64 --decode 32 --ctx 128
+python3 tests/make_bench_model.py /tmp/s15m-q4.gguf Q4_0   # offline bench
+python3 tests/bench.py --model /tmp/s15m-q4.gguf \
   --prefill 64 --decode 32 --ctx 128
 python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
                                   # birthday; --model ... for bigger models

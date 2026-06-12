@@ -100,6 +100,34 @@ def main() -> None:
                 out += ql + qh + struct.pack("<16b", *sc) + struct.pack("<e", d)
             return bytes(out)
 
+        def q4_1_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 32):
+                d = 0.015625 + (block % 7) * 0.001953125
+                m = -0.125 + (block % 5) * 0.0625
+                qs = bytes(((block * 31 + i * 7) & 0xFF) for i in range(16))
+                out += struct.pack("<ee", d, m) + qs
+            return bytes(out)
+
+        def q5_0_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 32):
+                d = 0.015625 + (block % 7) * 0.001953125
+                qh = bytes(((block * 23 + i * 13) & 0xFF) for i in range(4))
+                qs = bytes(((block * 31 + i * 7) & 0xFF) for i in range(16))
+                out += struct.pack("<e", d) + qh + qs
+            return bytes(out)
+
+        def q5_1_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 32):
+                d = 0.015625 + (block % 7) * 0.001953125
+                m = -0.125 + (block % 5) * 0.0625
+                qh = bytes(((block * 23 + i * 13) & 0xFF) for i in range(4))
+                qs = bytes(((block * 31 + i * 7) & 0xFF) for i in range(16))
+                out += struct.pack("<ee", d, m) + qh + qs
+            return bytes(out)
+
         def check_quantized_matvec(fmt: str, rows: int, cols: int) -> None:
             n = rows * cols
             weights = [((i * 37) % 251) / 17.0 - 7.0 for i in range(n)]
@@ -108,6 +136,12 @@ def main() -> None:
                 packed = quants.quantize_q8_0(weights)
             elif fmt == "Q4_0":
                 packed = quants.quantize_q4_0(weights)
+            elif fmt == "Q4_1":
+                packed = q4_1_bytes(n)
+            elif fmt == "Q5_0":
+                packed = q5_0_bytes(n)
+            elif fmt == "Q5_1":
+                packed = q5_1_bytes(n)
             elif fmt == "Q4_K":
                 packed = q4_k_bytes(n)
             elif fmt == "Q5_K":
@@ -129,84 +163,6 @@ def main() -> None:
                 berr = float(np.max(np.abs(qbatch - stacked)))
                 check(f"{fmt} quantized matmul_t matches stacked matvecs (diff {berr:.2e})",
                       berr < 1e-3)
-            if T.HAS_NUMPY and fmt == "Q6_K":
-                old_unpacked_mb = os.environ.get("ALPACCA_UNPACKED_WEIGHT_MB")
-                try:
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
-                    T._reset_hot_cache_state()
-                    cached_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    cached = T.to_list(T.matvec(cached_mat, T.vector(x)))
-                    cerr = max(abs(a - b) for a, b in zip(cached, dout))
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} unpacked-cache matvec matches dense (diff {cerr:.2e})",
-                          cerr < 2e-3 and stats["unpacked_matrices"] == 1,
-                          str(stats))
-                    T._reset_hot_cache_state()
-                    check(f"{fmt} cache reset clears live unpacked matrix",
-                          cached_mat._q6_cache is None and
-                          T.hot_cache_stats()["unpacked_matrices"] == 0)
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
-                    T._reset_hot_cache_state()
-                    env_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    T.matvec(env_mat, T.vector(x))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
-                    T.matvec(env_mat, T.vector(x))
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} budget change clears live unpacked matrix",
-                          env_mat._q6_cache is None and
-                          stats["unpacked_matrices"] == 0 and
-                          stats["unpacked_used_bytes"] == 0,
-                          str(stats))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
-                    T._reset_hot_cache_state()
-                    row_env_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    T.matvec(row_env_mat, T.vector(x))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
-                    T.matrix_row(row_env_mat, 0)
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} budget change clears live unpacked row lookup",
-                          row_env_mat._q6_cache is None and
-                          stats["unpacked_matrices"] == 0 and
-                          stats["unpacked_used_bytes"] == 0,
-                          str(stats))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = str(
-                        (rows * cols - 1) / (1024 * 1024))
-                    T._reset_hot_cache_state()
-                    over_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    over = T.to_list(T.matvec(over_mat, T.vector(x)))
-                    oerr = max(abs(a - b) for a, b in zip(over, dout))
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} over-budget unpacked cache is skipped (diff {oerr:.2e})",
-                          oerr < 2e-3 and over_mat._q6_cache is None and
-                          stats["unpacked_matrices"] == 0 and
-                          stats["unpacked_used_bytes"] == 0,
-                          str(stats))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
-                    T._reset_hot_cache_state()
-                    gc_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    T.matvec(gc_mat, T.vector(x))
-                    del gc_mat
-                    gc.collect()
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} unpacked-cache accounting releases on matrix GC",
-                          stats["unpacked_matrices"] == 0 and
-                          stats["unpacked_used_bytes"] == 0,
-                          str(stats))
-                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
-                    T._reset_hot_cache_state()
-                    uncached_mat = T.quantized_matrix(packed, fmt, rows, cols)
-                    uncached = T.to_list(T.matvec(uncached_mat, T.vector(x)))
-                    uerr = max(abs(a - b) for a, b in zip(uncached, dout))
-                    stats = T.hot_cache_stats()
-                    check(f"{fmt} unpacked cache can be disabled (diff {uerr:.2e})",
-                          uerr < 2e-3 and stats["unpacked_matrices"] == 0,
-                          str(stats))
-                finally:
-                    if old_unpacked_mb is None:
-                        os.environ.pop("ALPACCA_UNPACKED_WEIGHT_MB", None)
-                    else:
-                        os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = old_unpacked_mb
-                    T._reset_hot_cache_state()
             if T.HAS_NUMPY:
                 old_hot_mb = os.environ.get("ALPACCA_HOT_WEIGHT_MB")
                 try:
@@ -271,12 +227,53 @@ def main() -> None:
             rerr = max(abs(a - b) for a, b in zip(qrow, drow))
             check(f"{T.backend_name()} {fmt} quantized row lookup matches dense (diff {rerr:.2e})",
                   rerr < 1e-5)
+            idx = [0, rows - 1, min(1, rows - 1)]
+            qrows = [T.to_list(r) for r in T.matrix_rows(qmat, idx)]
+            drows = [T.to_list(T.matrix_row(dense, i)) for i in idx]
+            gerr = max(abs(a - b)
+                       for qr, dr in zip(qrows, drows)
+                       for a, b in zip(qr, dr))
+            check(f"{T.backend_name()} {fmt} quantized row gather matches dense (diff {gerr:.2e})",
+                  gerr < 1e-5)
+            try:
+                T.matrix_rows(qmat, [rows])
+                oob_raises = False
+            except IndexError:
+                oob_raises = True
+            check(f"{fmt} row gather rejects out-of-range index", oob_raises)
+            if T.HAS_NUMPY:
+                nbytes = qmat.storage_nbytes()
+                dense_bytes = rows * cols * 4
+                check(f"{fmt} stays quantized in RAM "
+                      f"({nbytes}B vs {dense_bytes}B dense)",
+                      qmat.data is None and qmat._q.dtype.name == "int8" and
+                      nbytes * 3 <= dense_bytes + 4096,
+                      f"nbytes={nbytes}")
 
         check_quantized_matvec("Q8_0", 5, 64)
         check_quantized_matvec("Q4_0", 5, 64)
+        check_quantized_matvec("Q4_1", 5, 64)
+        check_quantized_matvec("Q5_0", 5, 64)
+        check_quantized_matvec("Q5_1", 5, 64)
         check_quantized_matvec("Q4_K", 3, 512)
         check_quantized_matvec("Q5_K", 3, 512)
         check_quantized_matvec("Q6_K", 3, 512)
+        if T.HAS_NUMPY:
+            import numpy as np
+            # large matrix exercises the einsum matvec kernel (small ones
+            # take the batched-matmul kernel)
+            big_rows, big_cols = 4096, 288
+            big_n = big_rows * big_cols
+            big_vals = [((i * 37) % 251) / 251.0 - 0.5 for i in range(big_n)]
+            big_packed = quants.quantize_q8_0(big_vals)
+            big_q = T.quantized_matrix(big_packed, "Q8_0", big_rows, big_cols)
+            big_dense = T.matrix(quants.dequantize(big_packed, big_n, "Q8_0"),
+                                 big_rows, big_cols)
+            xb = T.vector([((i * 19) % 67) / 23.0 - 1.4 for i in range(big_cols)])
+            big_err = float(np.max(np.abs(T.matvec(big_q, xb) -
+                                          T.matvec(big_dense, xb))))
+            check(f"Q8_0 large-matrix einsum matvec matches dense (diff {big_err:.2e})",
+                  big_rows * big_cols >= 1 << 20 and big_err < 1e-3)
         dense = T.matrix([1.0, -2.0, 0.5, 3.0, 4.0, -1.0], 2, 3)
         dy = T.to_list(T.matvec(dense, T.vector([2.0, -1.0, 4.0])))
         check("dense matvec fallback still works",
@@ -331,9 +328,12 @@ def main() -> None:
         srv = tmp / "srv"
         srv.mkdir()
         mk = REPO / "tests" / "make_tiny_model.py"
-        for dtype, name in (("F32", "model.gguf"), ("Q2_K", "tiny-q2k.gguf"),
+        for dtype, name in (("F32", "model.gguf"), ("F16", "tiny-f16.gguf"),
+                            ("Q2_K", "tiny-q2k.gguf"),
                             ("Q8_0", "tiny-q8.gguf"),
-                            ("Q4_0", "tiny-q4.gguf"), ("Q4_K", "tiny-q4k.gguf"),
+                            ("Q4_0", "tiny-q4.gguf"), ("Q4_1", "tiny-q41.gguf"),
+                            ("Q5_0", "tiny-q50.gguf"), ("Q5_1", "tiny-q51.gguf"),
+                            ("Q4_K", "tiny-q4k.gguf"),
                             ("Q5_K", "tiny-q5k.gguf"), ("Q6_K", "tiny-q6k.gguf")):
             r = subprocess.run([sys.executable, str(mk), str(srv / name), dtype],
                                capture_output=True, text=True)
@@ -341,6 +341,8 @@ def main() -> None:
 
         from alpacca.model import Model
         for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
+                          ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
+                          ("Q5_1", "tiny-q51.gguf"),
                           ("Q4_K", "tiny-q4k.gguf"), ("Q5_K", "tiny-q5k.gguf"),
                           ("Q6_K", "tiny-q6k.gguf")):
             qm = Model.load(str(srv / name), progress=False)
@@ -354,11 +356,24 @@ def main() -> None:
                       desc)
             check(f"load tiny {fmt} reports backend",
                   f"backend {T.backend_name()}" in desc, desc)
-            if fmt in ("Q4_K", "Q5_K", "Q6_K"):
+            if fmt in ("Q4_1", "Q5_0", "Q5_1", "Q4_K", "Q5_K", "Q6_K"):
                 ids = qm.tok.encode("hi") or [qm.tok.bos_id]
                 logits = T.to_list(qm.prefill(ids[:1]))
                 check(f"tiny {fmt} forward runs",
                       len(logits) == qm.hp.n_vocab and all(v == v for v in logits[:8]))
+
+        f16_model = Model.load(str(srv / "tiny-f16.gguf"), progress=False)
+        f16_desc = f16_model.describe()
+        check("load tiny F16 stays dense float32 (no quantized wrap)",
+              f16_model.weight_storage["dense"] == 16 and
+              not f16_model.weight_storage["quantized"] and
+              "weights dense" in f16_desc,
+              f"{f16_model.weight_storage} {f16_desc}")
+        f16_ids = f16_model.tok.encode("hi") or [f16_model.tok.bos_id]
+        f16_logits = T.to_list(f16_model.prefill(f16_ids[:1]))
+        check("tiny F16 forward runs",
+              len(f16_logits) == f16_model.hp.n_vocab and
+              all(v == v for v in f16_logits[:8]))
 
         if T.HAS_NUMPY:
             def greedy_trace(model, prompt: str, steps: int) -> tuple[list[int], list[list[float]]]:
@@ -375,7 +390,9 @@ def main() -> None:
                     trace.append(T.to_list(logits))
                 return tokens, trace
 
-            for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf")):
+            for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
+                              ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
+                              ("Q5_1", "tiny-q51.gguf")):
                 old_f32 = os.environ.get("ALPACCA_F32")
                 try:
                     os.environ.pop("ALPACCA_F32", None)
