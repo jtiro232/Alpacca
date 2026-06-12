@@ -164,7 +164,7 @@ projection; a token embedding is only densified when it doubles as a tied
 output matrix. Chosen matrices never keep their quantized copy, so unlike
 `ALPACCA_HOT_WEIGHT_MB` nothing is stored twice.
 
-Measured on the same Linux container with a 1.26B-parameter
+Measured on the same Linux container with a 1.1B-parameter
 TinyLlama-shaped synthetic Q4_0 model (GQA 32/4 heads, untied output;
 `tests/make_bench_model.py --embd 2048 --ff 5632 --layers 22 --heads 32
 --kv 4 --untied`), 32-token prompt / 16-token decode:
@@ -180,7 +180,7 @@ Decode scales almost linearly with how much of the per-token matvec work
 runs through BLAS: the FFN-only budget buys 3.0x decode for ~2.2 GB, and
 the everything-but-embedding budget matches full float32 speed while the
 embedding stays quantized. For an 8B model (e.g. Hermes-3-Llama-3.1-8B
-Q4), the FFN stack is ~22.5 GiB dense, so
+Q4), the FFN stack is ~22.5 GB (21.0 GiB) dense, so
 `ALPACCA_DENSE_WEIGHT_MB=24000` is the "fast decode if you have ~35 GB
 total RAM" setting, and smaller budgets degrade gracefully - every MiB
 goes to the highest-impact matrices first. `tests/bench.py` prints the

@@ -249,6 +249,20 @@ def main() -> None:
                               late_mat._dense_cache is None and
                               stats["matrices"] == 0 and stats["used_bytes"] == 0,
                               str(stats))
+                        # absurd budget: mb*1048576 overflows float; the
+                        # guard parses it to 0, so no cache and no crash
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "1e308"
+                        T._reset_hot_cache_state()
+                        inert_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                        inert_out = T.to_list(T.matvec(inert_mat, T.vector(x)))
+                        ierr = max(abs(a - b)
+                                   for a, b in zip(inert_out, dout))
+                        stats = T.hot_cache_stats()
+                        check("hot-cache absurd budget is inert "
+                              f"(diff {ierr:.2e})",
+                              ierr < 2e-3 and stats["matrices"] == 0 and
+                              inert_mat._dense_cache is None,
+                              str(stats))
                 finally:
                     if old_hot_mb is None:
                         os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
@@ -555,6 +569,58 @@ def main() -> None:
                       len(tied.weight_storage["densified"]) == 15 and
                       not tied.weight_storage["quantized"],
                       str(tied.weight_storage))
+                # ALPACCA_F32 wins over the dense budget: everything is
+                # already dense fallback, so no densify pass runs
+                prior_f32 = os.environ.get("ALPACCA_F32")
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                os.environ["ALPACCA_F32"] = "1"
+                try:
+                    f32_wins = Model.load(str(srv / "tiny-q4.gguf"),
+                                          progress=False)
+                finally:
+                    if prior_f32 is None:
+                        os.environ.pop("ALPACCA_F32", None)
+                    else:
+                        os.environ["ALPACCA_F32"] = prior_f32
+                check("ALPACCA_F32 wins over the dense budget",
+                      f32_wins.weight_storage["densified"] == [] and
+                      f32_wins.weight_storage["fallback"] == {"Q4_0": 16},
+                      str(f32_wins.weight_storage))
+                # absurd budget: mb*1048576 overflows float; the guard
+                # parses it to 0 so the load stays fully quantized
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "1e308"
+                absurd = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                check("absurd dense budget is inert",
+                      absurd.weight_storage["densified"] == [] and
+                      absurd.weight_storage["quantized"] == {"Q4_0": 16},
+                      str(absurd.weight_storage))
+                # first-fit spillover on a GQA untied shape: tier-2
+                # attn_q/attn_output (16384B) do not fit, but a smaller
+                # tier-3 attn_k matrix (8192B) still does
+                r = subprocess.run(
+                    [sys.executable,
+                     str(REPO / "tests" / "make_bench_model.py"),
+                     str(srv / "gqa-bench.gguf"), "Q4_0", "--vocab", "320",
+                     "--embd", "64", "--heads", "4", "--kv", "2",
+                     "--layers", "2", "--ff", "128", "--untied"],
+                    capture_output=True, text=True)
+                check("write tiny GQA untied bench model", r.returncode == 0,
+                      r.stderr)
+                # budget int(0.20*1048576)=209715B: six FFN mats use
+                # 6*32768=196608B, then blk.0.attn_k lands at 204800B
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0.20"
+                spill = Model.load(str(srv / "gqa-bench.gguf"),
+                                   progress=False)
+                expect_spill = {f"blk.{i}.{role}.weight"
+                                for i in range(2)
+                                for role in ("ffn_gate", "ffn_up",
+                                             "ffn_down")}
+                expect_spill.add("blk.0.attn_k.weight")
+                check("dense budget spills past oversized tier to smaller matrices",
+                      set(spill.weight_storage["densified"]) == expect_spill and
+                      spill.weight_storage["densified_bytes"] == 204800 and
+                      len(spill.weight_storage["densified"]) == 7,
+                      str(spill.weight_storage))
             finally:
                 if old_budget is None:
                     os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)

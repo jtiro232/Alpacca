@@ -60,7 +60,10 @@ def _dense_budget_bytes() -> int:
         return 0
     if not math.isfinite(mb) or mb <= 0.0:
         return 0
-    return int(mb * 1024 * 1024)
+    try:
+        return int(mb * 1024 * 1024)
+    except (OverflowError, ValueError):
+        return 0
 
 
 @dataclass

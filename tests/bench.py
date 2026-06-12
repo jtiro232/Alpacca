@@ -112,7 +112,7 @@ def main() -> None:
         f"model={path.name} backend={T.backend_name()} "
         f"load_s={getattr(model, 'load_seconds', 0.0):.3f} "
         f"prefill_tps={prefill_tps:.3f} decode_tps={decode_tps:.3f} "
-        f"rss_mb={rss_text} dense_budget_mb={densified_mb:.1f}"
+        f"rss_mb={rss_text} densified_mb={densified_mb:.1f}"
     )
 
 
