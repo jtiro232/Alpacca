@@ -106,7 +106,7 @@ alpacca tokenize -m llama3.2:1b -p "hello world"
 ## Running models
 
 ```sh
-alpacca run llama3.2:1b                          # interactive (/exit, /clear)
+alpacca run llama3.2:1b                          # interactive (Esc or /exit returns, /clear resets)
 alpacca run llama3.2:1b "one-shot question"      # answers and exits
 alpacca run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
 alpacca serve llama3.2:1b --port 8080

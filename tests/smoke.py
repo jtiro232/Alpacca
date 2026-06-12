@@ -358,6 +358,18 @@ def main() -> None:
         check("dense matvec fallback still works",
               max(abs(a - b) for a, b in zip(dy, [6.0, -2.0])) < 1e-6)
 
+        import io
+        from alpacca.chat import _read_chat_line
+        prompt_out = io.StringIO()
+        check("chat Escape returns to caller",
+              _read_chat_line(stdin=io.StringIO("\x1b\n"),
+                              stdout=prompt_out) is None and
+              prompt_out.getvalue() == "> ")
+        prompt_out = io.StringIO()
+        check("chat line reader keeps normal input",
+              _read_chat_line(stdin=io.StringIO("hello\n"),
+                              stdout=prompt_out) == "hello")
+
         from alpacca import kernels as AK
         try:
             import numba as _numba

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
+from typing import TextIO
 
 from .model import Model
 from .sample import Sampler, SamplerParams
@@ -189,19 +190,122 @@ def chat_once(model: Model, messages: list[dict], params: SamplerParams,
     return generate(model, ids, params, n_predict, stream, stop_strings)
 
 
+def _read_chat_line(prompt: str = "> ", stdin: TextIO | None = None,
+                    stdout: TextIO | None = None) -> str | None:
+    """Read one chat line. Return None when the user presses bare Escape."""
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    if stdin is not sys.stdin or stdout is not sys.stdout or not stdin.isatty():
+        stdout.write(prompt)
+        stdout.flush()
+        line = stdin.readline()
+        if line == "":
+            raise EOFError
+        line = line.rstrip("\r\n")
+        return None if "\x1b" in line else line
+    if sys.platform == "win32":
+        return _read_chat_line_windows(prompt, stdout)
+    return _read_chat_line_posix(prompt, stdin, stdout)
+
+
+def _read_chat_line_windows(prompt: str, stdout: TextIO) -> str | None:
+    import msvcrt
+
+    stdout.write(prompt)
+    stdout.flush()
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            msvcrt.getwch()
+            continue
+        if ch == "\x1b":
+            stdout.write("\n")
+            stdout.flush()
+            return None
+        if ch in ("\r", "\n"):
+            stdout.write("\n")
+            stdout.flush()
+            return "".join(chars)
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x04":
+            raise EOFError
+        if ch in ("\b", "\x7f"):
+            if chars:
+                chars.pop()
+                stdout.write("\b \b")
+                stdout.flush()
+            continue
+        if ch == "\t" or ch >= " ":
+            chars.append(ch)
+            stdout.write(ch)
+            stdout.flush()
+
+
+def _read_chat_line_posix(prompt: str, stdin: TextIO,
+                          stdout: TextIO) -> str | None:
+    import select
+    import termios
+    import tty
+
+    fd = stdin.fileno()
+    old = termios.tcgetattr(fd)
+    stdout.write(prompt)
+    stdout.flush()
+    chars: list[str] = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = stdin.read(1)
+            if ch == "\x1b":
+                if select.select([stdin], [], [], 0.05)[0]:
+                    stdin.read(1)
+                    while select.select([stdin], [], [], 0.001)[0]:
+                        stdin.read(1)
+                    continue
+                stdout.write("\n")
+                stdout.flush()
+                return None
+            if ch in ("\r", "\n"):
+                stdout.write("\n")
+                stdout.flush()
+                return "".join(chars)
+            if ch == "\x04" and not chars:
+                raise EOFError
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\b", "\x7f"):
+                if chars:
+                    chars.pop()
+                    stdout.write("\b \b")
+                    stdout.flush()
+                continue
+            if ch == "\t" or ch >= " ":
+                chars.append(ch)
+                stdout.write(ch)
+                stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def interactive(model: Model, params: SamplerParams, system: str = "",
                 n_predict: int = -1) -> None:
     fmt = ChatFormat(model, detect_format(model.metadata))
     print(f"alpacca chat - {model.describe()}", file=sys.stderr)
-    print("type /exit to quit, /clear to reset the conversation\n", file=sys.stderr)
+    print("press Esc or type /exit to return, /clear to reset the conversation\n",
+          file=sys.stderr)
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     while True:
         try:
-            user = input("> ")
+            user = _read_chat_line("> ")
         except (EOFError, KeyboardInterrupt):
             print("", file=sys.stderr)
+            return
+        if user is None:
+            print("(returning to main menu)", file=sys.stderr)
             return
         if user.strip() in ("/exit", "/quit", "/bye"):
             return
