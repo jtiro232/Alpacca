@@ -163,6 +163,9 @@ def silu(x):
 def rmsnorm(x, weight, eps: float):
     if HAS_NUMPY:
         arr = x if getattr(x, "dtype", None) == _np.float32 else x.astype(_np.float32)
+        if arr.ndim == 1:  # decode hot path: BLAS dot beats np.mean here
+            inv = 1.0 / math.sqrt(float(arr @ arr) / arr.shape[0] + eps)
+            return arr * inv * weight
         inv = 1.0 / _np.sqrt(_np.mean(arr * arr, axis=-1, keepdims=True) + eps)
         return arr * inv * weight
     ss = sum(v * v for v in x) / len(x)

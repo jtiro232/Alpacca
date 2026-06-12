@@ -71,6 +71,8 @@ class Model:
         self.cached_ids: list[int] = []
         self.last_prefill_forwarded = 0
         self._rope_inv_freq = None
+        self._rope_cos = None
+        self._rope_sin = None
         if T.HAS_NUMPY:
             half = hp.n_rot // 2
             self._rope_inv_freq = (
@@ -211,6 +213,11 @@ class Model:
                             for _ in range(hp.n_layer)]
             self.cache_v = [np.zeros((self.n_ctx, hp.n_kv, hp.head_dim), dtype=np.float32)
                             for _ in range(hp.n_layer)]
+            if self._rope_cos is None or len(self._rope_cos) != self.n_ctx:
+                theta = (np.arange(self.n_ctx, dtype=np.float32)[:, None] *
+                         self._rope_inv_freq[None, :])
+                self._rope_cos = np.cos(theta)
+                self._rope_sin = np.sin(theta)
         else:
             self.cache_k = [[] for _ in range(hp.n_layer)]
             self.cache_v = [[] for _ in range(hp.n_layer)]
@@ -259,9 +266,7 @@ class Model:
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
         v = vec.reshape(n_heads, hd).copy()
-        inv = self._rope_inv_freq
-        theta = pos * inv
-        c, s = np.cos(theta), np.sin(theta)
+        c, s = self._rope_cos[pos], self._rope_sin[pos]
         if hp.rope_style == "norm":
             x0 = v[:, 0:n_rot:2].copy()
             x1 = v[:, 1:n_rot:2].copy()
@@ -279,9 +284,8 @@ class Model:
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
         v = vecs.reshape(len(vecs), n_heads, hd).copy()
-        theta = positions.astype(np.float32)[:, None] * self._rope_inv_freq[None, :]
-        c = np.cos(theta)[:, None, :]
-        s = np.sin(theta)[:, None, :]
+        c = self._rope_cos[positions][:, None, :]
+        s = self._rope_sin[positions][:, None, :]
         if hp.rope_style == "norm":
             x0 = v[:, :, 0:n_rot:2].copy()
             x1 = v[:, :, 1:n_rot:2].copy()
@@ -306,15 +310,13 @@ class Model:
 
     def _attention_np(self, q, K, V, group: int, inv_sqrt: float):
         hp = self.hp
-        att_out = np.empty((hp.n_head, hp.head_dim), dtype=np.float32)
-        for kvh in range(hp.n_kv):
-            h0, h1 = kvh * group, (kvh + 1) * group
-            scores = q[h0:h1] @ K[:, kvh, :].T * inv_sqrt
-            scores -= scores.max(axis=1, keepdims=True)
-            w = np.exp(scores)
-            w /= w.sum(axis=1, keepdims=True)
-            att_out[h0:h1] = w @ V[:, kvh, :]
-        return att_out
+        qg = q.reshape(hp.n_kv, group, hp.head_dim)
+        scores = np.matmul(qg, K.transpose(1, 2, 0)) * inv_sqrt
+        scores -= scores.max(axis=2, keepdims=True)
+        w = np.exp(scores)
+        w /= w.sum(axis=2, keepdims=True)
+        att_out = np.matmul(w, V.transpose(1, 0, 2))
+        return att_out.reshape(hp.n_head, hp.head_dim)
 
     def _attention_batch_np(self, q, K, V, positions, group: int, inv_sqrt: float):
         hp = self.hp
@@ -340,7 +342,8 @@ class Model:
         hp = self.hp
         pos0 = self.n_past
         positions = np.arange(pos0, pos0 + len(tokens), dtype=np.int32)
-        x = T.matrix_rows(self.tok_embd, tokens).astype(np.float32).copy()
+        # matrix_rows returns a fresh float32 array for dense and quantized
+        x = T.matrix_rows(self.tok_embd, tokens)
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
@@ -381,7 +384,7 @@ class Model:
     def _forward_np(self, token: int):
         hp = self.hp
         pos = self.n_past
-        x = T.matrix_row(self.tok_embd, token).astype(np.float32).copy()
+        x = T.matrix_row(self.tok_embd, token)  # fresh float32 copy
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 

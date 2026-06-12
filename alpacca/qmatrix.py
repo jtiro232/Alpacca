@@ -64,8 +64,8 @@ class QuantMatrix:
 
     __slots__ = ("dtype", "rows", "cols", "block_elements", "block_bytes",
                  "blocks_per_row", "sub_len", "n_sub", "data",
-                 "_q", "_d", "_m", "_dense_cache", "_dense_cache_bytes",
-                 "__weakref__")
+                 "_q", "_q3", "_small", "_d", "_m",
+                 "_dense_cache", "_dense_cache_bytes", "__weakref__")
 
     def __init__(self, data, dtype: str, rows: int, cols: int):
         geom = QUANT_GEOMETRY.get(dtype)
@@ -93,12 +93,23 @@ class QuantMatrix:
             from .quants import np_unpack
             q, d_eff, m_eff = np_unpack(data, rows * cols, dtype)
             self.data = None  # unpacked copies own everything; mmap may close
-            self._q = q.reshape(rows, cols)
+            q3 = q.reshape(rows, self.n_sub, sub_len)
+            self._small = rows * cols < _SMALL_MATVEC_ELEMS
+            if self._small:
+                # store small matrices in the batched-matmul kernel layout so
+                # the per-token astype reads contiguously; _q3 stays the
+                # logical element-order (rows, n_sub, sub_len) view of it
+                self._q = _np.ascontiguousarray(q3.transpose(1, 0, 2))
+                self._q3 = self._q.transpose(1, 0, 2)
+            else:
+                self._q = q3
+                self._q3 = q3
             self._d = d_eff.reshape(rows, self.n_sub)
             self._m = None if m_eff is None else m_eff.reshape(rows, self.n_sub)
         else:
             self.data = bytes(data)
-            self._q = self._d = self._m = None
+            self._small = False
+            self._q = self._q3 = self._d = self._m = None
 
     def __del__(self):  # pragma: no cover - depends on interpreter shutdown
         try:
@@ -131,18 +142,18 @@ class QuantMatrix:
         """self (rows x cols) @ x (cols) -> (rows)."""
         if not HAS_NUMPY:
             return self._matvec_pure(x)
-        dense = self._dense_hot_cache()
-        if dense is not None:
-            return dense @ _np.asarray(x, dtype=_np.float32)
+        if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
+            dense = self._dense_hot_cache()
+            if dense is not None:
+                return dense @ _np.asarray(x, dtype=_np.float32)
         xs = _np.asarray(x, dtype=_np.float32).reshape(self.n_sub, self.sub_len)
-        q3 = self._q.reshape(self.rows, self.n_sub, self.sub_len)
-        if self.rows * self.cols < _SMALL_MATVEC_ELEMS:
+        if self._small:
             # batched (n_sub) BLAS matmuls of (rows, sub_len) @ (sub_len, 1)
-            qf = q3.transpose(1, 0, 2).astype(_np.float32)
-            blockdot = _np.matmul(qf, xs[:, :, None])[:, :, 0]  # (n_sub, rows)
+            blockdot = _np.matmul(self._q.astype(_np.float32),
+                                  xs[:, :, None])[:, :, 0]      # (n_sub, rows)
             out = _np.einsum("sr,rs->r", blockdot, self._d)
         else:
-            blockdot = _np.einsum("rsl,sl->rs", q3, xs)         # (rows, n_sub)
+            blockdot = _np.einsum("rsl,sl->rs", self._q3, xs)   # (rows, n_sub)
             out = _np.einsum("rs,rs->r", blockdot, self._d)
         if self._m is not None:
             out += self._m @ xs.sum(axis=1)
@@ -167,9 +178,10 @@ class QuantMatrix:
         if X.ndim != 2 or X.shape[1] != self.cols:
             raise ValueError(
                 f"expected ({X.shape[0]}, {self.cols}) input, got {X.shape}")
-        dense = self._dense_hot_cache()
-        if dense is not None:
-            return X @ dense.T
+        if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
+            dense = self._dense_hot_cache()
+            if dense is not None:
+                return X @ dense.T
         out = _np.empty((X.shape[0], self.rows), dtype=_np.float32)
         x_sub_sums = None
         if self._m is not None:
@@ -177,7 +189,7 @@ class QuantMatrix:
         # dequantize ~4 MB row tiles; GGUF rows are contiguous so each tile
         # is a plain slice of the code/scale arrays
         tile_rows = max(16, (4 << 20) // max(self.cols * 4, 1))
-        q3 = self._q.reshape(self.rows, self.n_sub, self.sub_len)
+        q3 = self._q3
         for r0 in range(0, self.rows, tile_rows):
             r1 = min(self.rows, r0 + tile_rows)
             tile = q3[r0:r1].astype(_np.float32)
@@ -196,10 +208,11 @@ class QuantMatrix:
             row_bytes = self.blocks_per_row * self.block_bytes
             return dequantize(self.data[i * row_bytes:(i + 1) * row_bytes],
                               self.cols, self.dtype)
-        _sync_hot_cache_budget(_hot_cache_limit_bytes())
-        if self._dense_cache is not None:
-            return self._dense_cache[i].copy()
-        v = self._q[i].astype(_np.float32).reshape(self.n_sub, self.sub_len)
+        if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
+            _sync_hot_cache_budget(_hot_cache_limit_bytes())
+            if self._dense_cache is not None:
+                return self._dense_cache[i].copy()
+        v = self._q3[i].astype(_np.float32)
         v *= self._d[i, :, None]
         if self._m is not None:
             v += self._m[i, :, None]
@@ -211,11 +224,11 @@ class QuantMatrix:
         idx = _np.asarray(rows, dtype=_np.int64)
         if idx.size and (int(idx.min()) < 0 or int(idx.max()) >= self.rows):
             raise IndexError("row index out of range")
-        _sync_hot_cache_budget(_hot_cache_limit_bytes())
-        if self._dense_cache is not None:
-            return self._dense_cache[idx].copy()
-        v = self._q[idx].astype(_np.float32).reshape(
-            idx.size, self.n_sub, self.sub_len)
+        if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
+            _sync_hot_cache_budget(_hot_cache_limit_bytes())
+            if self._dense_cache is not None:
+                return self._dense_cache[idx].copy()
+        v = self._q3[idx].astype(_np.float32)
         v *= self._d[idx][:, :, None]
         if self._m is not None:
             v += self._m[idx][:, :, None]
@@ -224,8 +237,7 @@ class QuantMatrix:
     # ---- optional dense f32 cache (ALPACCA_HOT_WEIGHT_MB) -------------------
 
     def _dense_from_storage(self):
-        v = self._q.astype(_np.float32).reshape(
-            self.rows, self.n_sub, self.sub_len)
+        v = self._q3.astype(_np.float32)
         v *= self._d[:, :, None]
         if self._m is not None:
             v += self._m[:, :, None]

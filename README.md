@@ -109,21 +109,25 @@ feed, so wrapping F16 would only slow decode down).
 Measured on a 4-core Intel Xeon 2.80 GHz Linux container, Python 3.11,
 NumPy 2.4.6 (OpenBLAS), with a stories15M-shaped synthetic model from
 `tests/make_bench_model.py` (same architecture dimensions as the real
-stories15M; CI runs the real one):
+stories15M; CI runs the real one). Decode and RSS are medians of 3 runs;
+prefill on the 64-token rows is a single ~50 ms window and jitters
++-40% on this shared machine, the 256-token rows are steadier:
 
 | Run (`tests/bench.py`) | Mode | Load | Prefill | Decode | Peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Q4_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.088 s | 1,441 tok/s | 55.2 tok/s | 65.4 MB |
-| Q4_0, same run | `ALPACCA_F32=1` dense | 0.136 s | 3,393 tok/s | 123.3 tok/s | 107.1 MB |
-| Q4_0, 256 prompt / 128 decode, ctx 512 | quantized weights | 0.102 s | 3,249 tok/s | 56.1 tok/s | 71.2 MB |
-| Q4_0, same run | `ALPACCA_F32=1` dense | 0.123 s | 4,511 tok/s | 131.1 tok/s | 115.6 MB |
-| Q8_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.072 s | 1,789 tok/s | 58.5 tok/s | 72.4 MB |
-| F32 GGUF, 64 prompt / 32 decode | native dense | 0.091 s | 3,178 tok/s | 127.3 tok/s | 156.5 MB |
+| Q4_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.084 s | ~1,100 tok/s | 63.2 tok/s | 65.5 MB |
+| Q4_0, same run | `ALPACCA_F32=1` dense | 0.130 s | 3,192 tok/s | 126.7 tok/s | 107.1 MB |
+| Q4_0, 256 prompt / 128 decode, ctx 512 | quantized weights | 0.083 s | 2,998 tok/s | 60.3 tok/s | 71.3 MB |
+| Q4_0, same run | `ALPACCA_F32=1` dense | 0.128 s | 4,393 tok/s | 131.3 tok/s | 115.7 MB |
+| Q8_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.078 s | ~930 tok/s | 58.6 tok/s | 72.6 MB |
+| F32 GGUF, 64 prompt / 32 decode | native dense | 0.096 s | 3,638 tok/s | 152.0 tok/s | 156.7 MB |
 
 (The previous revision of this engine decoded the same quantized model at
-19.4 tok/s on this machine - the int8 unpacked storage is a 2.7-2.9x decode
-and ~2.3x prefill improvement - but see the next paragraph before
-expecting quantized to beat float32.)
+19.4 tok/s on this machine: the int8 unpacked storage is a ~2.9x decode
+improvement, plus another ~8-15% from decode-overhead trims - grouped
+attention, precomputed RoPE tables, BLAS-dot rmsnorm - that also sped the
+float32 paths up. But read the next paragraph before expecting quantized
+to beat float32.)
 
 What quantized storage does and does not buy here, measured honestly:
 
@@ -133,19 +137,20 @@ What quantized storage does and does not buy here, measured honestly:
   107 MB (0.61x); the ratio approaches the 0.28x storage ratio as models
   grow. RSS is reported by `tests/bench.py` on Linux/macOS and is `n/a`
   on Windows (no `resource` module).
-- **Load time**: 0.088 s vs 0.136 s for float32 expansion (writes ~1.1
+- **Load time**: 0.084 s vs 0.130 s for float32 expansion (writes ~1.1
   bytes per weight instead of 4; the advantage grows with model size).
-- **Decode speed**: quantized decode remains ~0.45x of `ALPACCA_F32=1`
+- **Decode speed**: quantized decode remains ~0.5x of `ALPACCA_F32=1`
   dense decode. This is a measured NumPy ceiling, not a missing
   optimization in this codebase: OpenBLAS SGEMV runs multithreaded at
   memory bandwidth (0.53 ms for the dominant 32000x288 output projection),
   while NumPy has no mixed int8xf32 GEMV primitive - every strategy
   (einsum, astype+GEMV, integer matmul) pays a single-threaded conversion
   pass that costs 4.5-9 ms on the same matrix. Per-token profile of the
-  quantized path: 81% quantized matvec (58% just the output projection),
-  19% everything else. Beating BLAS by 2x with quantized weights needs
-  native SIMD dot-product kernels (llama.cpp-class), which is an explicit
-  non-goal here.
+  quantized path after the overhead trims: ~76% in the int8 matvec
+  kernels (~54% just the output projection), ~9% residual Python
+  overhead, the rest attention/normalization. Beating BLAS by 2x with
+  quantized weights needs native SIMD dot-product kernels
+  (llama.cpp-class), which is an explicit non-goal here.
 
 Rules of thumb:
 
