@@ -11,8 +11,10 @@ usage: python3 tests/smoke.py
 from __future__ import annotations
 
 import json
+import gc
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -65,6 +67,248 @@ def main() -> None:
             err = max(abs(a - b) for a, b in zip(vals, list(back)))
             check(f"{fmt} quantize/dequantize roundtrip (max err {err:.3f})", err < tol)
 
+        from alpacca import tensor as T
+
+        def q4_k_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 256):
+                d = 0.015625 + (block % 7) * 0.001953125
+                dmin = 0.00390625 + (block % 5) * 0.0009765625
+                scales = bytes(((block * 17 + i * 29) & 0xFF) for i in range(12))
+                qs = bytes(((block * 31 + i * 7) & 0xFF) for i in range(128))
+                out += struct.pack("<ee", d, dmin) + scales + qs
+            return bytes(out)
+
+        def q5_k_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 256):
+                d = 0.015625 + (block % 7) * 0.001953125
+                dmin = 0.00390625 + (block % 5) * 0.0009765625
+                scales = bytes(((block * 17 + i * 29) & 0xFF) for i in range(12))
+                qh = bytes(((block * 23 + i * 13) & 0xFF) for i in range(32))
+                ql = bytes(((block * 31 + i * 7) & 0xFF) for i in range(128))
+                out += struct.pack("<ee", d, dmin) + scales + qh + ql
+            return bytes(out)
+
+        def q6_k_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 256):
+                ql = bytes(((block * 13 + i * 11) & 0xFF) for i in range(128))
+                qh = bytes(((block * 19 + i * 5) & 0xFF) for i in range(64))
+                sc = [((block * 7 + i * 9) % 63) - 31 for i in range(16)]
+                d = 0.001953125 + (block % 5) * 0.000244140625
+                out += ql + qh + struct.pack("<16b", *sc) + struct.pack("<e", d)
+            return bytes(out)
+
+        def check_quantized_matvec(fmt: str, rows: int, cols: int) -> None:
+            n = rows * cols
+            weights = [((i * 37) % 251) / 17.0 - 7.0 for i in range(n)]
+            x = [((i * 19) % 67) / 23.0 - 1.4 for i in range(cols)]
+            if fmt == "Q8_0":
+                packed = quants.quantize_q8_0(weights)
+            elif fmt == "Q4_0":
+                packed = quants.quantize_q4_0(weights)
+            elif fmt == "Q4_K":
+                packed = q4_k_bytes(n)
+            elif fmt == "Q5_K":
+                packed = q5_k_bytes(n)
+            else:
+                packed = q6_k_bytes(n)
+            qmat = T.quantized_matrix(packed, fmt, rows, cols)
+            dense = T.matrix(quants.dequantize(packed, n, fmt), rows, cols)
+            qout = T.to_list(T.matvec(qmat, T.vector(x)))
+            dout = T.to_list(T.matvec(dense, T.vector(x)))
+            err = max(abs(a - b) for a, b in zip(qout, dout))
+            check(f"{T.backend_name()} {fmt} quantized matvec matches dense (diff {err:.2e})",
+                  err < 1e-3)
+            if T.HAS_NUMPY:
+                import numpy as np
+                X = np.asarray([x, [v * 0.5 - 0.1 for v in x]], dtype=np.float32)
+                qbatch = T.matmul_t(X, qmat)
+                stacked = np.stack([T.matvec(qmat, row) for row in X], axis=0)
+                berr = float(np.max(np.abs(qbatch - stacked)))
+                check(f"{fmt} quantized matmul_t matches stacked matvecs (diff {berr:.2e})",
+                      berr < 1e-3)
+            if T.HAS_NUMPY and fmt == "Q6_K":
+                old_unpacked_mb = os.environ.get("ALPACCA_UNPACKED_WEIGHT_MB")
+                try:
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
+                    T._reset_hot_cache_state()
+                    cached_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    cached = T.to_list(T.matvec(cached_mat, T.vector(x)))
+                    cerr = max(abs(a - b) for a, b in zip(cached, dout))
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} unpacked-cache matvec matches dense (diff {cerr:.2e})",
+                          cerr < 2e-3 and stats["unpacked_matrices"] == 1,
+                          str(stats))
+                    T._reset_hot_cache_state()
+                    check(f"{fmt} cache reset clears live unpacked matrix",
+                          cached_mat._q6_cache is None and
+                          T.hot_cache_stats()["unpacked_matrices"] == 0)
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
+                    T._reset_hot_cache_state()
+                    env_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    T.matvec(env_mat, T.vector(x))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
+                    T.matvec(env_mat, T.vector(x))
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} budget change clears live unpacked matrix",
+                          env_mat._q6_cache is None and
+                          stats["unpacked_matrices"] == 0 and
+                          stats["unpacked_used_bytes"] == 0,
+                          str(stats))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
+                    T._reset_hot_cache_state()
+                    row_env_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    T.matvec(row_env_mat, T.vector(x))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
+                    T.matrix_row(row_env_mat, 0)
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} budget change clears live unpacked row lookup",
+                          row_env_mat._q6_cache is None and
+                          stats["unpacked_matrices"] == 0 and
+                          stats["unpacked_used_bytes"] == 0,
+                          str(stats))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = str(
+                        (rows * cols - 1) / (1024 * 1024))
+                    T._reset_hot_cache_state()
+                    over_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    over = T.to_list(T.matvec(over_mat, T.vector(x)))
+                    oerr = max(abs(a - b) for a, b in zip(over, dout))
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} over-budget unpacked cache is skipped (diff {oerr:.2e})",
+                          oerr < 2e-3 and over_mat._q6_cache is None and
+                          stats["unpacked_matrices"] == 0 and
+                          stats["unpacked_used_bytes"] == 0,
+                          str(stats))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "8"
+                    T._reset_hot_cache_state()
+                    gc_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    T.matvec(gc_mat, T.vector(x))
+                    del gc_mat
+                    gc.collect()
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} unpacked-cache accounting releases on matrix GC",
+                          stats["unpacked_matrices"] == 0 and
+                          stats["unpacked_used_bytes"] == 0,
+                          str(stats))
+                    os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = "0"
+                    T._reset_hot_cache_state()
+                    uncached_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    uncached = T.to_list(T.matvec(uncached_mat, T.vector(x)))
+                    uerr = max(abs(a - b) for a, b in zip(uncached, dout))
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} unpacked cache can be disabled (diff {uerr:.2e})",
+                          uerr < 2e-3 and stats["unpacked_matrices"] == 0,
+                          str(stats))
+                finally:
+                    if old_unpacked_mb is None:
+                        os.environ.pop("ALPACCA_UNPACKED_WEIGHT_MB", None)
+                    else:
+                        os.environ["ALPACCA_UNPACKED_WEIGHT_MB"] = old_unpacked_mb
+                    T._reset_hot_cache_state()
+            if T.HAS_NUMPY:
+                old_hot_mb = os.environ.get("ALPACCA_HOT_WEIGHT_MB")
+                try:
+                    os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                    T._reset_hot_cache_state()
+                    hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                    hot = T.to_list(T.matvec(hot_mat, T.vector(x)))
+                    herr = max(abs(a - b) for a, b in zip(hot, dout))
+                    stats = T.hot_cache_stats()
+                    check(f"{fmt} hot-cache matvec matches dense (diff {herr:.2e})",
+                          herr < 2e-3 and stats["matrices"] == 1,
+                          str(stats))
+                    if fmt == "Q8_0":
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        T.matvec(hot_mat, T.vector(x))
+                        stats = T.hot_cache_stats()
+                        check("hot-cache budget change clears live matrix",
+                              hot_mat._dense_cache is None and
+                              stats["matrices"] == 0 and stats["used_bytes"] == 0,
+                              str(stats))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        T._reset_hot_cache_state()
+                        row_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                        T.matvec(row_hot_mat, T.vector(x))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        T.matrix_row(row_hot_mat, 0)
+                        stats = T.hot_cache_stats()
+                        check("hot-cache budget change clears live matrix row lookup",
+                              row_hot_mat._dense_cache is None and
+                              stats["matrices"] == 0 and stats["used_bytes"] == 0,
+                              str(stats))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = str(
+                            (rows * cols * 4 - 1) / (1024 * 1024))
+                        T._reset_hot_cache_state()
+                        over_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                        over_hot = T.to_list(T.matvec(over_hot_mat, T.vector(x)))
+                        oherr = max(abs(a - b) for a, b in zip(over_hot, dout))
+                        stats = T.hot_cache_stats()
+                        check("hot-cache over-budget matrix is skipped",
+                              oherr < 2e-3 and over_hot_mat._dense_cache is None and
+                              stats["matrices"] == 0 and stats["used_bytes"] == 0,
+                              str(stats))
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        T._reset_hot_cache_state()
+                        gc_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
+                        T.matvec(gc_hot_mat, T.vector(x))
+                        del gc_hot_mat
+                        gc.collect()
+                        stats = T.hot_cache_stats()
+                        check("hot-cache accounting releases on matrix GC",
+                              stats["matrices"] == 0 and stats["used_bytes"] == 0,
+                              str(stats))
+                finally:
+                    if old_hot_mb is None:
+                        os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
+                    else:
+                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = old_hot_mb
+                    T._reset_hot_cache_state()
+            row = min(3, rows - 1)
+            qrow = T.to_list(T.matrix_row(qmat, row))
+            drow = T.to_list(T.matrix_row(dense, row))
+            rerr = max(abs(a - b) for a, b in zip(qrow, drow))
+            check(f"{T.backend_name()} {fmt} quantized row lookup matches dense (diff {rerr:.2e})",
+                  rerr < 1e-5)
+
+        check_quantized_matvec("Q8_0", 5, 64)
+        check_quantized_matvec("Q4_0", 5, 64)
+        check_quantized_matvec("Q4_K", 3, 512)
+        check_quantized_matvec("Q5_K", 3, 512)
+        check_quantized_matvec("Q6_K", 3, 512)
+        dense = T.matrix([1.0, -2.0, 0.5, 3.0, 4.0, -1.0], 2, 3)
+        dy = T.to_list(T.matvec(dense, T.vector([2.0, -1.0, 4.0])))
+        check("dense matvec fallback still works",
+              max(abs(a - b) for a, b in zip(dy, [6.0, -2.0])) < 1e-6)
+
+        if T.HAS_NUMPY:
+            import numpy as np
+            from types import SimpleNamespace
+            from alpacca.model import Model
+            dummy = Model.__new__(Model)
+            dummy.hp = SimpleNamespace(n_head=4, n_kv=2, head_dim=3)
+            q = np.asarray([((i * 7) % 19) / 11.0 - 0.8 for i in range(12)],
+                           dtype=np.float32).reshape(4, 3)
+            K = np.asarray([((i * 5) % 23) / 13.0 - 0.7 for i in range(30)],
+                           dtype=np.float32).reshape(5, 2, 3)
+            V = np.asarray([((i * 3) % 17) / 9.0 - 0.6 for i in range(30)],
+                           dtype=np.float32).reshape(5, 2, 3)
+            group = 2
+            inv_sqrt = 0.5773502691896258
+            fast = dummy._attention_np(q, K, V, group, inv_sqrt)
+            slow = np.empty((4, 3), dtype=np.float32)
+            for hh in range(4):
+                kvh = hh // group
+                scores = K[:, kvh, :] @ q[hh] * inv_sqrt
+                scores -= scores.max()
+                w = np.exp(scores)
+                w /= w.sum()
+                slow[hh] = w @ V[:, kvh, :]
+            aerr = float(np.max(np.abs(fast - slow)))
+            check(f"numpy grouped attention matches per-head loop (diff {aerr:.2e})",
+                  aerr < 1e-6)
+
         from alpacca.tokenizer import pretokenize
         toks = pretokenize("Hello there, world! It's 2026...\n  indented")
         check("BPE pretokenizer splits text", "".join(toks) == "Hello there, world! It's 2026...\n  indented",
@@ -87,10 +331,100 @@ def main() -> None:
         srv = tmp / "srv"
         srv.mkdir()
         mk = REPO / "tests" / "make_tiny_model.py"
-        for dtype, name in (("F32", "model.gguf"), ("Q4_0", "tiny-q4.gguf")):
+        for dtype, name in (("F32", "model.gguf"), ("Q2_K", "tiny-q2k.gguf"),
+                            ("Q8_0", "tiny-q8.gguf"),
+                            ("Q4_0", "tiny-q4.gguf"), ("Q4_K", "tiny-q4k.gguf"),
+                            ("Q5_K", "tiny-q5k.gguf"), ("Q6_K", "tiny-q6k.gguf")):
             r = subprocess.run([sys.executable, str(mk), str(srv / name), dtype],
                                capture_output=True, text=True)
             check(f"write tiny {dtype} model", r.returncode == 0, r.stderr)
+
+        from alpacca.model import Model
+        for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
+                          ("Q4_K", "tiny-q4k.gguf"), ("Q5_K", "tiny-q5k.gguf"),
+                          ("Q6_K", "tiny-q6k.gguf")):
+            qm = Model.load(str(srv / name), progress=False)
+            desc = qm.describe()
+            if T.HAS_NUMPY:
+                check(f"load tiny {fmt} keeps quantized weights",
+                      f"weights quantized {fmt}" in desc, desc)
+            else:
+                check(f"load tiny {fmt} falls back to dense without NumPy",
+                      "weights dense" in desc and f"dense fallback {fmt}" in desc,
+                      desc)
+            check(f"load tiny {fmt} reports backend",
+                  f"backend {T.backend_name()}" in desc, desc)
+            if fmt in ("Q4_K", "Q5_K", "Q6_K"):
+                ids = qm.tok.encode("hi") or [qm.tok.bos_id]
+                logits = T.to_list(qm.prefill(ids[:1]))
+                check(f"tiny {fmt} forward runs",
+                      len(logits) == qm.hp.n_vocab and all(v == v for v in logits[:8]))
+
+        if T.HAS_NUMPY:
+            def greedy_trace(model, prompt: str, steps: int) -> tuple[list[int], list[list[float]]]:
+                ids = model.tok.encode(prompt, add_bos=True)
+                logits = model.prefill(ids)
+                tokens: list[int] = []
+                trace = [T.to_list(logits)]
+                for _ in range(steps):
+                    tid = T.argmax(logits)
+                    tokens.append(tid)
+                    if model.tok.is_eog(tid):
+                        break
+                    logits = model.forward(tid)
+                    trace.append(T.to_list(logits))
+                return tokens, trace
+
+            for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf")):
+                old_f32 = os.environ.get("ALPACCA_F32")
+                try:
+                    os.environ.pop("ALPACCA_F32", None)
+                    q_model = Model.load(str(srv / name), progress=False)
+                    os.environ["ALPACCA_F32"] = "1"
+                    d_model = Model.load(str(srv / name), progress=False)
+                finally:
+                    if old_f32 is None:
+                        os.environ.pop("ALPACCA_F32", None)
+                    else:
+                        os.environ["ALPACCA_F32"] = old_f32
+                qtoks, qlogits = greedy_trace(q_model, "hello world", 6)
+                dtoks, dlogits = greedy_trace(d_model, "hello world", 6)
+                logit_diff = max(abs(a - b)
+                                 for qa, da in zip(qlogits, dlogits)
+                                 for a, b in zip(qa, da))
+                check(f"{fmt} quantized vs ALPACCA_F32 greedy generation/logits parity",
+                      q_model.weight_storage["quantized"] == {fmt: 16} and
+                      d_model.weight_storage["fallback"] == {fmt: 16} and
+                      qtoks == dtoks and len(qlogits) == len(dlogits) and
+                      logit_diff < 1e-2,
+                      f"quant={qtoks} dense={dtoks} diff={logit_diff:.2e} "
+                      f"qstore={q_model.weight_storage} dstore={d_model.weight_storage}")
+
+            old_f32 = os.environ.get("ALPACCA_F32")
+            try:
+                os.environ["ALPACCA_F32"] = "1"
+                f32_forced = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
+                check("ALPACCA_F32 forces dense quantized matrix loading",
+                      not f32_forced.weight_storage["quantized"] and
+                      f32_forced.weight_storage["fallback"] == {"Q4_0": 16},
+                      str(f32_forced.weight_storage))
+            finally:
+                if old_f32 is None:
+                    os.environ.pop("ALPACCA_F32", None)
+                else:
+                    os.environ["ALPACCA_F32"] = old_f32
+
+        q2 = Model.load(str(srv / "tiny-q2k.gguf"), progress=False)
+        q2_desc = q2.describe()
+        check("load tiny Q2_K falls back to dense matrices",
+              q2.weight_storage["dense"] == 16 and
+              q2.weight_storage["fallback"] == {"Q2_K": 16} and
+              "Q2_K" not in q2.weight_storage["quantized"],
+              str(q2.weight_storage))
+        check("describe reports dense fallback Q2_K",
+              "weights dense" in q2_desc and
+              "dense fallback Q2_K" in q2_desc,
+              q2_desc)
 
         (srv / "params.json").write_text(
             '{"temperature": 0.7, "num_ctx": 256, "top_k": 30}')
@@ -115,6 +449,55 @@ def main() -> None:
             la, lb = json.loads(a.stdout), json.loads(b.stdout)
             diff = max(abs(x - y) for x, y in zip(la, lb))
             check(f"numpy vs pure-python logits agree (diff {diff:.1e})", diff < 1e-3)
+
+            import numpy as np
+            ids = list(range(1, 45))
+            seq = Model.load(str(srv / "model.gguf"), progress=False)
+            bat = Model.load(str(srv / "model.gguf"), progress=False)
+            slogits = None
+            for tid in ids:
+                slogits = seq.forward(tid)
+            blogits = bat.forward_batch(ids)
+            ldiff = float(np.max(np.abs(slogits - blogits)))
+            kdiff = max(
+                float(np.max(np.abs(seq.cache_k[li][:len(ids)] -
+                                    bat.cache_k[li][:len(ids)])))
+                for li in range(seq.hp.n_layer)
+            )
+            vdiff = max(
+                float(np.max(np.abs(seq.cache_v[li][:len(ids)] -
+                                    bat.cache_v[li][:len(ids)])))
+                for li in range(seq.hp.n_layer)
+            )
+            check(f"forward_batch matches sequential logits (diff {ldiff:.2e})",
+                  ldiff < 1e-4)
+            check(f"forward_batch writes matching KV cache (K {kdiff:.2e}, V {vdiff:.2e})",
+                  kdiff < 1e-5 and vdiff < 1e-5)
+
+            pref = Model.load(str(srv / "model.gguf"), progress=False)
+            base = ids[:12]
+            longer = base + ids[12:24]
+            diverged = base + ids[30:38]
+            pref.prefill(base)
+            check("prefill counter records initial prompt",
+                  pref.last_prefill_forwarded == len(base),
+                  str(pref.last_prefill_forwarded))
+            pref.prefill(longer)
+            check("prefill forwards only shared-prefix suffix",
+                  pref.last_prefill_forwarded == len(longer) - len(base),
+                  str(pref.last_prefill_forwarded))
+            pref.prefill(longer)
+            check("prefill regenerate re-forwards last token",
+                  pref.last_prefill_forwarded == 1,
+                  str(pref.last_prefill_forwarded))
+            dlogits = pref.prefill(diverged)
+            fresh = Model.load(str(srv / "model.gguf"), progress=False)
+            flogits = fresh.prefill(diverged)
+            pdiff = float(np.max(np.abs(dlogits - flogits)))
+            check("prefill truncation keeps divergent conversation correct",
+                  pdiff < 1e-4 and pref.cached_ids == diverged and
+                  pref.n_past == len(diverged),
+                  f"diff={pdiff:.2e} cached={pref.cached_ids} n_past={pref.n_past}")
 
         # ---- mock registry ------------------------------------------------
         print("== mock registry (offline) ==")
@@ -240,6 +623,65 @@ def main() -> None:
         finally:
             sp.terminate()
             sp.wait(timeout=10)
+
+        import threading
+        from alpacca import chat
+        from alpacca.sample import SamplerParams
+        from alpacca.serve import serve as serve_in_process
+        api_model = Model.load(str(model_path), progress=False)
+        ready = threading.Event()
+        port_box: list[int] = []
+
+        def ready_callback(port: int) -> None:
+            port_box.append(port)
+            ready.set()
+
+        th = threading.Thread(
+            target=serve_in_process,
+            args=(api_model, "tiny"),
+            kwargs={"host": "127.0.0.1", "port": 0,
+                    "defaults": SamplerParams(temperature=0.0, seed=1),
+                    "ready_callback": ready_callback},
+            daemon=True,
+        )
+        th.start()
+        check("in-process serve starts for prefix-cache check", ready.wait(10))
+        ibase = f"http://127.0.0.1:{port_box[0]}"
+        first_messages = [{"role": "user", "content": "hi"}]
+        second_messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "again"},
+        ]
+        req = urllib.request.Request(
+            ibase + "/v1/chat/completions",
+            data=json.dumps({"messages": first_messages, "max_tokens": 2,
+                             "temperature": 0.0}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            json.loads(resp.read())
+        fmt = chat.ChatFormat(api_model, chat.detect_format(api_model.metadata))
+        second_prompt = fmt.render(second_messages)
+        before_second = list(api_model.cached_ids)
+        lcp = 0
+        for a, b in zip(second_prompt, before_second):
+            if a != b:
+                break
+            lcp += 1
+        expected_forwarded = len(second_prompt) - lcp
+        if expected_forwarded == 0:
+            expected_forwarded = 1
+        req = urllib.request.Request(
+            ibase + "/v1/chat/completions",
+            data=json.dumps({"messages": second_messages, "max_tokens": 2,
+                             "temperature": 0.0}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            json.loads(resp.read())
+        check("serve chat completions forwards exact shared-prefix suffix",
+              api_model.last_prefill_forwarded == expected_forwarded,
+              f"forwarded={api_model.last_prefill_forwarded} "
+              f"expected={expected_forwarded} prompt={len(second_prompt)} lcp={lcp}")
 
         # ---- removal -------------------------------------------------------
         print("== removal ==")

@@ -172,10 +172,11 @@ def cmd_serve(args) -> int:
 
 def cmd_doctor(_args) -> int:
     from . import tensor
-    print(f"alpacca {__version__} (pure-python engine)")
+    print(f"alpacca {__version__} (from-scratch python engine)")
     print(f"python:      {sys.version.split()[0]} ({sys.executable})")
     print(f"backend:     {tensor.backend_name()}"
-          + ("" if tensor.HAS_NUMPY else "  (pip install numpy for big speedups)"))
+          + ("  (optional accelerator active)" if tensor.HAS_NUMPY
+             else "  (pip install numpy for big speedups)"))
     root = models_root()
     try:
         root.mkdir(parents=True, exist_ok=True)

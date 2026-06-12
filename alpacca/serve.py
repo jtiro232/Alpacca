@@ -130,7 +130,6 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             n_predict = _int_param(body, ("n_predict", "max_tokens"), 256)
             stop = _stop_from(body)
             with lock:
-                model.reset()
                 ids = model.tok.encode(prompt)
                 res = chat.generate(model, ids, params, n_predict, stop_strings=stop)
             self.send_json({
@@ -169,7 +168,6 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
                 piece({"role": "assistant"})
                 with lock:
-                    model.reset()
                     res = chat.chat_once(model, messages, params, n_predict,
                                          stream=lambda s: piece({"content": s}),
                                          stop_strings=stop)
@@ -180,7 +178,6 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 return
 
             with lock:
-                model.reset()
                 res = chat.chat_once(model, messages, params, n_predict, stop_strings=stop)
             self.send_json({
                 "id": rid, "object": "chat.completion", "created": created,

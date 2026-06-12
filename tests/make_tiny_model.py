@@ -4,12 +4,13 @@ GGUF writer - no third-party packages needed.
 
 The model is gibberish but loads and generates, which is what the tests
 need. usage: python3 tests/make_tiny_model.py out.gguf [dtype]
-(dtype: F32 (default), F16, Q8_0 or Q4_0 - quantized variants exercise the
-dequantizers.)
+(dtype: F32 (default), F16, Q8_0, Q4_0, or raw Q2_K/Q4_K/Q5_K/Q6_K -
+quantized variants exercise the dequantizers and quantized matvec loader paths.)
 """
 from __future__ import annotations
 
 import random
+import struct
 import sys
 from pathlib import Path
 
@@ -27,6 +28,8 @@ N_EXTRA = 48  # normal word-piece tokens on top of specials + bytes
 
 def main(path: str, dtype: str = "F32") -> None:
     rng = random.Random(42)
+    n_embd = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_EMBD
+    n_ff = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_FF
 
     tokens: list[str] = []
     scores: list[float] = []
@@ -56,13 +59,13 @@ def main(path: str, dtype: str = "F32") -> None:
     w = gguf.GGUFWriter(path, "llama")
     w.add("general.name", gguf.T_STRING, "alpacca-tiny-test")
     w.add("llama.context_length", gguf.T_UINT32, N_CTX)
-    w.add("llama.embedding_length", gguf.T_UINT32, N_EMBD)
+    w.add("llama.embedding_length", gguf.T_UINT32, n_embd)
     w.add("llama.block_count", gguf.T_UINT32, N_LAYER)
-    w.add("llama.feed_forward_length", gguf.T_UINT32, N_FF)
+    w.add("llama.feed_forward_length", gguf.T_UINT32, n_ff)
     w.add("llama.attention.head_count", gguf.T_UINT32, N_HEAD)
     w.add("llama.attention.head_count_kv", gguf.T_UINT32, N_HEAD)
     w.add("llama.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32, 1e-5)
-    w.add("llama.rope.dimension_count", gguf.T_UINT32, N_EMBD // N_HEAD)
+    w.add("llama.rope.dimension_count", gguf.T_UINT32, n_embd // N_HEAD)
     w.add("llama.vocab_size", gguf.T_UINT32, n_vocab)
 
     w.add("tokenizer.ggml.model", gguf.T_STRING, "llama")
@@ -80,21 +83,104 @@ def main(path: str, dtype: str = "F32") -> None:
     def ones(n: int) -> list[float]:
         return [1.0] * n
 
+    def raw_q2_k(n: int) -> bytes:
+        if n % 256:
+            raise ValueError("Q2_K needs a multiple of 256 values")
+        out = bytearray()
+        for block in range(n // 256):
+            scales = bytes(rng.randrange(256) for _ in range(16))
+            qs = bytes(rng.randrange(256) for _ in range(64))
+            d = 0.00390625 + (block % 7) * 0.00048828125
+            dmin = 0.001953125 + (block % 5) * 0.000244140625
+            out += scales + qs + struct.pack("<ee", d, dmin)
+        return bytes(out)
+
+    def raw_q4_k(n: int) -> bytes:
+        if n % 256:
+            raise ValueError("Q4_K needs a multiple of 256 values")
+        out = bytearray()
+        for block in range(n // 256):
+            d = 0.015625 + (block % 7) * 0.001953125
+            dmin = 0.00390625 + (block % 5) * 0.0009765625
+            scales = bytes(rng.randrange(256) for _ in range(12))
+            qs = bytes(rng.randrange(256) for _ in range(128))
+            out += struct.pack("<ee", d, dmin) + scales + qs
+        return bytes(out)
+
+    def raw_q5_k(n: int) -> bytes:
+        if n % 256:
+            raise ValueError("Q5_K needs a multiple of 256 values")
+        out = bytearray()
+        for block in range(n // 256):
+            d = 0.015625 + (block % 7) * 0.001953125
+            dmin = 0.00390625 + (block % 5) * 0.0009765625
+            scales = bytes(rng.randrange(256) for _ in range(12))
+            qh = bytes(rng.randrange(256) for _ in range(32))
+            ql = bytes(rng.randrange(256) for _ in range(128))
+            out += struct.pack("<ee", d, dmin) + scales + qh + ql
+        return bytes(out)
+
+    def raw_q6_k(n: int) -> bytes:
+        if n % 256:
+            raise ValueError("Q6_K needs a multiple of 256 values")
+        out = bytearray()
+        for block in range(n // 256):
+            ql = bytes(rng.randrange(256) for _ in range(128))
+            qh = bytes(rng.randrange(256) for _ in range(64))
+            scales = [rng.randrange(-32, 32) for _ in range(16)]
+            d = 0.001953125 + (block % 5) * 0.000244140625
+            out += ql + qh + struct.pack("<16b", *scales) + struct.pack("<e", d)
+        return bytes(out)
+
+    def add_weight(name: str, shape: tuple[int, ...], values: list[float],
+                   tdtype: str) -> None:
+        if tdtype == "Q2_K":
+            n = 1
+            for dim in shape:
+                n *= dim
+            w.add_raw_tensor(name, shape, tdtype, raw_q2_k(n))
+        elif tdtype == "Q4_K":
+            n = 1
+            for dim in shape:
+                n *= dim
+            w.add_raw_tensor(name, shape, tdtype, raw_q4_k(n))
+        elif tdtype == "Q5_K":
+            n = 1
+            for dim in shape:
+                n *= dim
+            w.add_raw_tensor(name, shape, tdtype, raw_q5_k(n))
+        elif tdtype == "Q6_K":
+            n = 1
+            for dim in shape:
+                n *= dim
+            w.add_raw_tensor(name, shape, tdtype, raw_q6_k(n))
+        else:
+            w.add_tensor(name, shape, values, tdtype)
+
     # note: GGUF shape order is (cols, rows) - shape[0] is the input dim
-    w.add_tensor("token_embd.weight", (N_EMBD, n_vocab), rand(n_vocab * N_EMBD), dtype)
+    add_weight("token_embd.weight", (n_embd, n_vocab),
+               rand(n_vocab * n_embd), dtype)
     for i in range(N_LAYER):
         p = f"blk.{i}."
-        w.add_tensor(p + "attn_norm.weight", (N_EMBD,), ones(N_EMBD))
-        w.add_tensor(p + "attn_q.weight", (N_EMBD, N_EMBD), rand(N_EMBD * N_EMBD), dtype)
-        w.add_tensor(p + "attn_k.weight", (N_EMBD, N_EMBD), rand(N_EMBD * N_EMBD), dtype)
-        w.add_tensor(p + "attn_v.weight", (N_EMBD, N_EMBD), rand(N_EMBD * N_EMBD), dtype)
-        w.add_tensor(p + "attn_output.weight", (N_EMBD, N_EMBD), rand(N_EMBD * N_EMBD), dtype)
-        w.add_tensor(p + "ffn_norm.weight", (N_EMBD,), ones(N_EMBD))
-        w.add_tensor(p + "ffn_gate.weight", (N_EMBD, N_FF), rand(N_EMBD * N_FF), dtype)
-        w.add_tensor(p + "ffn_up.weight", (N_EMBD, N_FF), rand(N_EMBD * N_FF), dtype)
-        w.add_tensor(p + "ffn_down.weight", (N_FF, N_EMBD), rand(N_FF * N_EMBD), dtype)
-    w.add_tensor("output_norm.weight", (N_EMBD,), ones(N_EMBD))
-    w.add_tensor("output.weight", (N_EMBD, n_vocab), rand(n_vocab * N_EMBD), dtype)
+        add_weight(p + "attn_norm.weight", (n_embd,), ones(n_embd), dtype)
+        add_weight(p + "attn_q.weight", (n_embd, n_embd),
+                   rand(n_embd * n_embd), dtype)
+        add_weight(p + "attn_k.weight", (n_embd, n_embd),
+                   rand(n_embd * n_embd), dtype)
+        add_weight(p + "attn_v.weight", (n_embd, n_embd),
+                   rand(n_embd * n_embd), dtype)
+        add_weight(p + "attn_output.weight", (n_embd, n_embd),
+                   rand(n_embd * n_embd), dtype)
+        add_weight(p + "ffn_norm.weight", (n_embd,), ones(n_embd), dtype)
+        add_weight(p + "ffn_gate.weight", (n_embd, n_ff),
+                   rand(n_embd * n_ff), dtype)
+        add_weight(p + "ffn_up.weight", (n_embd, n_ff),
+                   rand(n_embd * n_ff), dtype)
+        add_weight(p + "ffn_down.weight", (n_ff, n_embd),
+                   rand(n_ff * n_embd), dtype)
+    add_weight("output_norm.weight", (n_embd,), ones(n_embd), dtype)
+    add_weight("output.weight", (n_embd, n_vocab),
+               rand(n_vocab * n_embd), dtype)
 
     w.write()
     print(f"wrote {path} (vocab={n_vocab}, dtype={dtype})")

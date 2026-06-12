@@ -34,6 +34,9 @@ def main() -> None:
     local = pull_model(parse_model_ref(MODEL_REF))
     model = Model.load(str(local.model_path), progress=False)
     print(model.describe())
+    assert model.weight_storage["quantized"], (
+        f"real-model gate did not exercise quantized matrix storage: "
+        f"{model.weight_storage}")
 
     ids = model.tok.encode("Once upon a time")
     res = chat.generate(model, ids, SamplerParams(temperature=0.0), n_predict=60)

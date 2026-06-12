@@ -213,7 +213,6 @@ def interactive(model: Model, params: SamplerParams, system: str = "",
         if not user.strip():
             continue
         messages.append({"role": "user", "content": user})
-        model.reset()  # re-prefill whole conversation (simple & correct)
         ids = fmt.render(messages)
         res = generate(model, ids, params, n_predict,
                        stream=lambda s: print(s, end="", flush=True))

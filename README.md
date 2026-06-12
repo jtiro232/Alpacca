@@ -96,38 +96,71 @@ stablelm, gemma. Chat templates are detected from the model's metadata.
 ### Honest performance expectations
 
 This engine values clarity, auditability, and zero dependencies over raw
-speed. Weights are held in float32. Rules of thumb:
+speed. The NumPy path now batches prompt prefill, reuses the KV cache for
+shared prompt prefixes, and can keep Q4_0, Q4_K, Q5_K, Q6_K, and Q8_0 matrix
+weights in their GGUF quantized bytes instead of eagerly expanding every
+matrix to float32. Supported non-matvec quantized formats fall back to
+float32.
 
-- **with NumPy**: 1B-class models chat comfortably; 7-8B models work but
-  need ~35 GB RAM and patience.
-- **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow.
-  Good for air-gapped checks, not long conversations.
+Measured on this Windows/NumPy workstation with
+`tests/bench.py --ctx 128`:
+
+| Model | Mode | Load | Prefill | Decode | RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| stories15M Q4_0, 64 prompt / 32 decode | quantized weights | 0.028 s | 1,322 tok/s | 26.6 tok/s | n/a on Windows |
+| stories15M Q4_0, same run | `ALPACCA_F32=1` dense weights | 0.086 s | 6,721 tok/s | 301.8 tok/s | n/a on Windows |
+| stories15M Q4_0, 64 prompt / 2 decode | `ALPACCA_PREFILL_CHUNK=1` | 0.028 s | 28.0 tok/s | not comparable | n/a on Windows |
+
+That last row is the old prompt-processing shape: token-at-a-time prefill. The
+default batched prefill is about 47x faster on the same small model. Decode is
+more nuanced: for very small models, dense float32 BLAS can still beat Python
+quantized matvec by a wide margin. Quantized storage is mainly a load-time and
+memory tool here, and it becomes more relevant as models grow past comfortable
+float32 RAM sizes. It is not a claim of llama.cpp-style quantized decode speed.
+
+Rules of thumb:
+
+- **with NumPy**: tiny and 1B-class models are the practical target; larger
+  quantized models can load with much less RAM than full float32, but Python
+  quantized matvec remains the limiter.
+- **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow. Good
+  for air-gapped checks, not long conversations.
+- **chat/server reuse**: repeated turns or requests with a shared prompt prefix
+  skip already-cached K/V work automatically.
 
 If you need llama.cpp-class speed, you need llama.cpp-class native kernels -
 that's a different project (and an explicit non-goal here).
 
-Recent local acceptance coverage includes `NousResearch/Hermes-3-Llama-3.1-8B`
-via its single-file `Q4_K_M` GGUF. On a 16-core Ryzen 9 7950X with NumPy, it
-loaded at ~36 GB RAM and answered the Lincoln birthday check at about 1.75
-tokens/sec. Treat that as a correctness and compatibility signal, not an
-Ollama-speed performance target.
+Useful environment knobs:
+
+- `ALPACCA_PURE=1`: force the standard-library backend.
+- `ALPACCA_F32=1`: force the NumPy loader to expand quantized matrices to
+  float32, useful for A/B checks and small models where BLAS wins.
+- `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
+- `ALPACCA_UNPACKED_WEIGHT_MB=N`: compact Q6_K unpack cache; default 2048 MiB,
+  set `0` to disable.
+- `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense cache for quantized matvec
+  weights, capped at `N` MiB.
 
 ## Roadmap
 
 Alpacca's near-term goal is to stay inspectable and Python-first while making
-the fast path more practical. Planned work:
+the fast path more practical. Current status:
 
-- **Quantized matvec backend**: keep GGUF weights in their native quantized
-  representation during inference instead of expanding everything to float32.
-  This is the main path toward large speed and memory wins.
+- **Done**: batched NumPy prefill with last-token-only vocab projection.
+- **Done**: prefix-aware KV-cache reuse across chat turns and serialized server
+  requests.
+- **Done, initial**: quantized matrix storage and matvec/matmul dispatch for
+  Q4_0/Q4_K/Q5_K/Q6_K/Q8_0.
+- **Next**: make quantized decode faster without giving up the no-native-code
+  constraint, or document where that constraint sets the ceiling.
 - **Backend selection**: keep the current stdlib and NumPy paths, then add
   optional accelerated backends behind clear flags. Candidate backends include
   Numba, CuPy, PyTorch, Triton, or small native kernels exposed through Python.
-- **Kernel fusion**: fuse common transformer operations such as QKV projection,
-  SwiGLU gate/up projection, RoPE, and attention reductions where the selected
-  backend can do so without excessive memory duplication.
-- **Model compatibility gates**: add recurring real-model tests for Q4_K,
-  Q5_K/Q6_K, qwen, gemma, mistral, and larger llama-family GGUFs.
+- **Kernel fusion**: continue fusing common transformer operations where the
+  selected backend can do so without excessive memory duplication.
+- **Model compatibility gates**: add recurring real-model tests for Q5_K/Q6_K,
+  qwen, gemma, mistral, and larger llama-family GGUFs.
 - **Operational UX**: improve Windows launchers, model selection, and clearer
   warnings for split GGUFs, unsupported architectures, and memory-heavy runs.
 - **Server compatibility**: broaden OpenAI-compatible API behavior while keeping
@@ -136,10 +169,12 @@ the fast path more practical. Planned work:
 ## Testing
 
 ```sh
-python3 tests/smoke.py            # offline: 33 checks - mock registry pulls,
+python3 tests/smoke.py            # offline suite: mock registry pulls,
                                   # real inference, API server, store mgmt
 python3 tests/real_model_test.py  # downloads a 19 MB real model (network),
                                   # asserts it generates coherent English
+python3 tests/bench.py --model hf:ggml-org/models:stories15M-q4_0.gguf \
+  --prefill 64 --decode 32 --ctx 128
 python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
                                   # birthday; --model ... for bigger models
 ```

@@ -232,6 +232,26 @@ class GGUFWriter:
             raise ValueError(f"writer does not support {dtype}")
         self.tensors.append((name, shape, dtype, data))
 
+    def add_raw_tensor(self, name: str, shape: tuple[int, ...], dtype: str,
+                       data: bytes) -> None:
+        """Add pre-encoded GGUF tensor bytes.
+
+        This is intended for tests that need a valid container for formats the
+        writer cannot quantize from float values yet.
+        """
+        if dtype not in GGML_BLOCK_INFO:
+            raise ValueError(f"writer does not support raw tensor type {dtype}")
+        n = 1
+        for d in shape:
+            n *= d
+        block_n, block_b = GGML_BLOCK_INFO[dtype]
+        if n % block_n:
+            raise ValueError(f"{name}: element count is not a multiple of {block_n}")
+        expected = n // block_n * block_b
+        if len(data) != expected:
+            raise ValueError(f"{name}: {len(data)} bytes for {dtype}, expected {expected}")
+        self.tensors.append((name, shape, dtype, bytes(data)))
+
     @staticmethod
     def _pack_string(s: str) -> bytes:
         b = s.encode("utf-8")
