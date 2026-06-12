@@ -328,6 +328,10 @@ class Model:
 
             m.n_ctx = min(n_ctx, hp.n_ctx_train) if n_ctx else min(hp.n_ctx_train, 4096)
             m._init_cache()
+            if quantized_matrices and T.HAS_NUMPY:
+                from . import kernels
+                if kernels.available():
+                    kernels.warmup()  # JIT compile/cache-load counts as load
             m.load_seconds = time.time() - t0
             return m
         finally:

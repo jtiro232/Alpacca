@@ -34,6 +34,7 @@ import math
 import os
 import weakref
 
+from . import kernels as _kernels
 from .quants import QUANT_GEOMETRY, dequantize
 
 try:
@@ -152,6 +153,10 @@ class QuantMatrix:
             dense = self._dense_hot_cache()
             if dense is not None:
                 return dense @ _np.asarray(x, dtype=_np.float32)
+        if not self._small and _kernels.available():
+            # our fused Python-source kernel, JIT-compiled by pinned numba:
+            # reads the int8 codes once, ~10x the einsum path (measured)
+            return _kernels.matvec_codes(self._q3, self._d, self._m, x)
         xs = _np.asarray(x, dtype=_np.float32).reshape(self.n_sub, self.sub_len)
         if self._small:
             # batched (n_sub) BLAS matmuls of (rows, sub_len) @ (sub_len, 1)

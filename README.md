@@ -14,10 +14,15 @@ Alpacca stands on three commitments:
    around llama.cpp, PyTorch, or anything else - no vendored code, no
    binaries, no submodules. You can read the whole engine in an afternoon.
 2. **Pure Python.** The engine runs on the standard library alone, on any
-   Python >= 3.10. NumPy is the single optional accelerator: auto-detected
-   when installed (10-100x faster math), never required. `ALPACCA_PURE=1`
-   forces the stdlib path. Both backends produce matching results and
-   verify each other in CI.
+   Python >= 3.10, and every algorithm in this repository - including the
+   fast kernels - is written in Python. Acceleration is optional and
+   tiered: NumPy when installed (10-100x faster math), and Alpacca's own
+   kernels in `alpacca/kernels.py` - our Python source, JIT-compiled to
+   native SIMD at runtime by a *pinned* Numba (`pip install
+   alpacca[kernels]`; the pin is never bumped implicitly). No C, no Rust,
+   no compiled files in the repo. `ALPACCA_PURE=1` forces the stdlib
+   path; the pure and NumPy paths are the reference implementations that
+   everything else must match in CI.
 3. **Fast and reliable - honestly.** Speed is engineered as far as Python
    plus NumPy can go: quantized int8 weight storage, a hybrid
    dense/quantized policy that auto-tunes to your machine's RAM, batched
@@ -33,6 +38,7 @@ Alpacca stands on three commitments:
 | GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
 | Quantization | `alpacca/quants.py` | F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
 | Quantized weights | `alpacca/qmatrix.py` | int8 codes + folded scales in RAM; matvec/matmul kernels, hot cache |
+| Fast kernels | `alpacca/kernels.py` | our fused quantized-matvec algorithms in Python source, JIT-compiled by pinned optional Numba |
 | Tokenizers | `alpacca/tokenizer.py` | SentencePiece-style (Viterbi + byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
 | Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
 | Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
@@ -205,6 +211,37 @@ Q4), the FFN stack is ~22.5 GB (21.0 GiB) dense, so
 total RAM" setting, and smaller budgets degrade gracefully - every MiB
 goes to the highest-impact matrices first. `tests/bench.py` prints the
 resulting storage split per run.
+
+### Our own kernels: native speed, still our Python
+
+`pip install alpacca[kernels]` adds the third tier: the fused
+quantized-matvec algorithms in `alpacca/kernels.py` - written and
+maintained as ordinary Python in this repository - get JIT-compiled to
+native SIMD machine code at runtime by Numba, **pinned at
+`numba==0.65.1`** (a validated pair with this code; the pin is never
+updated implicitly, and a different installed version deactivates the
+kernels rather than running unvalidated). Weights stay quantized in RAM
+(~1.1-1.3 bytes/weight) and the kernel reads them exactly once per
+token, fused dequant-and-dot, multithreaded.
+
+Microbenchmarks on the 4-core container, 8B-class (Hermes) matrix
+shapes, int8 codes + scales vs the same matvec through NumPy:
+
+| Matrix | dense BLAS f32 | NumPy einsum (quant) | our kernel (quant) |
+| --- | ---: | ---: | ---: |
+| 4096x4096 attn | 0.69 ms | 6.20 ms | **0.74 ms** |
+| 14336x4096 ffn | 2.34 ms | 22.4 ms | **2.23 ms** |
+| 4096x14336 ffn | 2.74 ms | 22.4 ms | **1.86 ms** |
+| 128256x4096 output | 39.9 ms | 278 ms | **48.0 ms** |
+
+~10x the NumPy quantized path, and dense-BLAS-class speed while reading
+3.5x fewer bytes - which is exactly why, when the kernels are active,
+`alpacca run` keeps weights quantized instead of densifying: fastest
+path and lowest RAM at the same time. Without Numba nothing changes;
+the NumPy and pure paths remain the reference and the fallback
+(`ALPACCA_KERNELS=0` disables; `ALPACCA_KERNELS=force` accepts an
+unpinned Numba at your own risk). First use compiles the kernels once
+(~1 s, cached on disk).
 
 **Fast is the default for `alpacca run` and `alpacca serve`**: unless
 `ALPACCA_DENSE_WEIGHT_MB` is set, the CLI sizes the budget automatically

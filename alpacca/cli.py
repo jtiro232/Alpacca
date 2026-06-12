@@ -154,6 +154,15 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
         return
     if os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None:
         return
+    from . import kernels
+    if kernels.available():
+        # fused quantized kernels read ~1.1-1.3 B/weight at native speed:
+        # faster than dense BLAS (4 B/weight) AND ~3x less RAM, so the
+        # fastest default is to keep everything quantized
+        kernels.warmup()
+        print(f"{kernels.status()}: keeping weights quantized "
+              f"(fastest path, lowest RAM)", file=sys.stderr)
+        return
     avail = _available_ram_mb()
     if avail is None:
         print("alpacca: could not detect available RAM; keeping weights "

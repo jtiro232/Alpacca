@@ -358,6 +358,30 @@ def main() -> None:
         check("dense matvec fallback still works",
               max(abs(a - b) for a, b in zip(dy, [6.0, -2.0])) < 1e-6)
 
+        from alpacca import kernels as AK
+        try:
+            import numba as _numba
+            has_pinned_numba = (T.HAS_NUMPY and
+                                _numba.__version__ == AK.NUMBA_PIN)
+        except Exception:
+            has_pinned_numba = False
+        if has_pinned_numba:
+            check("alpacca kernels activate on the pinned numba",
+                  AK.available(), AK.status())
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 "import os; os.environ['ALPACCA_KERNELS'] = '0'\n"
+                 "import sys; sys.path.insert(0, '.')\n"
+                 "from alpacca import kernels\n"
+                 "assert not kernels.available()\n"
+                 "print('off-ok')"],
+                capture_output=True, text=True, cwd=str(REPO))
+            check("ALPACCA_KERNELS=0 disables the kernels",
+                  "off-ok" in r.stdout, r.stdout + r.stderr)
+        else:
+            check("alpacca kernels stay inactive without the pinned numba",
+                  not AK.available(), AK.status())
+
         if T.HAS_NUMPY:
             import numpy as np
             from types import SimpleNamespace
@@ -816,10 +840,17 @@ def main() -> None:
                     "--seed", "1", env=env)
         check("run Q4_0 hf model", "tokens," in r.stderr)
         if T.HAS_NUMPY:
-            check("run defaults to an auto dense-weight budget",
-                  "auto dense-weight budget:" in r.stderr and
-                  "dense budget 15 matrices" in r.stderr,
-                  r.stderr[-500:])
+            if has_pinned_numba:
+                check("run keeps weights quantized when kernels are active",
+                      "alpacca-kernels active" in r.stderr and
+                      "auto dense-weight budget:" not in r.stderr and
+                      "weights quantized Q4_0 (16 matrices)" in r.stderr,
+                      r.stderr[-500:])
+            else:
+                check("run defaults to an auto dense-weight budget",
+                      "auto dense-weight budget:" in r.stderr and
+                      "dense budget 15 matrices" in r.stderr,
+                      r.stderr[-500:])
             r0 = run_cli("run", "hf:test/tiny-GGUF:tiny-q4.gguf", "hi", "-n", "4",
                          "--seed", "1",
                          env={**env, "ALPACCA_DENSE_WEIGHT_MB": "0"})
