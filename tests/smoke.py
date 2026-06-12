@@ -326,7 +326,7 @@ def main() -> None:
             xb = T.vector([((i * 19) % 67) / 23.0 - 1.4 for i in range(big_cols)])
             big_err = float(np.max(np.abs(T.matvec(big_q, xb) -
                                           T.matvec(big_dense, xb))))
-            check(f"Q8_0 large-matrix einsum matvec matches dense (diff {big_err:.2e})",
+            check(f"Q8_0 large-matrix quantized matvec matches dense (diff {big_err:.2e})",
                   big_rows * big_cols >= 1 << 20 and big_err < 1e-3)
             # cover the >=1M-element einsum kernel branch for an affine
             # format (Q4_K, exercises m_eff) and the 16-wide-sub-block Q6_K
@@ -342,7 +342,7 @@ def main() -> None:
                                 for i in range(bcols)])
                 berr2 = float(np.max(np.abs(T.matvec(bq, xb2) -
                                             T.matvec(bdense, xb2))))
-                check(f"{big_fmt} large-matrix einsum matvec matches dense "
+                check(f"{big_fmt} large-matrix quantized matvec matches dense "
                       f"(diff {berr2:.2e})",
                       brows * bcols >= 1 << 20 and berr2 < 1e-3)
                 X2 = np.stack([np.asarray(xb2),

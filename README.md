@@ -174,9 +174,10 @@ What quantized storage does and does not buy here, measured honestly:
   pass that costs 4.5-9 ms on the same matrix. Per-token profile of the
   quantized path after the overhead trims: ~76% in the int8 matvec
   kernels (~54% just the output projection), ~9% residual Python
-  overhead, the rest attention/normalization. Beating BLAS by 2x with
-  quantized weights needs native SIMD dot-product kernels
-  (llama.cpp-class), which is an explicit non-goal here.
+  overhead, the rest attention/normalization. Closing that gap needs
+  native SIMD dot-product kernels - which is exactly what the optional
+  `alpacca[kernels]` tier below provides, while staying our own Python
+  source.
 
 ### Spending RAM for speed: the dense-weight budget
 
@@ -262,6 +263,10 @@ storage.
 
 Rules of thumb:
 
+- **with the pinned kernels** (`pip install alpacca[kernels]`): quantized
+  weights become the fastest *and* smallest path; 1B-class models decode
+  at several tok/s and 8B-class models become usable. Prefer this tier
+  whenever you can install the pinned Numba.
 - **with NumPy**: tiny and 1B-class models are the practical target. Use
   quantized weights when RAM is the constraint, `ALPACCA_DENSE_WEIGHT_MB`
   to spend whatever RAM you can spare on decode speed, and `ALPACCA_F32=1`
@@ -274,6 +279,8 @@ Rules of thumb:
 Useful environment knobs:
 
 - `ALPACCA_PURE=1`: force the standard-library backend.
+- `ALPACCA_KERNELS=0`: disable the optional JIT kernels;
+  `ALPACCA_KERNELS=force` accepts a non-pinned Numba at your own risk.
 - `ALPACCA_DENSE_WEIGHT_MB=N`: densify up to `N` MiB of the most
   decode-critical matrices at load time (FFN first) and keep the rest
   quantized - the main RAM-for-speed dial. The CLI auto-sizes this from
@@ -355,9 +362,9 @@ python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
                                   # birthday; --model ... for bigger models
 ```
 
-CI runs the offline suite on Linux/macOS/Windows, with and without NumPy
-(187 checks on the NumPy backend, 117 pure-stdlib), plus the real-model
-generation gate on every push.
+CI runs the offline suite on Linux/macOS/Windows across the stdlib,
+NumPy, and pinned-numba kernel variants, plus the real-model generation
+gate on every push.
 
 ## Security & supply chain
 

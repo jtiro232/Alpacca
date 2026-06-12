@@ -72,8 +72,11 @@ def auto_budget_fit_mb(path: str, n_ctx: int = 0):
     float32 size of every matrix the densify plan could select, and
     fixed_mb covers what stays resident regardless - residual quantized
     storage (~1.3 B/weight upper bound), the KV cache at the effective
-    context, and a runtime baseline. Returns None if the header cannot be
-    read or the architecture is unsupported."""
+    context, and a runtime baseline. Matrices with unsupported dtypes
+    load dense float32 regardless of any budget and are counted in
+    neither term, so mixed-format files understate fixed memory (same
+    blind spot as the fallback formula). Returns None if the header
+    cannot be read or the architecture is unsupported."""
     try:
         gf = GGUFFile.open(path)
     except Exception:

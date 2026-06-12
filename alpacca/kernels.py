@@ -68,7 +68,8 @@ def _init() -> dict:
             out[r] = acc
         return out
 
-    _state = {"np": np, "matvec": _matvec_codes}
+    _state = {"np": np, "matvec": _matvec_codes,
+              "numba_version": numba.__version__}
     return _state
 
 
@@ -78,8 +79,10 @@ def available() -> bool:
 
 
 def status() -> str:
-    if available():
-        return f"alpacca-kernels active (numba=={NUMBA_PIN}, our Python source)"
+    st = _init()
+    if st:
+        return (f"alpacca-kernels active (numba=={st['numba_version']}, "
+                f"pin {NUMBA_PIN}, our Python source)")
     return "alpacca-kernels inactive (pure/NumPy paths in use)"
 
 
