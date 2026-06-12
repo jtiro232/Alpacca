@@ -5,15 +5,18 @@ question headlessly, and check the answer.
     python3 tests/acceptance.py                       # llama3.2:1b (default)
     python3 tests/acceptance.py --model NousResearch/Hermes-3-Llama-3.1-8B
 
-The default is a 1B model (~770 MB download, ~6 GB RAM with NumPy).
-The 8B Hermes model works but the pure-Python engine keeps weights in
-float32: expect a ~4.6 GB download, 35+ GB of RAM, and slow generation
-without NumPy - the script checks RAM and warns before committing.
-Needs network access to the model source on first run.
+The default is a 1B model (~770 MB download, ~2 GB RAM with NumPy now
+that quantized weights stay quantized in RAM; ~6 GB with ALPACCA_F32=1).
+The 8B Hermes model works with NumPy at roughly 13 GB RAM quantized
+(35+ GB with ALPACCA_F32=1). Without NumPy, weights become Python float
+objects at ~38 bytes each (measured), so 1B-class models need ~45 GB and
+8B-class ~300 GB - impractical; the script checks RAM and warns before
+committing. Needs network access to the model source on first run.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -49,7 +52,12 @@ def main() -> None:
 
     big = "8b" in args.model.lower() or "7b" in args.model.lower()
     ram = available_ram_gb()
-    need = 35 if big else 6
+    if tensor.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+        need = 13 if big else 2    # quantized int8 weight storage
+    elif tensor.HAS_NUMPY:
+        need = 35 if big else 6    # ALPACCA_F32=1 dense float32 expansion
+    else:
+        need = 300 if big else 45  # pure python: ~38 bytes per list weight
     if ram >= 0 and ram < need:
         print(f"warning: ~{need} GB RAM recommended for {args.model}, "
               f"only {ram:.1f} GB available", file=sys.stderr)
