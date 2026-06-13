@@ -290,36 +290,59 @@ def _read_chat_line_posix(prompt: str, stdin: TextIO,
 
 
 def interactive(model: Model, params: SamplerParams, system: str = "",
-                n_predict: int = -1) -> None:
+                n_predict: int = -1, model_name: str = "",
+                model_path: str = "") -> None:
     fmt = ChatFormat(model, detect_format(model.metadata))
-    print(f"alpacca chat - {model.describe()}", file=sys.stderr)
+    description = model.describe()
+    print(f"alpacca chat - {description}", file=sys.stderr)
     print("press Esc or type /exit to return, /clear to reset the conversation\n",
           file=sys.stderr)
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
-    while True:
+    from .history import start_session
+    history = start_session(model_name or description, model_path, system)
+    history_disabled = False
+
+    def record_history(method: str, *args, **kwargs) -> None:
+        nonlocal history_disabled
+        if history_disabled:
+            return
         try:
-            user = _read_chat_line("> ")
-        except (EOFError, KeyboardInterrupt):
-            print("", file=sys.stderr)
-            return
-        if user is None:
-            print("(returning to main menu)", file=sys.stderr)
-            return
-        if user.strip() in ("/exit", "/quit", "/bye"):
-            return
-        if user.strip() == "/clear":
-            messages = messages[:1] if system else []
-            model.reset()
-            print("(cleared)", file=sys.stderr)
-            continue
-        if not user.strip():
-            continue
-        messages.append({"role": "user", "content": user})
-        ids = fmt.render(messages)
-        res = generate(model, ids, params, n_predict,
-                       stream=lambda s: print(s, end="", flush=True))
-        print()
-        print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
-        messages.append({"role": "assistant", "content": res.text})
+            getattr(history, method)(*args, **kwargs)
+        except OSError as e:
+            history_disabled = True
+            print(f"(chat history disabled: {e})", file=sys.stderr)
+
+    try:
+        while True:
+            try:
+                user = _read_chat_line("> ")
+            except (EOFError, KeyboardInterrupt):
+                print("", file=sys.stderr)
+                return
+            if user is None:
+                print("(returning to main menu)", file=sys.stderr)
+                return
+            if user.strip() in ("/exit", "/quit", "/bye"):
+                return
+            if user.strip() == "/clear":
+                messages = messages[:1] if system else []
+                model.reset()
+                record_history("append_event", "clear")
+                print("(cleared)", file=sys.stderr)
+                continue
+            if not user.strip():
+                continue
+            messages.append({"role": "user", "content": user})
+            record_history("append_message", "user", user)
+            ids = fmt.render(messages)
+            res = generate(model, ids, params, n_predict,
+                           stream=lambda s: print(s, end="", flush=True))
+            print()
+            print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
+            messages.append({"role": "assistant", "content": res.text})
+            record_history("append_message", "assistant", res.text,
+                           tokens=res.tokens, seconds=res.seconds)
+    finally:
+        record_history("close")

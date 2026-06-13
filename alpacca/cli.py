@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .sample import SamplerParams
-from .store import (LocalModel, find_local, human_size, list_models,
+from .store import (LocalModel, alpacca_home, find_local, human_size, list_models,
                     models_root, parse_model_ref, remove_model)
 
 EXAMPLES = """\
@@ -21,8 +21,10 @@ model references:
 
 examples:
   alpacca pull llama3.2:1b
+  alpacca menu                                  # terminal app menu
   alpacca run llama3.2:1b                        # interactive chat
   alpacca run llama3.2:1b "why is the sky blue?" # one-shot
+  alpacca history list                           # list saved chats
   alpacca serve llama3.2:1b --port 8080          # OpenAI-compatible API
 """
 
@@ -275,7 +277,9 @@ def cmd_run(args) -> int:
         print()
         print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
         return 0
-    chat.interactive(model, params, system=args.system, n_predict=args.n_predict)
+    chat.interactive(model, params, system=args.system, n_predict=args.n_predict,
+                     model_name=parse_model_ref(args.model).display(),
+                     model_path=str(local.model_path))
     return 0
 
 
@@ -320,6 +324,339 @@ def cmd_tokenize(args) -> int:
     for i in ids:
         print(f"{i:>8}  {ascii(tok.piece(i))}")
     return 0
+
+
+def _clip(text: str, width: int) -> str:
+    text = " ".join(str(text).split())
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 3)].rstrip() + "..."
+
+
+def _default_model_file() -> Path:
+    return alpacca_home() / "default-model.txt"
+
+
+def _read_default_model() -> str:
+    try:
+        value = _default_model_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if value:
+        return value
+    models = list_models()
+    if models:
+        return models[0]["name"]
+    return "llama3.2:1b"
+
+
+def _write_default_model(model_ref: str) -> None:
+    path = _default_model_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(model_ref.strip() + "\n", encoding="utf-8")
+
+
+def _prompt_line(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def _menu_pause() -> None:
+    _prompt_line("Press Enter to continue...")
+
+
+def _menu_error(e) -> None:
+    print(f"alpacca: error: {e}", file=sys.stderr)
+
+
+def _print_installed_models() -> None:
+    print("Installed models:")
+    cmd_list(argparse.Namespace())
+
+
+def _menu_run_model() -> None:
+    print("\nChat with a model\n")
+    _print_installed_models()
+    current = _read_default_model()
+    print(f"\nCurrent chat model:\n  {current}\n")
+    model_ref = _prompt_line("Model reference (blank = current): ").strip() or current
+    print()
+    args = argparse.Namespace(
+        model=model_ref, prompt=[], ctx=0, temp=None, top_k=None, top_p=None,
+        repeat_penalty=None, seed=None, n_predict=-1, system="")
+    try:
+        rc = cmd_run(args)
+    except (RuntimeError, ValueError, SystemExit) as e:
+        _menu_error(e)
+        rc = 1
+    if rc:
+        _menu_pause()
+
+
+def _menu_model_manager() -> None:
+    while True:
+        print("\nAlpacca Model Manager\n")
+        _print_installed_models()
+        print("\n1. Add/download a model")
+        print("2. Switch chat model")
+        print("3. Show model details")
+        print("4. Delete an installed model")
+        print("5. Back to main menu\n")
+        choice = _prompt_line("Choose an option [1-5]: ").strip()
+        if choice in ("", "5"):
+            return
+        if choice == "1":
+            print("\nEnter any supported Alpacca model reference.")
+            print("Examples: llama3.2:1b, qwen2.5:0.5b, "
+                  "hf:NousResearch/Hermes-3-Llama-3.1-8B")
+            model_ref = _prompt_line("Model reference (blank to cancel): ").strip()
+            if model_ref:
+                try:
+                    cmd_pull(argparse.Namespace(model=model_ref, force=False,
+                                                no_verify=False))
+                except (RuntimeError, ValueError, SystemExit) as e:
+                    _menu_error(e)
+                _menu_pause()
+        elif choice == "2":
+            model_ref = _prompt_line(
+                "New chat model, exactly as shown in NAME (blank to cancel): "
+            ).strip()
+            if not model_ref:
+                continue
+            try:
+                local = find_local(parse_model_ref(model_ref))
+            except ValueError as e:
+                print(f"alpacca: error: {e}", file=sys.stderr)
+                local = None
+            if local is None:
+                print("Model is not installed or the reference is invalid.")
+                print("Use Add/download first, then switch to the installed model.")
+                _menu_pause()
+                continue
+            _write_default_model(parse_model_ref(model_ref).display())
+            print(f"Chat model set to:\n  {_read_default_model()}")
+            _menu_pause()
+        elif choice == "3":
+            model_ref = _prompt_line("Model reference to inspect (blank to cancel): ").strip()
+            if model_ref:
+                try:
+                    cmd_show(argparse.Namespace(model=model_ref, metadata=False))
+                except (RuntimeError, ValueError, SystemExit) as e:
+                    _menu_error(e)
+                _menu_pause()
+        elif choice == "4":
+            model_ref = _prompt_line("Model reference to delete (blank to cancel): ").strip()
+            if not model_ref:
+                continue
+            confirm = _prompt_line("Type DELETE to confirm: ")
+            if confirm.upper() == "DELETE":
+                try:
+                    cmd_rm(argparse.Namespace(models=[model_ref]))
+                except (RuntimeError, ValueError, SystemExit) as e:
+                    _menu_error(e)
+                _menu_pause()
+
+
+def _menu_history() -> None:
+    while True:
+        print("\nAlpacca Chat History\n")
+        _history_list()
+        print("\n1. View a chat")
+        print("2. Delete one chat")
+        print("3. Delete all chat history")
+        print("4. Back to main menu\n")
+        choice = _prompt_line("Choose an option [1-4]: ").strip()
+        if choice in ("", "4"):
+            return
+        if choice == "1":
+            chat = _prompt_line("Chat number or ID to view (blank to cancel): ").strip()
+            if chat:
+                try:
+                    _history_show(chat)
+                except (RuntimeError, ValueError, SystemExit) as e:
+                    _menu_error(e)
+                _menu_pause()
+        elif choice == "2":
+            chat = _prompt_line("Chat number or ID to delete (blank to cancel): ").strip()
+            if chat:
+                try:
+                    cmd_history(argparse.Namespace(history_command="rm", chats=[chat]))
+                except (RuntimeError, ValueError, SystemExit) as e:
+                    _menu_error(e)
+                _menu_pause()
+        elif choice == "3":
+            confirm = _prompt_line("Type DELETE to delete all chat history: ")
+            if confirm.upper() == "DELETE":
+                cmd_history(argparse.Namespace(history_command="clear", yes=True))
+                _menu_pause()
+
+
+def _print_controls() -> None:
+    print("\nAlpacca Controls\n")
+    print("Core commands:")
+    print("  alpacca menu")
+    print("  alpacca list")
+    print("  alpacca pull <model>")
+    print("  alpacca run <model> [prompt text]")
+    print("  alpacca serve <model> [--host HOST] [--port PORT]")
+    print("  alpacca history list|show|stats|rm|clear --yes")
+    print("  alpacca show <model> [--metadata]")
+    print("  alpacca rm <model> [more models...]")
+    print("  alpacca tokenize -m <model> -p \"text\"")
+    print("  alpacca doctor")
+    print("\nInteractive chat:")
+    print("  Esc or /exit returns to the menu/caller")
+    print("  /clear resets the current conversation")
+    print("\nUseful environment variables:")
+    print("  ALPACCA_HOME changes the model/history/default-model store")
+    print("  ALPACCA_DENSE_WEIGHT_MB=0 keeps weights fully quantized")
+    print("  ALPACCA_KERNELS=0 disables optional pinned JIT kernels")
+    print("  ALPACCA_PURE=1 forces the standard-library backend")
+
+
+def cmd_menu(_args) -> int:
+    """Repo-owned local terminal app menu."""
+    while True:
+        print("\nAlpacca\n")
+        _print_installed_models()
+        print(f"\nCurrent chat model:\n  {_read_default_model()}\n")
+        print("1. Chat with current or selected model")
+        print("2. Alpacca doctor")
+        print("3. Open Alpacca shell")
+        print("4. Model manager")
+        print("5. Chat history")
+        print("6. Saved chat statistics")
+        print("7. Controls tutorial")
+        print("8. Exit\n")
+        choice = _prompt_line("Choose an option [1-8]: ").strip()
+        if choice in ("", "8"):
+            return 0
+        if choice == "1":
+            _menu_run_model()
+        elif choice == "2":
+            cmd_doctor(argparse.Namespace())
+            _menu_pause()
+        elif choice == "3":
+            os.system("cmd" if sys.platform == "win32"
+                      else os.environ.get("SHELL", "sh"))
+        elif choice == "4":
+            _menu_model_manager()
+        elif choice == "5":
+            _menu_history()
+        elif choice == "6":
+            _history_stats()
+            _menu_pause()
+        elif choice == "7":
+            _print_controls()
+            _menu_pause()
+
+
+def _history_list() -> int:
+    from .history import list_chats
+    chats = list_chats()
+    if not chats:
+        print("no chat history yet")
+        return 0
+    print(f"{'#':>3}  {'ID':<25}  {'STARTED':<20}  {'TURNS':>5}  {'MODEL':<32}  TITLE")
+    for i, chat in enumerate(chats, 1):
+        print(f"{i:>3}  {chat['id']:<25}  "
+              f"{chat['started_at']:<20}  {chat['turns']:>5}  "
+              f"{_clip(chat['model'], 32):<32}  {_clip(chat['title'], 72)}")
+    return 0
+
+
+def _history_show(selector: str) -> int:
+    from .history import message_dicts, read_chat
+    chat = read_chat(selector)
+    print(f"Chat:    {chat['id']}")
+    print(f"Started: {chat.get('started_at', '')}")
+    if chat.get("ended_at"):
+        print(f"Ended:   {chat['ended_at']}")
+    print(f"Model:   {chat.get('model', '')}")
+    if chat.get("model_path"):
+        print(f"File:    {chat['model_path']}")
+    if chat.get("title"):
+        print(f"Title:   {chat['title']}")
+    for msg in message_dicts(chat):
+        role = msg.get("role", "?")
+        created = msg.get("created_at", "")
+        if role == "event":
+            print(f"\n--- event {created} ---")
+            print(msg.get("event", ""))
+            continue
+        print(f"\n--- {role} {created} ---")
+        content = msg.get("content", "")
+        if content:
+            print(content)
+        stats = []
+        if "tokens" in msg:
+            stats.append(f"{msg['tokens']} tokens")
+        if isinstance(msg.get("seconds"), (int, float)):
+            stats.append(f"{msg['seconds']:.2f}s")
+        if stats:
+            print(f"[{', '.join(stats)}]")
+    return 0
+
+
+def _history_stats() -> int:
+    from .history import model_stats
+    rows = model_stats()
+    if not rows:
+        print("no downloaded models or chat history yet")
+        return 0
+    print(f"{'MODEL':<40}  {'INST':<4}  {'CHATS':>5}  {'RESP':>5}  "
+          f"{'TOKENS':>8}  {'SECONDS':>9}  {'AVG TOK/S':>9}")
+    for row in rows:
+        rate = f"{row['tok_per_sec']:.1f}" if row["responses"] else "n/a"
+        print(f"{_clip(row['model'], 40):<40}  "
+              f"{'yes' if row['installed'] else 'no':<4}  "
+              f"{row['chats']:>5}  {row['responses']:>5}  "
+              f"{row['tokens']:>8}  {row['seconds']:>9.2f}  {rate:>9}")
+    return 0
+
+
+def cmd_history(args) -> int:
+    command = args.history_command or "list"
+    if command in ("list", "ls"):
+        return _history_list()
+    if command == "show":
+        return _history_show(args.chat)
+    if command == "stats":
+        return _history_stats()
+    if command in ("rm", "delete"):
+        from .history import list_chats, resolve_chat_entry
+        chats = list_chats()
+        targets = []
+        seen = set()
+        for sel in args.chats:
+            chat = resolve_chat_entry(sel, chats)
+            path = chat["path"]
+            if path not in seen:
+                targets.append(chat)
+                seen.add(path)
+        for chat in targets:
+            try:
+                chat["path"].unlink()
+            except FileNotFoundError:
+                pass
+            print(f"deleted {chat['id']}")
+        return 0
+    if command == "clear":
+        from .history import clear_history, list_chats
+        count = len(list_chats())
+        if not args.yes:
+            if count == 0:
+                print("no chat history to delete")
+                return 0
+            print(f"this will delete {count} chat(s); rerun with --yes to confirm",
+                  file=sys.stderr)
+            return 1
+        deleted = clear_history()
+        print(f"deleted {deleted} chat(s)")
+        return 0
+    raise ValueError(f"unknown history command: {command}")
 
 
 def _add_model_flags(p: argparse.ArgumentParser) -> None:
@@ -387,11 +724,33 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-p", "--text", required=True)
     p.set_defaults(func=cmd_tokenize)
 
+    p = sub.add_parser("menu", help="open the local terminal app menu")
+    p.set_defaults(func=cmd_menu)
+
+    p = sub.add_parser("history", aliases=["hist"], help="manage saved chat history")
+    hsub = p.add_subparsers(dest="history_command", metavar="<history-command>")
+    hp = hsub.add_parser("list", aliases=["ls"], help="list saved chats")
+    hp.set_defaults(func=cmd_history)
+    hp = hsub.add_parser("show", help="show a saved chat")
+    hp.add_argument("chat", help="chat number, full id, or unique id prefix")
+    hp.set_defaults(func=cmd_history)
+    hp = hsub.add_parser("stats", help="show read-only saved chat statistics")
+    hp.set_defaults(func=cmd_history)
+    hp = hsub.add_parser("rm", aliases=["delete"], help="delete saved chats")
+    hp.add_argument("chats", nargs="+", help="chat number/id/prefix to delete")
+    hp.set_defaults(func=cmd_history)
+    hp = hsub.add_parser("clear", help="delete all saved chat history")
+    hp.add_argument("--yes", action="store_true", help="confirm deletion")
+    hp.set_defaults(func=cmd_history)
+    p.set_defaults(func=cmd_history)
+
     p = sub.add_parser("doctor", help="check the installation")
     p.set_defaults(func=cmd_doctor)
 
     args = ap.parse_args(argv)
     if not args.command:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return cmd_menu(argparse.Namespace())
         ap.print_help()
         return 0
     try:

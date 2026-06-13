@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import gc
 import os
+import argparse
 import shutil
 import struct
 import subprocess
@@ -39,12 +40,14 @@ def check(label: str, ok: bool, detail: str = "") -> None:
         sys.exit(1)
 
 
-def run_cli(*args, env=None, expect=0) -> subprocess.CompletedProcess:
+def run_cli(*args, env=None, expect=0,
+            input_text: str | None = None) -> subprocess.CompletedProcess:
     e = dict(os.environ)
     if env:
         e.update(env)
     r = subprocess.run([sys.executable, "-m", "alpacca", *args],
-                       capture_output=True, text=True, env=e, cwd=str(REPO))
+                       input=input_text, capture_output=True, text=True,
+                       env=e, cwd=str(REPO))
     if expect is not None and r.returncode != expect:
         print(f"FAIL alpacca {' '.join(args)} -> rc={r.returncode}")
         print("     | " + "\n     | ".join((r.stdout + r.stderr).splitlines()[-15:]))
@@ -369,6 +372,209 @@ def main() -> None:
         check("chat line reader keeps normal input",
               _read_chat_line(stdin=io.StringIO("hello\n"),
                               stdout=prompt_out) == "hello")
+
+        old_home = os.environ.get("ALPACCA_HOME")
+        try:
+            os.environ["ALPACCA_HOME"] = str(tmp / "history-unit-home")
+            import alpacca.history as history_mod
+            from alpacca.history import (clear_history, delete_chat,
+                                         list_chats, model_stats, read_chat,
+                                         start_session)
+
+            def run_with_vanished_after_list_load(target: Path, callback):
+                original_load_chat = history_mod._load_chat
+                vanished = {"value": False}
+
+                def load_then_vanish(path: Path):
+                    data = original_load_chat(path)
+                    if path == target and data is not None and not vanished["value"]:
+                        vanished["value"] = True
+                        try:
+                            target.unlink()
+                        except FileNotFoundError:
+                            pass
+                    return data
+
+                history_mod._load_chat = load_then_vanish
+                try:
+                    result = callback()
+                finally:
+                    history_mod._load_chat = original_load_chat
+                    if target.exists():
+                        target.unlink()
+                return vanished["value"], result
+
+            empty_hist = start_session("unit-model", "unit.gguf")
+            empty_hist.close()
+            check("empty chat history session is not saved", list_chats() == [])
+            event_hist = start_session("unit-model", "unit.gguf")
+            event_hist.append_event("clear")
+            check("event-only chat history session is not saved", list_chats() == [])
+            event_hist.append_message("user", "hello history")
+            event_hist.append_message("assistant", "saved", tokens=2, seconds=0.25)
+            event_hist.close()
+            chats = list_chats()
+            check("chat history session is saved",
+                  len(chats) == 1 and chats[0]["turns"] == 1 and
+                  chats[0]["title"] == "hello history",
+                  str(chats))
+            chat_doc = read_chat("1")
+            check("chat history can be read by list number",
+                  chat_doc["id"] == event_hist.id and
+                  chat_doc["messages"][1]["content"] == "hello history")
+            race_show = start_session("unit-model", "unit.gguf")
+            race_show.append_message("user", "vanished show")
+            race_show.close()
+
+            def read_vanished_show():
+                try:
+                    read_chat(race_show.id)
+                except ValueError as e:
+                    return str(e)
+                return ""
+
+            vanished_show, show_error = run_with_vanished_after_list_load(
+                race_show.path, read_vanished_show)
+            check("history show reports chat vanished before read",
+                  vanished_show and "could not read chat" in show_error,
+                  show_error)
+            stats = model_stats()
+            check("chat history stats aggregate token speed by model",
+                  len(stats) == 1 and stats[0]["model"] == "unit-model" and
+                  stats[0]["chats"] == 1 and stats[0]["responses"] == 1 and
+                  stats[0]["tokens"] == 2 and
+                  abs(stats[0]["tok_per_sec"] - 8.0) < 1e-9,
+                  str(stats))
+            invalid_hist = start_session("unit-model", "unit.gguf")
+            invalid_hist.append_message("user", "bad metrics")
+            invalid_hist.append_message("assistant", "bool tokens",
+                                        tokens=True, seconds=1.0)
+            invalid_hist.append_message("assistant", "float tokens",
+                                        tokens=1.5, seconds=1.0)
+            invalid_hist.append_message("assistant", "negative tokens",
+                                        tokens=-1, seconds=1.0)
+            invalid_hist.append_message("assistant", "nonfinite seconds",
+                                        tokens=3, seconds=float("inf"))
+            invalid_hist.close()
+            stats = model_stats()
+            unit = next(row for row in stats if row["model"] == "unit-model")
+            check("chat history stats rejects invalid metric fields",
+                  unit["chats"] == 2 and unit["responses"] == 1 and
+                  unit["tokens"] == 2 and abs(unit["seconds"] - 0.25) < 1e-9,
+                  str(unit))
+            delete_chat(invalid_hist.id)
+            delete_chat(event_hist.id[:12])
+            check("chat history can delete by id prefix", list_chats() == [])
+            original_unlink = Path.unlink
+            race_delete = start_session("unit-model", "unit.gguf")
+            race_delete.append_message("user", "vanished delete")
+            race_delete.close()
+            vanished = {"delete": False}
+
+            def vanish_on_delete(self, *args, **kwargs):
+                if self == race_delete.path and not vanished["delete"]:
+                    vanished["delete"] = True
+                    raise FileNotFoundError(str(self))
+                return original_unlink(self, *args, **kwargs)
+
+            Path.unlink = vanish_on_delete
+            try:
+                delete_chat(race_delete.id)
+            finally:
+                Path.unlink = original_unlink
+                if race_delete.path.exists():
+                    race_delete.path.unlink()
+            check("chat history delete tolerates vanished file",
+                  vanished["delete"])
+            race_delete_read = start_session("unit-model", "unit.gguf")
+            race_delete_read.append_message("user", "vanished before delete unlink")
+            race_delete_read.close()
+            vanished_delete_read, deleted = run_with_vanished_after_list_load(
+                race_delete_read.path, lambda: delete_chat(race_delete_read.id))
+            check("chat history delete tolerates pre-unlink vanished file",
+                  vanished_delete_read and deleted["id"] == race_delete_read.id and
+                  not race_delete_read.path.exists(),
+                  str(deleted))
+            race_clear = start_session("unit-model", "unit.gguf")
+            race_clear.append_message("user", "vanished clear")
+            race_clear.close()
+            vanished["clear"] = False
+
+            def vanish_on_clear(self, *args, **kwargs):
+                if self == race_clear.path and not vanished["clear"]:
+                    vanished["clear"] = True
+                    raise FileNotFoundError(str(self))
+                return original_unlink(self, *args, **kwargs)
+
+            Path.unlink = vanish_on_clear
+            try:
+                clear_deleted = clear_history()
+            finally:
+                Path.unlink = original_unlink
+                if race_clear.path.exists():
+                    race_clear.path.unlink()
+            check("chat history clear tolerates vanished file",
+                  vanished["clear"] and clear_deleted == 0)
+            from alpacca.cli import cmd_history
+            race_cli = start_session("unit-model", "unit.gguf")
+            race_cli.append_message("user", "vanished cli rm")
+            race_cli.close()
+            vanished["cli"] = False
+
+            def vanish_on_cli_rm(self, *args, **kwargs):
+                if self == race_cli.path and not vanished["cli"]:
+                    vanished["cli"] = True
+                    raise FileNotFoundError(str(self))
+                return original_unlink(self, *args, **kwargs)
+
+            Path.unlink = vanish_on_cli_rm
+            try:
+                cli_rc = cmd_history(argparse.Namespace(
+                    history_command="rm", chats=[race_cli.id]))
+            finally:
+                Path.unlink = original_unlink
+                if race_cli.path.exists():
+                    race_cli.path.unlink()
+            check("history rm tolerates vanished file",
+                  vanished["cli"] and cli_rc == 0)
+            race_cli_read = start_session("unit-model", "unit.gguf")
+            race_cli_read.append_message("user", "vanished before cli rm unlink")
+            race_cli_read.close()
+            vanished_cli_read, cli_read_rc = run_with_vanished_after_list_load(
+                race_cli_read.path,
+                lambda: cmd_history(argparse.Namespace(
+                    history_command="rm", chats=[race_cli_read.id])))
+            check("history rm tolerates pre-unlink vanished file",
+                  vanished_cli_read and cli_read_rc == 0 and
+                  not race_cli_read.path.exists())
+            active_hist = start_session("unit-model", "unit.gguf")
+            active_hist.append_message("user", "deleted active")
+            active_path = active_hist.path
+            delete_chat(active_hist.id[:12])
+            active_hist.append_message("assistant", "late answer")
+            active_hist.close()
+            check("deleted chat history session is not recreated",
+                  not active_path.exists() and list_chats() == [])
+            for label in ("first", "second"):
+                h = start_session("unit-model", "unit.gguf")
+                h.append_message("user", label)
+                h.close()
+            check("chat history clear deletes all chats", clear_history() == 2 and
+                  list_chats() == [])
+            active_clear = start_session("unit-model", "unit.gguf")
+            active_clear.append_message("user", "cleared active")
+            active_clear_path = active_clear.path
+            check("chat history clear removes active chat",
+                  clear_history() == 1 and not active_clear_path.exists())
+            active_clear.append_message("assistant", "late answer")
+            active_clear.close()
+            check("cleared chat history session is not recreated",
+                  not active_clear_path.exists() and list_chats() == [])
+        finally:
+            if old_home is None:
+                os.environ.pop("ALPACCA_HOME", None)
+            else:
+                os.environ["ALPACCA_HOME"] = old_home
 
         from alpacca import kernels as AK
         try:
@@ -839,6 +1045,145 @@ def main() -> None:
         check("run with pure-python backend", "tokens," in r.stderr)
         r = run_cli("tokenize", "-m", "tiny", "-p", "hello", env=env)
         check("tokenize via model name", "\u2581hello" in r.stdout or "hello" in r.stdout)
+
+        old_home = os.environ.get("ALPACCA_HOME")
+        try:
+            os.environ["ALPACCA_HOME"] = env["ALPACCA_HOME"]
+            from alpacca.history import start_session
+            h = start_session("tiny", str(model_path))
+            h.append_message("user", "history question")
+            h.append_message("assistant", "history answer", tokens=2, seconds=0.01)
+            h.close()
+            history_id = h.id
+        finally:
+            if old_home is None:
+                os.environ.pop("ALPACCA_HOME", None)
+            else:
+                os.environ["ALPACCA_HOME"] = old_home
+        r = run_cli("history", "list", env=env)
+        check("history list shows saved chat",
+              history_id in r.stdout and "history question" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "show", "1", env=env)
+        check("history show displays saved messages",
+              "history question" in r.stdout and "history answer" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "stats", env=env)
+        check("history stats shows saved model token speed",
+              "tiny" in r.stdout and "200.0" in r.stdout and "TOKENS" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "rm", history_id[:12], env=env)
+        check("history rm deletes one chat", f"deleted {history_id}" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "list", env=env)
+        check("history list is empty after delete", "no chat history yet" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "stats", env=env)
+        check("history stats lists installed model without saved chats",
+              "tiny" in r.stdout and "n/a" in r.stdout,
+              r.stdout)
+        hist_dir = Path(env["ALPACCA_HOME"]) / "history"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        malformed_json = hist_dir / "malformed.json"
+        bad_utf8_json = hist_dir / "bad-utf8.json"
+        temp_json = hist_dir / "orphan.json.tmp"
+        malformed_json.write_text("{not json", encoding="utf-8")
+        bad_utf8_json.write_bytes(b"\xff\xfe\xfa")
+        temp_json.write_text("partial", encoding="utf-8")
+        r = run_cli("history", "list", env=env)
+        check("history list tolerates invalid utf-8 history files",
+              "no chat history yet" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("history", "stats", env=env)
+        check("history stats tolerates invalid utf-8 history files",
+              "tiny" in r.stdout and "TOKENS" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("history", "clear", env=env)
+        check("history clear without --yes leaves malformed artifacts",
+              malformed_json.exists() and temp_json.exists(),
+              r.stdout + r.stderr)
+        r = run_cli("history", "clear", "--yes", env=env)
+        check("history clear --yes removes malformed artifacts",
+              not malformed_json.exists() and not bad_utf8_json.exists() and
+              not temp_json.exists(),
+              r.stdout + r.stderr)
+        bad_schema_json = hist_dir / "bad-schema.json"
+        bad_schema_tmp = hist_dir / "bad-schema.json.tmp"
+        bad_schema_json.write_text(json.dumps({
+            "id": "bad-schema",
+            "started_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-01-02T03:04:05Z",
+            "model": "tiny",
+            "title": "bad schema",
+            "messages": ["not-a-message"],
+        }), encoding="utf-8")
+        bad_schema_tmp.write_text("partial", encoding="utf-8")
+        r = run_cli("history", "list", env=env)
+        check("history list tolerates non-dict message entries",
+              "bad-schema" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "show", "bad-schema", env=env)
+        check("history show tolerates non-dict message entries",
+              "Chat:    bad-schema" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "stats", env=env)
+        check("history stats tolerates non-dict message entries",
+              "tiny" in r.stdout and "TOKENS" in r.stdout,
+              r.stdout)
+        r = run_cli("history", "clear", "--yes", env=env)
+        check("history clear --yes removes structurally malformed history",
+              not bad_schema_json.exists() and not bad_schema_tmp.exists(),
+              r.stdout + r.stderr)
+        old_home = os.environ.get("ALPACCA_HOME")
+        try:
+            os.environ["ALPACCA_HOME"] = env["ALPACCA_HOME"]
+            from alpacca.history import start_session
+            for content in ("clear one", "clear two"):
+                h = start_session("tiny", str(model_path))
+                h.append_message("user", content)
+                h.close()
+        finally:
+            if old_home is None:
+                os.environ.pop("ALPACCA_HOME", None)
+            else:
+                os.environ["ALPACCA_HOME"] = old_home
+        r = run_cli("history", "clear", env=env, expect=1)
+        check("history clear requires confirmation",
+              "rerun with --yes" in r.stderr, r.stderr)
+        r = run_cli("history", "clear", "--yes", env=env)
+        check("history clear --yes deletes all chats",
+              "deleted 2 chat(s)" in r.stdout, r.stdout)
+
+        r = run_cli("menu", env=env, input_text="8\n")
+        check("menu opens and exits",
+              "Current chat model:" in r.stdout and
+              "Chat history" in r.stdout and r.returncode == 0,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="2\n\n8\n")
+        check("menu doctor path runs",
+              "alpacca 0.2.0" in r.stdout and "models dir:" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="6\n\n8\n")
+        check("menu history stats path runs",
+              "Saved chat statistics" in r.stdout and "AVG TOK/S" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="5\n4\n8\n")
+        check("menu history list path runs",
+              "Alpacca Chat History" in r.stdout and
+              "no chat history yet" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="4\n2\ntiny\n\n5\n8\n")
+        default_model = Path(env["ALPACCA_HOME"]) / "default-model.txt"
+        check("menu model switch persists default",
+              default_model.read_text(encoding="utf-8").strip() == "tiny" and
+              "Chat model set to:" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env,
+                    input_text="4\n2\nnot-installed-model\n\n5\n8\n")
+        check("menu invalid model switch is rejected",
+              default_model.read_text(encoding="utf-8").strip() == "tiny" and
+              "Model is not installed" in r.stdout,
+              r.stdout + r.stderr)
 
         # ---- hugging-face path (incl. -GGUF fallback) ---------------------
         print("== hugging-face path ==")

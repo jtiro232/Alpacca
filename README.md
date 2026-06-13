@@ -18,9 +18,9 @@ Alpacca stands on three commitments:
    fast kernels - is written in Python. Acceleration is optional and
    tiered: NumPy when installed (10-100x faster math), and Alpacca's own
    kernels in `alpacca/kernels.py` - our Python source, JIT-compiled to
-   native SIMD at runtime by a *pinned* Numba (`pip install
-   alpacca[kernels]`; the pin is never bumped implicitly). No C, no Rust,
-   no compiled files in the repo. `ALPACCA_PURE=1` forces the stdlib
+   native SIMD at runtime by a *pinned* Numba (`python -m pip install
+   ".[kernels]"` from this checkout; the pin is never bumped implicitly).
+   No C, no Rust, no compiled files in the repo. `ALPACCA_PURE=1` forces the stdlib
    path; the pure and NumPy paths are the reference implementations that
    everything else must match in CI.
 3. **Fast and reliable - honestly.** Speed is engineered as far as Python
@@ -28,7 +28,7 @@ Alpacca stands on three commitments:
    dense/quantized policy that auto-tunes to your machine's RAM, batched
    prefill, KV-cache reuse. Every number in this README is measured, and
    the ceilings are documented next to the wins. Reliability means a CI
-   matrix across Linux/macOS/Windows with and without NumPy (300+ checks)
+   matrix across Linux/macOS/Windows with and without NumPy (hundreds of checks)
    plus a real-model generation gate on every push.
 
 ## Structure
@@ -36,21 +36,23 @@ Alpacca stands on three commitments:
 | Layer | Where | What's implemented |
 | --- | --- | --- |
 | GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
-| Quantization | `alpacca/quants.py` | F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
-| Quantized weights | `alpacca/qmatrix.py` | int8 codes + folded scales in RAM; matvec/matmul kernels, hot cache |
+| Quantization codecs | `alpacca/quants.py` | decode/encode support for F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
+| Quantized weight storage | `alpacca/qmatrix.py` | fast in-RAM matvec/matmul storage for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; unsupported matrix formats fall back to dense |
 | Fast kernels | `alpacca/kernels.py` | our fused quantized-matvec algorithms in Python source, JIT-compiled by pinned optional Numba |
 | Tokenizers | `alpacca/tokenizer.py` | SentencePiece-style (Viterbi + byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
 | Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
 | Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
-| Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, interactive REPL |
+| Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, Esc-to-menu interactive REPL with saved history |
+| History | `alpacca/history.py` | local JSON chat sessions, delete one/delete all controls, saved-chat statistics |
 | API server | `alpacca/serve.py` | OpenAI-compatible `/v1/chat/completions` (incl. SSE streaming) on `http.server` |
 | Model manager | `alpacca/store.py`, `alpacca/pull.py` | Ollama-registry protocol + Hugging Face pulls via `urllib`, resumable, SHA-256 verified |
-| CLI | `alpacca/cli.py` | pull/run/serve/list/show/rm/tokenize/doctor; auto RAM-aware speed defaults |
-| Tests | `tests/` | 300+ checks: offline smoke (mock registry, kernel parity, both backends), real-model gate, benchmarks, synthetic bench-model builders |
-| Tooling | `scripts/` | offline installers for Linux/macOS/Windows |
+| CLI / terminal app | `alpacca/cli.py` | repo-owned `alpacca menu`; pull/run/serve/list/show/rm/tokenize/history/hist/doctor; default model persistence; auto RAM-aware speed defaults |
+| Tests | `tests/` | offline smoke (mock registry, kernel parity, menu/history, both backends), real-model gate, benchmarks, synthetic bench-model builders |
+| Tooling | `scripts/` | offline installers for Linux/macOS/Windows, generating thin launchers into this checkout |
 
 ```text
 $ alpacca pull llama3.2:1b            # straight from the Ollama registry
+$ alpacca menu                        # local terminal app menu
 $ alpacca run llama3.2:1b             # interactive chat
 $ alpacca run llama3.2:1b "why is the sky blue?"
 $ alpacca serve llama3.2:1b           # OpenAI-compatible API on :8080
@@ -71,10 +73,20 @@ scripts/install.sh          # Linux/macOS   (PREFIX=... to relocate)
 .\scripts\install.ps1     # Windows PowerShell
 ```
 
-Requires Python >= 3.10. Optional: `pip install numpy` for fast generation -
-that is the only thing that would ever touch a package index, it's off by
-default, and Alpacca works without it. `pip install .` also works if you
-prefer a normal Python install.
+Requires Python >= 3.10. The generated launchers are deliberately thin:
+they set `PYTHONPATH` to this checkout and dispatch to `python -m alpacca`.
+Running `alpacca` with no arguments opens the repo-owned terminal menu in an
+interactive terminal; `alpacca menu` opens it explicitly; all normal commands
+still work (`alpacca doctor`, `alpacca run ...`, `alpacca history stats`).
+Installers use the normal store at `~/.alpacca` unless you set
+`ALPACCA_HOME` yourself.
+
+Optional: `python -m pip install numpy` for fast generation, or
+`python -m pip install ".[kernels]"` from this checkout for Alpacca's pinned
+Numba kernel tier. Those are the only commands here that would touch a
+package index for Python packages, they are opt-in, and Alpacca works without
+them. `python -m pip install .` also works if you prefer a normal Python
+install.
 
 ## Getting models
 
@@ -101,6 +113,8 @@ alpacca list
 alpacca show llama3.2:1b --metadata
 alpacca rm llama3.2:1b
 alpacca tokenize -m llama3.2:1b -p "hello world"
+alpacca history list
+alpacca history stats
 ```
 
 ## Running models
@@ -111,6 +125,35 @@ alpacca run llama3.2:1b "one-shot question"      # answers and exits
 alpacca run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
 alpacca serve llama3.2:1b --port 8080
 ```
+
+The terminal app has a repo-owned menu:
+
+```sh
+alpacca menu       # or just `alpacca` in an interactive terminal
+```
+
+The menu lists installed models, opens chat, switches the default chat
+model, shows model details, exposes history/statistics, and links back to
+the normal commands. The default chat model is stored locally in
+`~/.alpacca/default-model.txt` (or `$ALPACCA_HOME/default-model.txt`) and is
+only a UI convenience; every CLI command still accepts an explicit model
+reference.
+
+Interactive chats are saved as local JSON files under `~/.alpacca/history`
+(or `$ALPACCA_HOME/history`). One-shot `alpacca run MODEL "prompt"` calls and
+server/API requests are not logged. Use:
+
+```sh
+alpacca history list            # list saved interactive chats
+alpacca history show <chat>     # <chat> = list number, full ID, or unique prefix
+alpacca history stats           # read-only saved-chat token/s summary
+alpacca history rm <chat>       # delete one saved chat
+alpacca history clear --yes     # delete all saved chat history
+```
+
+`history stats` also lists installed models with zero saved chats so you can
+distinguish "installed but unused" from "used and deleted". History remains
+offline and zero-dependency.
 
 The server is OpenAI-compatible - point any OpenAI client at
 `http://127.0.0.1:8080/v1` (chat completions, streaming included), or use
@@ -176,7 +219,7 @@ What quantized storage does and does not buy here, measured honestly:
   kernels (~54% just the output projection), ~9% residual Python
   overhead, the rest attention/normalization. Closing that gap needs
   native SIMD dot-product kernels - which is exactly what the optional
-  `alpacca[kernels]` tier below provides, while staying our own Python
+  pinned kernel tier below provides, while staying our own Python
   source.
 
 ### Spending RAM for speed: the dense-weight budget
@@ -215,8 +258,8 @@ resulting storage split per run.
 
 ### Our own kernels: native speed, still our Python
 
-`pip install alpacca[kernels]` adds the third tier: the fused
-quantized-matvec algorithms in `alpacca/kernels.py` - written and
+`python -m pip install ".[kernels]"` from this checkout adds the third tier:
+the fused quantized-matvec algorithms in `alpacca/kernels.py` - written and
 maintained as ordinary Python in this repository - get JIT-compiled to
 native SIMD machine code at runtime by Numba, **pinned at
 `numba==0.65.1`** (a validated pair with this code; the pin is never
@@ -263,10 +306,10 @@ storage.
 
 Rules of thumb:
 
-- **with the pinned kernels** (`pip install alpacca[kernels]`): quantized
-  weights become the fastest *and* smallest path; 1B-class models decode
-  at several tok/s and 8B-class models become usable. Prefer this tier
-  whenever you can install the pinned Numba.
+- **with the pinned kernels** (`python -m pip install ".[kernels]"` from this
+  checkout): quantized weights become the fastest *and* smallest path;
+  1B-class models decode at several tok/s and 8B-class models become usable.
+  Prefer this tier whenever you can install the pinned Numba.
 - **with NumPy**: tiny and 1B-class models are the practical target. Use
   quantized weights when RAM is the constraint, `ALPACCA_DENSE_WEIGHT_MB`
   to spend whatever RAM you can spare on decode speed, and `ALPACCA_F32=1`
@@ -303,6 +346,16 @@ and the roadmap orders the work that serves it.
 
 **Landed recently**
 
+- Repo-owned terminal app menu (`alpacca menu`, or no-arg `alpacca` in an
+  interactive terminal), with model switching, history navigation, deletion
+  controls, saved-chat statistics, and Esc-to-menu chat return.
+- Interactive chat history: local JSON sessions under `ALPACCA_HOME`,
+  `history list/show/stats/rm/clear --yes`, and stats rows for installed
+  models even when they have no saved chats.
+- Optional pinned kernels: our Python-source fused quantized matvecs
+  JIT-compiled by `numba==0.65.1`; when active, the CLI
+  keeps weights quantized by default because that is the fastest and
+  smallest path.
 - Quantized int8 weight storage for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/
   Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight, nothing
   re-dequantized per token (2.9x decode over the previous engine); other
@@ -321,6 +374,11 @@ and the roadmap orders the work that serves it.
 
 **Next**
 
+- *Product UX:* keep the repo-owned menu and installer launchers in lockstep;
+  add history search/export/resume; add richer saved-chat statistics that
+  separate assistant messages from timed responses; normalize model identity
+  so raw GGUF paths and installed model refs merge in stats; keep default
+  model config portable and explicit.
 - *Reliability:* broaden the real-model CI gates beyond stories15M
   (K-quant files, qwen2/3, gemma, mistral, 1B-class llama); harden the
   GGUF parser against malformed files; add a server soak test.
@@ -340,9 +398,10 @@ and the roadmap orders the work that serves it.
 
 - Wrapping llama.cpp, Ollama, PyTorch, or any third-party inference
   runtime - that would be someone else's software.
-- Shipping compiled code. If a native fast path ever proves worth it, it
-  would be our own small, optional, clearly-flagged kernels - and the
-  engine must always run, and stay readable, as pure Python.
+- Shipping precompiled/native extension modules or required compiled
+  dependencies. Optional runtime JIT of our Python-source kernels is allowed
+  only behind an explicit, pinned dependency, and the engine must always run,
+  and stay readable, as pure Python.
 - Marketing numbers. When a performance gate is not met, this README
   says so.
 
@@ -362,9 +421,9 @@ python3 tests/acceptance.py       # pulls llama3.2:1b and asks it Lincoln's
                                   # birthday; --model ... for bigger models
 ```
 
-CI runs the offline suite on Linux/macOS/Windows across the stdlib,
-NumPy, and pinned-numba kernel variants, plus the real-model generation
-gate on every push.
+CI runs the offline suite on Linux/macOS/Windows for the stdlib and NumPy
+paths, adds a pinned-numba kernel job on Ubuntu, and runs the real-model
+generation gate on every push.
 
 ## Security & supply chain
 
