@@ -8,8 +8,10 @@ from pathlib import Path
 
 from . import __version__
 from .sample import SamplerParams
-from .store import (LocalModel, alpacca_home, find_local, human_size, list_models,
-                    models_root, parse_model_ref, remove_model)
+from .store import (LocalModel, alpacca_home, clear_model_nickname, find_local,
+                    human_size, list_models, models_root, nickname_for_model,
+                    parse_model_ref, remove_model, resolve_model_input,
+                    set_model_nickname)
 
 EXAMPLES = """\
 model references:
@@ -29,19 +31,21 @@ examples:
 """
 
 
-def _resolve_or_pull(name: str, auto_pull: bool = True) -> LocalModel:
+def _resolve_or_pull(name: str, auto_pull: bool = True) -> tuple[LocalModel, str]:
     from .pull import pull_model
-    ref = parse_model_ref(name)
+    resolved = resolve_model_input(name)
+    ref = parse_model_ref(resolved)
     local = find_local(ref)
     if local is not None:
-        return local
+        return local, ref.display()
     if ref.source == "file":
         raise SystemExit(f"alpacca: model file not found: {ref.path}")
     if not auto_pull:
         raise SystemExit(f"alpacca: {ref.display()} is not installed "
-                         f"(try `alpacca pull {name}`)")
+                         f"(try `alpacca pull {ref.display()}`)")
     print(f"{ref.display()} is not installed yet - pulling it first", file=sys.stderr)
-    return pull_model(ref)
+    return pull_model(ref), ref.display()
+
 
 
 def _sampler_params(args) -> SamplerParams:
@@ -218,17 +222,20 @@ def cmd_list(_args) -> int:
         print("no models installed - try: alpacca pull llama3.2:1b")
         return 0
     width = max(4, max(len(m["name"]) for m in models))
-    print(f"{'NAME':<{width}}  {'SOURCE':<8}  {'SIZE':<10}  PULLED")
+    nick_width = max(8, max(len(m.get("nickname", "")) for m in models))
+    print(f"{'NAME':<{width}}  {'NICKNAME':<{nick_width}}  "
+          f"{'SOURCE':<8}  {'SIZE':<10}  PULLED")
     for m in models:
-        print(f"{m['name']:<{width}}  {m['source']:<8}  "
-              f"{human_size(m['size']):<10}  {m['pulled_at']}")
+        print(f"{m['name']:<{width}}  {m.get('nickname', ''):<{nick_width}}  "
+              f"{m['source']:<8}  {human_size(m['size']):<10}  {m['pulled_at']}")
     return 0
+
 
 
 def cmd_rm(args) -> int:
     rc = 0
     for name in args.models:
-        ref = parse_model_ref(name)
+        ref = parse_model_ref(resolve_model_input(name))
         if remove_model(ref):
             print(f"removed {ref.display()}")
         else:
@@ -237,13 +244,18 @@ def cmd_rm(args) -> int:
     return rc
 
 
+
 def cmd_show(args) -> int:
     import json
-    ref = parse_model_ref(args.model)
+    ref = parse_model_ref(resolve_model_input(args.model))
     local = find_local(ref)
     if local is None:
         raise SystemExit(f"alpacca: {ref.display()} is not installed")
-    print(json.dumps(local.manifest or {"model_file": str(local.model_path)}, indent=2))
+    manifest = dict(local.manifest or {"model_file": str(local.model_path)})
+    nickname = nickname_for_model(ref.display())
+    if nickname:
+        manifest["nickname"] = nickname
+    print(json.dumps(manifest, indent=2))
     if local.dir:
         print(f"\nfiles in {local.dir}:")
         for f in sorted(local.dir.iterdir()):
@@ -259,8 +271,9 @@ def cmd_show(args) -> int:
     return 0
 
 
+
 def cmd_run(args) -> int:
-    local = _resolve_or_pull(args.model)
+    local, model_name = _resolve_or_pull(args.model)
     _apply_manifest_defaults(local, args)
     model = _load_model(local, args)
     params = _sampler_params(args)
@@ -278,21 +291,21 @@ def cmd_run(args) -> int:
         print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
         return 0
     chat.interactive(model, params, system=args.system, n_predict=args.n_predict,
-                     model_name=parse_model_ref(args.model).display(),
-                     model_path=str(local.model_path))
+                     model_name=model_name, model_path=str(local.model_path))
     return 0
 
 
+
 def cmd_serve(args) -> int:
-    local = _resolve_or_pull(args.model)
+    local, model_name = _resolve_or_pull(args.model)
     _apply_manifest_defaults(local, args)
     model = _load_model(local, args)
     from .serve import serve
     host = args.host or os.environ.get("ALPACCA_HOST", "127.0.0.1")
     port = args.port if args.port is not None else int(os.environ.get("ALPACCA_PORT", "8080"))
-    serve(model, parse_model_ref(args.model).display(), host, port,
-          defaults=_sampler_params(args))
+    serve(model, model_name, host, port, defaults=_sampler_params(args))
     return 0
+
 
 
 def cmd_doctor(_args) -> int:
@@ -315,7 +328,7 @@ def cmd_doctor(_args) -> int:
 
 
 def cmd_tokenize(args) -> int:
-    local = _resolve_or_pull(args.model, auto_pull=False)
+    local, _model_name = _resolve_or_pull(args.model, auto_pull=False)
     from .gguf import GGUFFile
     from .tokenizer import Tokenizer
     with GGUFFile.open(local.model_path) as gf:
@@ -324,6 +337,22 @@ def cmd_tokenize(args) -> int:
     for i in ids:
         print(f"{i:>8}  {ascii(tok.piece(i))}")
     return 0
+
+
+def cmd_nickname(args) -> int:
+    if args.clear:
+        removed = clear_model_nickname(args.model)
+        if removed:
+            print(f"removed nickname '{removed}'")
+        else:
+            print("no nickname set")
+        return 0
+    if not args.nickname:
+        raise ValueError("nickname text is required unless --clear is used")
+    nickname, target = set_model_nickname(args.model, " ".join(args.nickname))
+    print(f"nickname set: {nickname} -> {target}")
+    return 0
+
 
 
 def _clip(text: str, width: int) -> str:
@@ -356,6 +385,11 @@ def _write_default_model(model_ref: str) -> None:
     path.write_text(model_ref.strip() + "\n", encoding="utf-8")
 
 
+def _model_label(model_ref: str) -> str:
+    nickname = nickname_for_model(model_ref)
+    return f"{nickname} ({model_ref})" if nickname else model_ref
+
+
 def _prompt_line(prompt: str) -> str:
     try:
         return input(prompt)
@@ -380,8 +414,8 @@ def _menu_run_model() -> None:
     print("\nChat with a model\n")
     _print_installed_models()
     current = _read_default_model()
-    print(f"\nCurrent chat model:\n  {current}\n")
-    model_ref = _prompt_line("Model reference (blank = current): ").strip() or current
+    print(f"\nCurrent chat model:\n  {_model_label(current)}\n")
+    model_ref = _prompt_line("Model reference or nickname (blank = current): ").strip() or current
     print()
     args = argparse.Namespace(
         model=model_ref, prompt=[], ctx=0, temp=None, top_k=None, top_p=None,
@@ -401,11 +435,12 @@ def _menu_model_manager() -> None:
         _print_installed_models()
         print("\n1. Add/download a model")
         print("2. Switch chat model")
-        print("3. Show model details")
-        print("4. Delete an installed model")
-        print("5. Back to main menu\n")
-        choice = _prompt_line("Choose an option [1-5]: ").strip()
-        if choice in ("", "5"):
+        print("3. Rename/nickname a model")
+        print("4. Show model details")
+        print("5. Delete an installed model")
+        print("6. Back to main menu\n")
+        choice = _prompt_line("Choose an option [1-6]: ").strip()
+        if choice in ("", "6"):
             return
         if choice == "1":
             print("\nEnter any supported Alpacca model reference.")
@@ -421,12 +456,14 @@ def _menu_model_manager() -> None:
                 _menu_pause()
         elif choice == "2":
             model_ref = _prompt_line(
-                "New chat model, exactly as shown in NAME (blank to cancel): "
+                "New chat model NAME or nickname (blank to cancel): "
             ).strip()
             if not model_ref:
                 continue
             try:
-                local = find_local(parse_model_ref(model_ref))
+                resolved = resolve_model_input(model_ref)
+                ref = parse_model_ref(resolved)
+                local = find_local(ref)
             except ValueError as e:
                 print(f"alpacca: error: {e}", file=sys.stderr)
                 local = None
@@ -435,19 +472,53 @@ def _menu_model_manager() -> None:
                 print("Use Add/download first, then switch to the installed model.")
                 _menu_pause()
                 continue
-            _write_default_model(parse_model_ref(model_ref).display())
-            print(f"Chat model set to:\n  {_read_default_model()}")
+            _write_default_model(ref.display())
+            print(f"Chat model set to:\n  {_model_label(_read_default_model())}")
             _menu_pause()
         elif choice == "3":
-            model_ref = _prompt_line("Model reference to inspect (blank to cancel): ").strip()
+            model_ref = _prompt_line(
+                "Model NAME or current nickname to rename (blank to cancel): "
+            ).strip()
+            if not model_ref:
+                continue
+            try:
+                resolved = resolve_model_input(model_ref)
+                ref = parse_model_ref(resolved)
+                if find_local(ref) is None or ref.source == "file":
+                    print("Model is not installed or the reference is invalid.")
+                    _menu_pause()
+                    continue
+                current = nickname_for_model(ref.display())
+                if current:
+                    print(f"Current nickname: {current}")
+                nickname = _prompt_line(
+                    "New nickname (blank to cancel, '-' to clear): "
+                ).strip()
+                if not nickname:
+                    continue
+                if nickname == "-":
+                    removed = clear_model_nickname(ref.display())
+                    print(f"Removed nickname: {removed}" if removed else "No nickname set.")
+                else:
+                    nickname, target = set_model_nickname(ref.display(), nickname)
+                    print(f"Nickname set:\n  {nickname} -> {target}")
+            except (RuntimeError, ValueError, SystemExit) as e:
+                _menu_error(e)
+            _menu_pause()
+        elif choice == "4":
+            model_ref = _prompt_line(
+                "Model reference or nickname to inspect (blank to cancel): "
+            ).strip()
             if model_ref:
                 try:
                     cmd_show(argparse.Namespace(model=model_ref, metadata=False))
                 except (RuntimeError, ValueError, SystemExit) as e:
                     _menu_error(e)
                 _menu_pause()
-        elif choice == "4":
-            model_ref = _prompt_line("Model reference to delete (blank to cancel): ").strip()
+        elif choice == "5":
+            model_ref = _prompt_line(
+                "Model reference or nickname to delete (blank to cancel): "
+            ).strip()
             if not model_ref:
                 continue
             confirm = _prompt_line("Type DELETE to confirm: ")
@@ -457,6 +528,7 @@ def _menu_model_manager() -> None:
                 except (RuntimeError, ValueError, SystemExit) as e:
                     _menu_error(e)
                 _menu_pause()
+
 
 
 def _menu_history() -> None:
@@ -499,8 +571,9 @@ def _print_controls() -> None:
     print("  alpacca menu")
     print("  alpacca list")
     print("  alpacca pull <model>")
-    print("  alpacca run <model> [prompt text]")
-    print("  alpacca serve <model> [--host HOST] [--port PORT]")
+    print("  alpacca nickname <model> <nickname>")
+    print("  alpacca run <model-or-nickname> [prompt text]")
+    print("  alpacca serve <model-or-nickname> [--host HOST] [--port PORT]")
     print("  alpacca history list|show|stats|rm|clear --yes")
     print("  alpacca show <model> [--metadata]")
     print("  alpacca rm <model> [more models...]")
@@ -521,7 +594,8 @@ def cmd_menu(_args) -> int:
     while True:
         print("\nAlpacca\n")
         _print_installed_models()
-        print(f"\nCurrent chat model:\n  {_read_default_model()}\n")
+        current = _read_default_model()
+        print(f"\nCurrent chat model:\n  {_model_label(current)}\n")
         print("1. Chat with current or selected model")
         print("2. Alpacca doctor")
         print("3. Open Alpacca shell")
@@ -723,6 +797,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-m", "--model", required=True)
     p.add_argument("-p", "--text", required=True)
     p.set_defaults(func=cmd_tokenize)
+
+    p = sub.add_parser("nickname", aliases=["nick"],
+                       help="set or clear a nickname for an installed model")
+    p.add_argument("model")
+    p.add_argument("nickname", nargs="*", help="nickname text, spaces allowed")
+    p.add_argument("--clear", action="store_true", help="remove this model's nickname")
+    p.set_defaults(func=cmd_nickname)
 
     p = sub.add_parser("menu", help="open the local terminal app menu")
     p.set_defaults(func=cmd_menu)

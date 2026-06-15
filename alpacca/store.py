@@ -21,6 +21,10 @@ def models_root() -> Path:
     return alpacca_home() / "models"
 
 
+def _nicknames_file() -> Path:
+    return alpacca_home() / "model-nicknames.json"
+
+
 def _sanitize(part: str) -> str:
     out = re.sub(r"[^A-Za-z0-9._+-]", "_", part)
     return out if out not in ("", ".", "..") else "_"
@@ -139,6 +143,151 @@ def write_manifest(d: Path, manifest: dict) -> None:
     tmp.replace(d / "manifest.json")
 
 
+def _clean_nickname(nickname: str) -> str:
+    return " ".join(str(nickname).strip().split())
+
+
+def _read_nicknames() -> dict[str, str]:
+    try:
+        data = json.loads(_nicknames_file().read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("nicknames"), dict):
+        data = data["nicknames"]
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for nickname, target in data.items():
+        nickname = _clean_nickname(str(nickname))
+        target = str(target).strip()
+        if not nickname or not target:
+            continue
+        try:
+            out[nickname] = parse_model_ref(target).display()
+        except ValueError:
+            continue
+    return out
+
+
+def _write_nicknames(nicknames: dict[str, str]) -> None:
+    path = _nicknames_file()
+    if not nicknames:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned = {k: v for k, v in sorted(nicknames.items(), key=lambda kv: kv[0].lower())}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps({"nicknames": cleaned}, indent=2) + "\n", "utf-8")
+    tmp.replace(path)
+
+
+def list_nicknames() -> dict[str, str]:
+    """Return nickname -> canonical model reference."""
+    return dict(_read_nicknames())
+
+
+def nickname_for_model(model_name: str) -> str:
+    try:
+        canonical = parse_model_ref(model_name).display()
+    except ValueError:
+        canonical = model_name.strip()
+    for nickname, target in _read_nicknames().items():
+        if target == canonical:
+            return nickname
+    return ""
+
+
+def resolve_model_input(raw: str) -> str:
+    """Resolve a CLI/menu model input to a canonical model reference.
+
+    Installed canonical names win over nicknames so adding a nickname cannot
+    shadow an existing model. If no installed model matches, an exact or
+    unique case-insensitive nickname is accepted before falling back to the
+    normal model-reference parser.
+    """
+    s = raw.strip()
+    if not s:
+        raise ValueError("empty model name")
+    ref: ModelRef | None
+    try:
+        ref = parse_model_ref(s)
+    except ValueError:
+        ref = None
+    if ref is not None and (ref.source == "file" or find_local(ref) is not None):
+        return ref.display()
+
+    cleaned = _clean_nickname(s)
+    nicknames = _read_nicknames()
+    if cleaned in nicknames:
+        return nicknames[cleaned]
+    matches = [target for nickname, target in nicknames.items()
+               if nickname.lower() == cleaned.lower()]
+    if len(set(matches)) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(f"ambiguous model nickname: {raw}")
+    if ref is not None:
+        return ref.display()
+    return parse_model_ref(s).display()
+
+
+def set_model_nickname(model_name: str, nickname: str) -> tuple[str, str]:
+    target = resolve_model_input(model_name)
+    ref = parse_model_ref(target)
+    if ref.source == "file" or find_local(ref) is None:
+        raise ValueError(f"{target} is not an installed model")
+    nickname = _clean_nickname(nickname)
+    if not nickname:
+        raise ValueError("empty model nickname")
+
+    try:
+        nick_ref = parse_model_ref(nickname)
+        if find_local(nick_ref) is not None and nick_ref.display() != target:
+            raise ValueError(
+                f"nickname '{nickname}' conflicts with installed model {nick_ref.display()}")
+    except ValueError as e:
+        if "conflicts with installed model" in str(e):
+            raise
+
+    nicknames = _read_nicknames()
+    for existing, existing_target in list(nicknames.items()):
+        if existing_target == target:
+            del nicknames[existing]
+        elif existing.lower() == nickname.lower():
+            raise ValueError(
+                f"nickname '{nickname}' already points to {existing_target}")
+    nicknames[nickname] = target
+    _write_nicknames(nicknames)
+    return nickname, target
+
+
+def clear_model_nickname(model_name: str) -> str:
+    target = resolve_model_input(model_name)
+    nicknames = _read_nicknames()
+    removed = ""
+    for nickname, existing_target in list(nicknames.items()):
+        if existing_target == target:
+            removed = nickname
+            del nicknames[nickname]
+    if removed:
+        _write_nicknames(nicknames)
+    return removed
+
+
+def _remove_nicknames_for_model(model_name: str) -> None:
+    nicknames = _read_nicknames()
+    changed = False
+    for nickname, target in list(nicknames.items()):
+        if target == model_name:
+            del nicknames[nickname]
+            changed = True
+    if changed:
+        _write_nicknames(nicknames)
+
+
 def now_iso8601() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -156,6 +305,8 @@ def list_models() -> list[dict]:
     root = models_root()
     if not root.exists():
         return out
+    nicknames = _read_nicknames()
+    model_to_nickname = {target: nickname for nickname, target in nicknames.items()}
     for mf in sorted(root.rglob("manifest.json")):
         d = mf.parent
         try:
@@ -165,8 +316,10 @@ def list_models() -> list[dict]:
         size = manifest.get("size", 0)
         if not size:
             size = sum(f.stat().st_size for f in d.glob("*.gguf"))
+        name = manifest.get("name", d.name)
         out.append({
-            "name": manifest.get("name", d.name),
+            "name": name,
+            "nickname": model_to_nickname.get(name, ""),
             "source": manifest.get("source", "?"),
             "size": int(size),
             "pulled_at": manifest.get("pulled_at", ""),
@@ -182,9 +335,11 @@ def remove_model(ref: ModelRef) -> bool:
     d = ref.store_dir()
     if not (d / "manifest.json").exists():
         return False
+    name = ref.display()
     for f in sorted(d.rglob("*"), reverse=True):
         f.unlink() if f.is_file() else f.rmdir()
     d.rmdir()
+    _remove_nicknames_for_model(name)
     parent = d.parent
     while parent != models_root() and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()

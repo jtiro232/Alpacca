@@ -1026,6 +1026,16 @@ def main() -> None:
         check("pull is idempotent", "already installed" in r.stderr)
         r = run_cli("list", env=env)
         check("list shows tiny", any(line.startswith("tiny ") for line in r.stdout.splitlines()))
+        r = run_cli("nickname", "tiny", "Tiny", "Buddy", env=env)
+        check("nickname command sets model nickname",
+              "nickname set: Tiny Buddy -> tiny" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("list", env=env)
+        check("list shows model nickname", "Tiny Buddy" in r.stdout, r.stdout)
+        r = run_cli("show", "Tiny Buddy", env=env)
+        check("show resolves model nickname",
+              '"name": "tiny"' in r.stdout and '"nickname": "Tiny Buddy"' in r.stdout,
+              r.stdout)
         r = run_cli("show", "tiny", env=env)
         check("show has params", '"temperature"' in r.stdout)
         check("show has system", "smoke test" in r.stdout)
@@ -1037,6 +1047,8 @@ def main() -> None:
         print("== inference (the engine itself) ==")
         r = run_cli("run", "tiny", "hello there", "-n", "8", "--seed", "1", env=env)
         check("run one-shot generates", "tokens," in r.stderr)
+        r = run_cli("run", "Tiny Buddy", "hello there", "-n", "4", "--seed", "1", env=env)
+        check("run one-shot resolves nickname", "tokens," in r.stderr, r.stderr)
         model_path = tmp / "home" / "models" / "ollama" / "library" / "tiny" / "latest" / "model.gguf"
         r = run_cli("run", str(model_path), "hi", "-n", "4", "--seed", "1", env=env)
         check("run by file path", "tokens," in r.stderr)
@@ -1045,6 +1057,8 @@ def main() -> None:
         check("run with pure-python backend", "tokens," in r.stderr)
         r = run_cli("tokenize", "-m", "tiny", "-p", "hello", env=env)
         check("tokenize via model name", "\u2581hello" in r.stdout or "hello" in r.stdout)
+        r = run_cli("tokenize", "-m", "Tiny Buddy", "-p", "hello", env=env)
+        check("tokenize resolves nickname", "\u2581hello" in r.stdout or "hello" in r.stdout)
 
         old_home = os.environ.get("ALPACCA_HOME")
         try:
@@ -1172,14 +1186,23 @@ def main() -> None:
               "Alpacca Chat History" in r.stdout and
               "no chat history yet" in r.stdout,
               r.stdout + r.stderr)
-        r = run_cli("menu", env=env, input_text="4\n2\ntiny\n\n5\n8\n")
+        r = run_cli("menu", env=env, input_text="4\n2\nTiny Buddy\n\n6\n8\n")
         default_model = Path(env["ALPACCA_HOME"]) / "default-model.txt"
-        check("menu model switch persists default",
+        check("menu model switch accepts nickname",
               default_model.read_text(encoding="utf-8").strip() == "tiny" and
-              "Chat model set to:" in r.stdout,
+              "Tiny Buddy (tiny)" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="4\n3\ntiny\nMenu Tiny\n\n6\n8\n")
+        check("menu model manager renames nickname",
+              "Nickname set:" in r.stdout and "Menu Tiny -> tiny" in r.stdout,
+              r.stdout + r.stderr)
+        r = run_cli("menu", env=env, input_text="4\n2\nMenu Tiny\n\n6\n8\n")
+        check("menu model switch uses renamed nickname",
+              default_model.read_text(encoding="utf-8").strip() == "tiny" and
+              "Menu Tiny (tiny)" in r.stdout,
               r.stdout + r.stderr)
         r = run_cli("menu", env=env,
-                    input_text="4\n2\nnot-installed-model\n\n5\n8\n")
+                    input_text="4\n2\nnot-installed-model\n\n6\n8\n")
         check("menu invalid model switch is rejected",
               default_model.read_text(encoding="utf-8").strip() == "tiny" and
               "Model is not installed" in r.stdout,

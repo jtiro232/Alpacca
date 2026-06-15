@@ -106,13 +106,17 @@ content-addressed layers - weights, parameters, system prompt, license) and
 the Hugging Face API (quant selection, `-GGUF` sibling-repo fallback,
 `HF_TOKEN` for gated repos). Downloads resume after interruption and are
 verified against the publisher's SHA-256 digests. `alpacca run` auto-pulls
-on first use.
+on first use. Model nicknames are stored as local aliases under
+`$ALPACCA_HOME` and do not rename the downloaded model directory or manifest.
+Use `alpacca nickname <model> <nickname>` or the Model manager menu to set one;
+`alpacca list` shows the `NICKNAME` column.
 
 ```sh
 alpacca list
-alpacca show llama3.2:1b --metadata
+alpacca nickname llama3.2:1b "quick llama"
+alpacca show "quick llama" --metadata
 alpacca rm llama3.2:1b
-alpacca tokenize -m llama3.2:1b -p "hello world"
+alpacca tokenize -m "quick llama" -p "hello world"
 alpacca history list
 alpacca history stats
 ```
@@ -121,7 +125,7 @@ alpacca history stats
 
 ```sh
 alpacca run llama3.2:1b                          # interactive (Esc or /exit returns, /clear resets)
-alpacca run llama3.2:1b "one-shot question"      # answers and exits
+alpacca run "quick llama" "one-shot question"    # nicknames work for model selectors
 alpacca run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
 alpacca serve llama3.2:1b --port 8080
 ```
@@ -133,11 +137,11 @@ alpacca menu       # or just `alpacca` in an interactive terminal
 ```
 
 The menu lists installed models, opens chat, switches the default chat
-model, shows model details, exposes history/statistics, and links back to
-the normal commands. The default chat model is stored locally in
-`~/.alpacca/default-model.txt` (or `$ALPACCA_HOME/default-model.txt`) and is
-only a UI convenience; every CLI command still accepts an explicit model
-reference.
+model by name or nickname, sets model nicknames, shows model details, exposes
+history/statistics, and links back to the normal commands. The default chat
+model is stored locally in `~/.alpacca/default-model.txt` (or
+`$ALPACCA_HOME/default-model.txt`) and is only a UI convenience; model selector
+commands accept an explicit model reference or a nickname.
 
 Interactive chats are saved as local JSON files under `~/.alpacca/history`
 (or `$ALPACCA_HOME/history`). One-shot `alpacca run MODEL "prompt"` calls and
