@@ -109,11 +109,13 @@ verified against the publisher's SHA-256 digests. `alpacca run` auto-pulls
 on first use. Model nicknames are stored as local aliases under
 `$ALPACCA_HOME` and do not rename the downloaded model directory or manifest.
 Use `alpacca nickname <model> <nickname>` or the Model manager menu to set one;
-`alpacca list` shows the `NICKNAME` column.
+`alpacca list` shows the `NICKNAME` column, and `alpacca nickname --list`
+enumerates every alias - including any left orphaned by a removed model.
 
 ```sh
 alpacca list
 alpacca nickname llama3.2:1b "quick llama"
+alpacca nickname --list
 alpacca show "quick llama" --metadata
 alpacca rm llama3.2:1b
 alpacca tokenize -m "quick llama" -p "hello world"
@@ -142,6 +144,13 @@ history/statistics, and links back to the normal commands. The default chat
 model is stored locally in `~/.alpacca/default-model.txt` (or
 `$ALPACCA_HOME/default-model.txt`) and is only a UI convenience; model selector
 commands accept an explicit model reference or a nickname.
+
+An interactive chat stays inside the model's context window on its own: when the
+conversation no longer leaves room for a reply, the oldest turns are dropped
+(the system message is kept) and the REPL prints how many it dropped. `/clear`
+resets the conversation outright. The effective context length is printed at
+load next to the model's trained maximum, because `alpacca run` defaults to a
+smaller window than most models advertise - pass `-c` to raise it.
 
 Interactive chats are saved as local JSON files under `~/.alpacca/history`
 (or `$ALPACCA_HOME/history`). One-shot `alpacca run MODEL "prompt"` calls and
@@ -182,10 +191,14 @@ reference on a fixture, not against a released checkpoint.
 Chat templates are *detected* from the model's metadata, and the renderer emits
 the format's real control tokens. It is not a Jinja interpreter: the template is
 matched to one of five built-in renderers (llama3, chatml, gemma, llama2,
-zephyr). For Gemma that renderer is close but not identical to the shipped
-template - a system message becomes its own leading turn rather than a prefix on
-the first user turn. Measured on Gemma 3 1B over 36 greedy generations, the two
-renderings are not distinguishable in how well the model obeys a system prompt.
+zephyr). The Gemma renderer follows the shipped template where it matters: a
+leading system message is folded into the first user turn as a prefix, because
+the template has no system turn and refuses two user turns in a row. Measured on
+Gemma 3 1B over 36 greedy generations, that rendering and a separate-system-turn
+rendering are not distinguishable in how well the model obeys a system prompt.
+Two divergences remain: every non-assistant role is mapped to `user`, and the
+template's `raise_exception` on non-alternating roles is not ported - alpacca
+renders such a conversation instead of rejecting it.
 
 ### Honest performance expectations
 
