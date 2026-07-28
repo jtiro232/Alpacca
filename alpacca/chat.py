@@ -75,10 +75,14 @@ class ChatFormat:
             return ids
 
         if self.name == "gemma":
+            # the gemma template opens with {{ bos_token }} and the models are
+            # trained with <bos> at position 0; without it they answer empty
+            if tok.bos_id >= 0:
+                ids.append(tok.bos_id)
             for m in messages:
                 role = "model" if m["role"] == "assistant" else "user"
                 ids += self._special("<start_of_turn>")
-                ids += self._ids(role + "\n" + m["content"])
+                ids += self._ids(role + "\n" + m["content"].strip())
                 ids += self._special("<end_of_turn>")
                 ids += self._ids("\n")
             if add_generation_prompt:
@@ -161,9 +165,9 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
     while n_tokens < budget and model.n_past < model.n_ctx:
         tid = sampler.sample(logits)
         sampler.accept(tid)
-        n_tokens += 1
         if model.tok.is_eog(tid):
-            break
+            break  # never forwarded into the cache, so never counted either
+        n_tokens += 1
         text += dec.feed(tid)
         if stop_strings:
             hit = next((s for s in stop_strings if s and s in text), None)

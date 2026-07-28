@@ -169,8 +169,12 @@ class Tokenizer:
                 t.eog_ids.add(int(md[key]))
         for name in ("<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>",
                      "<|endoftext|>", "<|end_of_text|>", "</s>"):
-            if name in t.piece_to_id:
-                t.eog_ids.add(t.piece_to_id[name])
+            tid = t.piece_to_id.get(name)
+            # only control tokens end generation: Gemma 3 ships "</s>" as an
+            # ordinary USER_DEFINED text piece, and halting on it truncates
+            # any answer that happens to contain it
+            if tid is not None and t.types[tid] == TT_CONTROL:
+                t.eog_ids.add(tid)
 
         if model == "gpt2":
             merges = md.get("tokenizer.ggml.merges", []) or []

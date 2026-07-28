@@ -62,6 +62,11 @@ def _params_from(body: dict, defaults: SamplerParams) -> SamplerParams:
     )
 
 
+def _finish_reason(tokens: int, n_predict: int) -> str:
+    """OpenAI semantics: "length" when the token budget ran out, else "stop"."""
+    return "length" if n_predict > 0 and tokens >= n_predict else "stop"
+
+
 def _stop_from(body: dict) -> list[str]:
     stop = body.get("stop") or []
     if isinstance(stop, str):
@@ -123,6 +128,10 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 self.send_json({"error": "not found"}, 404)
             except (TypeError, ValueError) as e:
                 self.send_json({"error": str(e)}, 400)
+            except RuntimeError as e:
+                # Model.prefill/forward raise this when the prompt does not fit
+                # the context window - ordinary input, not a server fault
+                self.send_json({"error": str(e)}, 400)
 
         def completion(self, body: dict):
             prompt = str(body.get("prompt", ""))
@@ -167,11 +176,20 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                                         "finish_reason": finish}]})
 
                 piece({"role": "assistant"})
-                with lock:
-                    res = chat.chat_once(model, messages, params, n_predict,
-                                         stream=lambda s: piece({"content": s}),
-                                         stop_strings=stop)
-                piece({}, finish="stop")
+                try:
+                    with lock:
+                        res = chat.chat_once(model, messages, params, n_predict,
+                                             stream=lambda s: piece({"content": s}),
+                                             stop_strings=stop)
+                    finish = _finish_reason(res.tokens, n_predict)
+                except (TypeError, ValueError, RuntimeError) as e:
+                    # the 200 and the first delta are already on the wire, so
+                    # close the stream cleanly instead of dropping the socket
+                    piece({"content": ""}, finish="error")
+                    chunk({"error": {"message": str(e), "type": "invalid_request_error"}})
+                    finish = None
+                if finish is not None:
+                    piece({}, finish=finish)
                 tail = b"data: [DONE]\n\n"
                 self.wfile.write(f"{len(tail):x}\r\n".encode() + tail + b"\r\n")
                 self.wfile.write(b"0\r\n\r\n")
@@ -179,12 +197,16 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
             with lock:
                 res = chat.chat_once(model, messages, params, n_predict, stop_strings=stop)
+            prompt_tokens = max(0, model.n_past - res.tokens)
             self.send_json({
                 "id": rid, "object": "chat.completion", "created": created,
                 "model": model_name,
-                "choices": [{"index": 0, "finish_reason": "stop",
+                "choices": [{"index": 0,
+                             "finish_reason": _finish_reason(res.tokens, n_predict),
                              "message": {"role": "assistant", "content": res.text}}],
-                "usage": {"completion_tokens": res.tokens},
+                "usage": {"prompt_tokens": prompt_tokens,
+                          "completion_tokens": res.tokens,
+                          "total_tokens": prompt_tokens + res.tokens},
             })
 
     httpd = _Server((host, port), Handler)

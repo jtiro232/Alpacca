@@ -2,10 +2,13 @@
 # MIT License. See LICENSE.
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -144,13 +147,18 @@ def write_manifest(d: Path, manifest: dict) -> None:
 
 
 def _clean_nickname(nickname: str) -> str:
-    return " ".join(str(nickname).strip().split())
+    # nicknames are echoed to a terminal and written into JSON, so replace
+    # control characters with spaces before they can be stored - notably ESC,
+    # which would otherwise let a nickname emit ANSI escape sequences
+    text = "".join(" " if unicodedata.category(ch) == "Cc" else ch
+                   for ch in str(nickname))
+    return " ".join(text.strip().split())
 
 
 def _read_nicknames() -> dict[str, str]:
     try:
         data = json.loads(_nicknames_file().read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if isinstance(data, dict) and isinstance(data.get("nicknames"), dict):
         data = data["nicknames"]
@@ -179,9 +187,67 @@ def _write_nicknames(nicknames: dict[str, str]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     cleaned = {k: v for k, v in sorted(nicknames.items(), key=lambda kv: kv[0].lower())}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"nicknames": cleaned}, indent=2) + "\n", "utf-8")
-    tmp.replace(path)
+    payload = json.dumps({"nicknames": cleaned}, indent=2) + "\n"
+    # a temp name shared between processes is worse than no temp file at all:
+    # two writers interleave into it and replace() then publishes the garbage
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent),
+                                    prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+@contextlib.contextmanager
+def _nicknames_lock():
+    """Serialise the nickname read-modify-write across processes.
+
+    Best-effort: an atomic write alone still loses updates, because two
+    processes each read the old map and write back only their own entry.
+    If locking is unavailable the mutation still proceeds - a lost alias is
+    better than a command that refuses to run.
+    """
+    path = _nicknames_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path.with_name(path.name + ".lock"), "a+b")
+    except OSError:
+        yield
+        return
+    locked = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except (OSError, ImportError, ValueError):
+            pass
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except (OSError, ImportError, ValueError):
+                pass
+        fh.close()
 
 
 def list_nicknames() -> dict[str, str]:
@@ -207,6 +273,11 @@ def resolve_model_input(raw: str) -> str:
     shadow an existing model. If no installed model matches, an exact or
     unique case-insensitive nickname is accepted before falling back to the
     normal model-reference parser.
+
+    File references are returned unchanged. Their display() form is a
+    pathlib-normalised string ("./tiny" -> "tiny"), and callers re-parse what
+    they get back - so returning display() here would silently reclassify a
+    local path as a registry name.
     """
     s = raw.strip()
     if not s:
@@ -216,7 +287,9 @@ def resolve_model_input(raw: str) -> str:
         ref = parse_model_ref(s)
     except ValueError:
         ref = None
-    if ref is not None and (ref.source == "file" or find_local(ref) is not None):
+    if ref is not None and ref.source == "file":
+        return s
+    if ref is not None and find_local(ref) is not None:
         return ref.display()
 
     cleaned = _clean_nickname(s)
@@ -245,47 +318,54 @@ def set_model_nickname(model_name: str, nickname: str) -> tuple[str, str]:
 
     try:
         nick_ref = parse_model_ref(nickname)
-        if find_local(nick_ref) is not None and nick_ref.display() != target:
-            raise ValueError(
-                f"nickname '{nickname}' conflicts with installed model {nick_ref.display()}")
-    except ValueError as e:
-        if "conflicts with installed model" in str(e):
-            raise
+    except ValueError:
+        nick_ref = None  # not a parseable reference, so it cannot collide
+    if nick_ref is not None and nick_ref.source == "file":
+        raise ValueError(
+            f"nickname '{nickname}' looks like a file path; "
+            f"it could never be resolved back to a model")
+    if nick_ref is not None and find_local(nick_ref) is not None \
+            and nick_ref.display() != target:
+        raise ValueError(
+            f"nickname '{nickname}' conflicts with installed model {nick_ref.display()}")
 
-    nicknames = _read_nicknames()
-    for existing, existing_target in list(nicknames.items()):
-        if existing_target == target:
-            del nicknames[existing]
-        elif existing.lower() == nickname.lower():
-            raise ValueError(
-                f"nickname '{nickname}' already points to {existing_target}")
-    nicknames[nickname] = target
-    _write_nicknames(nicknames)
+    with _nicknames_lock():
+        nicknames = _read_nicknames()
+        for existing, existing_target in list(nicknames.items()):
+            if existing_target == target:
+                del nicknames[existing]
+            elif existing.lower() == nickname.lower():
+                raise ValueError(
+                    f"nickname '{nickname}' already points to {existing_target}")
+        nicknames[nickname] = target
+        _write_nicknames(nicknames)
     return nickname, target
 
 
 def clear_model_nickname(model_name: str) -> str:
     target = resolve_model_input(model_name)
-    nicknames = _read_nicknames()
-    removed = ""
-    for nickname, existing_target in list(nicknames.items()):
-        if existing_target == target:
-            removed = nickname
-            del nicknames[nickname]
-    if removed:
-        _write_nicknames(nicknames)
+    with _nicknames_lock():
+        nicknames = _read_nicknames()
+        removed = ""
+        for nickname, existing_target in list(nicknames.items()):
+            if existing_target == target:
+                removed = nickname
+                del nicknames[nickname]
+        if removed:
+            _write_nicknames(nicknames)
     return removed
 
 
 def _remove_nicknames_for_model(model_name: str) -> None:
-    nicknames = _read_nicknames()
-    changed = False
-    for nickname, target in list(nicknames.items()):
-        if target == model_name:
-            del nicknames[nickname]
-            changed = True
-    if changed:
-        _write_nicknames(nicknames)
+    with _nicknames_lock():
+        nicknames = _read_nicknames()
+        changed = False
+        for nickname, target in list(nicknames.items()):
+            if target == model_name:
+                del nicknames[nickname]
+                changed = True
+        if changed:
+            _write_nicknames(nicknames)
 
 
 def now_iso8601() -> str:
@@ -339,7 +419,10 @@ def remove_model(ref: ModelRef) -> bool:
     for f in sorted(d.rglob("*"), reverse=True):
         f.unlink() if f.is_file() else f.rmdir()
     d.rmdir()
-    _remove_nicknames_for_model(name)
+    try:  # the model is already gone; never report rm as failed over an alias
+        _remove_nicknames_for_model(name)
+    except OSError:
+        pass
     parent = d.parent
     while parent != models_root() and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()

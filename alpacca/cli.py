@@ -212,7 +212,8 @@ def _load_model(local: LocalModel, args):
 
 def cmd_pull(args) -> int:
     from .pull import pull_model
-    pull_model(parse_model_ref(args.model), force=args.force, verify=not args.no_verify)
+    pull_model(parse_model_ref(resolve_model_input(args.model)),
+               force=args.force, verify=not args.no_verify)
     return 0
 
 
@@ -222,11 +223,12 @@ def cmd_list(_args) -> int:
         print("no models installed - try: alpacca pull llama3.2:1b")
         return 0
     width = max(4, max(len(m["name"]) for m in models))
-    nick_width = max(8, max(len(m.get("nickname", "")) for m in models))
+    nicks = {m["name"]: _clip(m.get("nickname", ""), 32) for m in models}
+    nick_width = max(8, max(len(n) for n in nicks.values()))
     print(f"{'NAME':<{width}}  {'NICKNAME':<{nick_width}}  "
           f"{'SOURCE':<8}  {'SIZE':<10}  PULLED")
     for m in models:
-        print(f"{m['name']:<{width}}  {m.get('nickname', ''):<{nick_width}}  "
+        print(f"{m['name']:<{width}}  {nicks[m['name']]:<{nick_width}}  "
               f"{m['source']:<8}  {human_size(m['size']):<10}  {m['pulled_at']}")
     return 0
 
@@ -839,7 +841,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("", file=sys.stderr)
         return 130
-    except (RuntimeError, ValueError) as e:
+    except (RuntimeError, ValueError, OSError) as e:
         print(f"alpacca: error: {e}", file=sys.stderr)
         return 1
 

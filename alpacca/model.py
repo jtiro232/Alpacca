@@ -214,11 +214,26 @@ class Model:
             def meta(key, default=None):
                 return gf.get(f"{arch}.{key}", default)
 
-            n_embd = int(meta("embedding_length"))
-            n_head = int(meta("attention.head_count"))
+            def meta_required(key) -> int:
+                """A core dimension. Missing or non-positive means the file is
+                unusable; say so instead of dying in int(None) or NumPy."""
+                raw = meta(key)
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"{path}: required metadata '{arch}.{key}' is "
+                        f"{'missing' if raw is None else repr(raw)}") from None
+                if value <= 0:
+                    raise ValueError(
+                        f"{path}: metadata '{arch}.{key}' must be positive, got {value}")
+                return value
+
+            n_embd = meta_required("embedding_length")
+            n_head = meta_required("attention.head_count")
             n_kv = int(meta("attention.head_count_kv", n_head) or n_head)
             head_dim = int(meta("attention.key_length", n_embd // n_head) or n_embd // n_head)
-            n_layer = int(meta("block_count"))
+            n_layer = meta_required("block_count")
             rope_base = float(meta("rope.freq_base", 10000.0))
             rope_base_swa = float(meta("rope.freq_base_swa", 0.0) or 0.0)
             sliding_window = int(meta("attention.sliding_window", 0) or 0)
@@ -251,6 +266,12 @@ class Model:
                             "gemma3.attention.sliding_window_pattern has "
                             f"{len(pattern)} entries, expected {n_layer}")
                     sliding_layers = tuple(bool(v) for v in pattern)
+                elif isinstance(pattern, bool) or (pattern is not None
+                                                   and int(pattern) <= 1):
+                    # a scalar bool (or 0/1) is not a period: int(True) == 1
+                    # makes every layer full-attention and silently disables
+                    # sliding-window attention entirely
+                    full_attention_period = int(meta("full_attention_interval", 6) or 6)
                 elif pattern is not None:
                     full_attention_period = int(pattern)
                 else:
@@ -262,7 +283,7 @@ class Model:
                 n_embd=n_embd,
                 n_head=n_head,
                 n_kv=n_kv,
-                n_ff=int(meta("feed_forward_length")),
+                n_ff=meta_required("feed_forward_length"),
                 n_vocab=int(gf.get(f"{arch}.vocab_size",
                                    len(gf.get("tokenizer.ggml.tokens", [])))),
                 n_ctx_train=int(meta("context_length", 4096)),
@@ -984,10 +1005,13 @@ class Model:
     def describe(self) -> str:
         hp = self.hp
         params = hp.n_vocab * hp.n_embd
+        if self.output is not self.tok_embd:
+            params += hp.n_vocab * hp.n_embd  # untied output projection
+        params += hp.n_embd  # output_norm
         for ly in range(hp.n_layer):
             params += 2 * hp.n_embd  # norms
             if hp.arch == "gemma3":
-                params += hp.n_head * hp.head_dim + hp.n_kv * hp.head_dim
+                params += 2 * hp.head_dim  # q_norm/k_norm are shared per head
                 params += 2 * hp.n_embd  # post-attention/post-ffw norms
             params += hp.n_embd * hp.n_head * hp.head_dim * 2  # wq, wo
             params += hp.n_embd * hp.n_kv * hp.head_dim * 2    # wk, wv

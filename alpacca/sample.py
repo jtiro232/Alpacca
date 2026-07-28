@@ -19,6 +19,37 @@ class SamplerParams:
     seed: int = -1  # -1 -> random
 
 
+def _topk_indices(logits: list, k: int) -> list[int]:
+    """Indices of the k largest logits, descending, ties broken by lower index.
+
+    Identical output to ``sorted(range(n), key=logits.__getitem__,
+    reverse=True)[:k]`` - which is a stable sort, so equal logits keep
+    ascending index order - but O(n) instead of O(n log n). Gemma 3's 262144
+    -entry vocabulary makes the full sort a measurable share of every token.
+    """
+    n = len(logits)
+    if k >= n:
+        return sorted(range(n), key=logits.__getitem__, reverse=True)
+    if T.HAS_NUMPY:
+        import numpy as np
+
+        arr = np.asarray(logits, dtype=np.float64)
+        # argpartition alone is not enough: when logits tie across the cut it
+        # keeps an arbitrary one, where the stable sort keeps the lowest index.
+        # So take everything strictly above the k-th value, then fill from the
+        # tied indices in ascending order.
+        thr = arr[np.argpartition(arr, n - k)[n - k:]].min()
+        above = np.flatnonzero(arr > thr)
+        ties = np.flatnonzero(arr == thr)[:k - above.size]
+        sel = np.concatenate((above, ties))
+        order = np.lexsort((sel, -arr[sel]))  # last key is primary
+        return [int(i) for i in sel[order]]
+    import heapq
+
+    top = heapq.nlargest(k, range(n), key=lambda i: (logits[i], -i))
+    return top
+
+
 @dataclass
 class Sampler:
     params: SamplerParams = field(default_factory=SamplerParams)
@@ -48,7 +79,7 @@ class Sampler:
         # work on the top-k slice only (huge speedup for big vocabs)
         k = p.top_k if p.top_k and p.top_k > 0 else len(logits)
         k = min(k, len(logits))
-        idx = sorted(range(len(logits)), key=logits.__getitem__, reverse=True)[:k]
+        idx = _topk_indices(logits, k)
 
         maxl = logits[idx[0]]
         weights = [math.exp((logits[i] - maxl) / p.temperature) for i in idx]
