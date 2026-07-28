@@ -2122,7 +2122,7 @@ def main() -> None:
                 check("run keeps weights quantized when kernels are active",
                       "alpacca-kernels active" in r.stderr and
                       "auto dense-weight budget:" not in r.stderr and
-                      "weights quantized Q4_0 (16 matrices)" in r.stderr,
+                      "weights quantized Q4_0 (16 matrices," in r.stderr,
                       r.stderr[-500:])
             else:
                 check("run defaults to an auto dense-weight budget",
