@@ -627,11 +627,13 @@ def _print_controls() -> None:
     print("\nInteractive chat:")
     print("  Esc or /exit returns to the menu/caller")
     print("  /clear resets the current conversation")
+    print("  the oldest turns are dropped automatically to fit the context window")
     print("\nUseful environment variables:")
     print("  ALPACCA_HOME changes the model/history/default-model store")
     print("  ALPACCA_DENSE_WEIGHT_MB=0 keeps weights fully quantized")
     print("  ALPACCA_KERNELS=0 disables optional pinned JIT kernels")
     print("  ALPACCA_PURE=1 forces the standard-library backend")
+    print("  ALPACCA_SMALL_MATVEC_ELEMS re-tunes the quantized matvec crossover")
 
 
 def cmd_menu(_args) -> int:

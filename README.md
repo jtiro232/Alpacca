@@ -37,9 +37,9 @@ Alpacca stands on three commitments:
 | --- | --- | --- |
 | GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
 | Quantization codecs | `alpacca/quants.py` | decode/encode support for F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
-| Quantized weight storage | `alpacca/qmatrix.py` | fast in-RAM matvec/matmul storage for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; unsupported matrix formats fall back to dense |
+| Quantized weight storage | `alpacca/qmatrix.py` | fast in-RAM matvec/matmul storage for Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; unsupported matrix formats fall back to dense, and say so at load |
 | Fast kernels | `alpacca/kernels.py` | our fused quantized-matvec algorithms in Python source, JIT-compiled by pinned optional Numba |
-| Tokenizers | `alpacca/tokenizer.py` | SentencePiece-style (Viterbi + byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
+| Tokenizers | `alpacca/tokenizer.py` | SentencePiece (llama.cpp's greedy highest-score-first merge, special-token pre-split, byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
 | Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
 | Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
 | Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, Esc-to-menu interactive REPL with saved history |
@@ -167,16 +167,32 @@ Supported architectures: llama (1/2/3, TinyLlama, Mistral-family), qwen2/3,
 stablelm, gemma, and Gemma 3 text GGUFs. Gemma 3 support includes Q/K
 normalization, local sliding-window attention patterns, dual RoPE bases, linear
 RoPE scaling, metadata-driven attention scale, GELU FFNs, post-attention/post-FFN
-norms, tied output embeddings, and optional final logit softcapping. Chat
-templates are detected from the model's metadata. Gemma 3 support is text-only;
-multimodal projector/vision support is outside Alpacca's current engine scope.
+norms, tied output embeddings, and optional final logit softcapping. Gemma 3
+support is text-only; multimodal projector/vision support is outside Alpacca's
+current engine scope.
+
+What has actually been exercised, and what has not: Gemma 3 1B has been run end
+to end against a real GGUF. The 4B/12B/27B variants have not - the RoPE-scaling
+path and the 27B attention-scale rule are implemented from llama.cpp's rules and
+covered by fixtures, but no such checkpoint has been loaded. Gemma 1 (`gemma`)
+is likewise implemented from the architecture specification - the sqrt(n_embd)
+embedding scale and GELU FFN - and validated against an independent float64
+reference on a fixture, not against a released checkpoint.
+
+Chat templates are *detected* from the model's metadata, and the renderer emits
+the format's real control tokens. It is not a Jinja interpreter: the template is
+matched to one of five built-in renderers (llama3, chatml, gemma, llama2,
+zephyr). For Gemma that renderer is close but not identical to the shipped
+template - a system message becomes its own leading turn rather than a prefix on
+the first user turn. Measured on Gemma 3 1B over 36 greedy generations, the two
+renderings are not distinguishable in how well the model obeys a system prompt.
 
 ### Honest performance expectations
 
 This engine values clarity, auditability, and zero dependencies over raw
 speed. The NumPy path batches prompt prefill, reuses the KV cache for shared
-prompt prefixes, and keeps Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, and
-Q6_K matrix weights quantized in RAM: at load each matrix is unpacked once
+prompt prefixes, and keeps Q2_K, Q3_K, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K,
+Q5_K, and Q6_K matrix weights quantized in RAM: at load each matrix is unpacked once
 into int8 quant codes plus per-sub-block float32 scales (about 1.1-1.3
 bytes per weight instead of 4), and decode/prefill kernels consume that
 form directly - nothing is re-dequantized per token. F16/BF16 and the
@@ -341,6 +357,10 @@ Useful environment knobs:
 - `ALPACCA_F32=1`: force the NumPy loader to expand all quantized matrices
   to float32, useful for A/B checks and small models where BLAS wins.
 - `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
+- `ALPACCA_SMALL_MATVEC_ELEMS=N`: matrices below `N` elements use the
+  batched-matmul quantized matvec instead of the einsum one. Default 0 (off) -
+  einsum measured faster at every shape a llama- or Gemma-class model uses, on
+  two different machines. Re-measure before raising it.
 - `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense float32 cache for quantized
   matrices, capped at `N` MiB. Unlike the dense budget this caches at first
   use and keeps the quantized copy too; prefer `ALPACCA_DENSE_WEIGHT_MB`
@@ -365,10 +385,10 @@ and the roadmap orders the work that serves it.
   JIT-compiled by `numba==0.65.1`; when active, the CLI
   keeps weights quantized by default because that is the fastest and
   smallest path.
-- Quantized int8 weight storage for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/
-  Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight, nothing
-  re-dequantized per token (2.9x decode over the previous engine); other
-  formats fall back to dense float32.
+- Quantized int8 weight storage for Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
+  Q4_K/Q5_K/Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight,
+  nothing re-dequantized per token (2.9x decode over the previous engine);
+  other formats fall back to dense float32 and say so at load.
 - The dense-weight budget (`ALPACCA_DENSE_WEIGHT_MB`): spend RAM on BLAS
   speed exactly where it pays, FFN projections first - and the CLI sizes
   it automatically from available RAM (cgroup-aware in containers,
