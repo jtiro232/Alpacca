@@ -1018,9 +1018,13 @@ class Model:
             params += hp.n_embd * hp.n_kv * hp.head_dim * 2    # wk, wv
             params += 3 * hp.n_embd * hp.n_ff
         storage = self._storage_description()
+        # the default clamps a 32768-token Gemma 3 down to 4096; say so rather
+        # than letting the model look like it has a quarter of its real window
+        ctx = (f"ctx {self.n_ctx}" if self.n_ctx >= hp.n_ctx_train
+               else f"ctx {self.n_ctx} of {hp.n_ctx_train}")
         return (f"{hp.arch} | {hp.n_layer} layers | embd {hp.n_embd} | "
                 f"heads {hp.n_head}/{hp.n_kv} | ff {hp.n_ff} | vocab {hp.n_vocab} | "
-                f"~{params / 1e6:.0f}M params | ctx {self.n_ctx} | "
+                f"~{params / 1e6:.0f}M params | {ctx} | "
                 f"backend {T.backend_name()} | {storage}")
 
     def _storage_description(self) -> str:

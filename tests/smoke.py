@@ -1033,6 +1033,97 @@ def main() -> None:
               len(f16_logits) == f16_model.hp.n_vocab and
               all(v == v for v in f16_logits[:8]))
 
+        # ---- context window --------------------------------------------
+        # Nothing covered n_past near n_ctx for any architecture, which is why
+        # a prompt of exactly n_ctx returned tokens=0/text='' with no signal.
+        print("== context window ==")
+        from alpacca import chat as chat_mod
+        from alpacca.chat import ChatFormat, fit_to_context, generate
+        ctx_model = Model.load(str(srv / "model.gguf"), n_ctx=32, progress=False)
+        check("effective context window is reported next to the trained one",
+              "ctx 32 of 256" in ctx_model.describe(), ctx_model.describe())
+        ctx_params = SamplerParams(temperature=0.0, seed=1)
+
+        full = list(range(1, 33))            # exactly n_ctx tokens
+        res = generate(ctx_model, full, ctx_params, n_predict=-1)
+        check("a prompt of exactly n_ctx says it ran out of context",
+              res.tokens == 0 and res.stop_reason == "context" and
+              res.prompt_tokens == 32,
+              f"{res.tokens} {res.stop_reason} {res.prompt_tokens}")
+        ctx_model.reset()
+        res = generate(ctx_model, list(range(1, 31)), ctx_params, n_predict=-1)
+        check("a prompt just under n_ctx still generates and reports length",
+              res.tokens == 2 and res.stop_reason == "length", str(res))
+        ctx_model.reset()
+        res = generate(ctx_model, list(range(1, 5)), ctx_params, n_predict=4)
+        check("a spent n_predict budget is reported as length",
+              res.tokens == 4 and res.stop_reason == "length", str(res))
+        ctx_model.reset()
+        overflow = False
+        try:
+            generate(ctx_model, list(range(1, 40)), ctx_params, n_predict=4)
+        except RuntimeError:
+            overflow = True
+        check("a prompt longer than n_ctx raises rather than truncating",
+              overflow)
+
+        # trimming: the REPL drops the oldest exchanges to make room
+        ctx_model.reset()
+        fmt_ctx = ChatFormat(ctx_model, "raw")
+        convo = [{"role": "system", "content": "s"}]
+        for _ in range(6):
+            convo.append({"role": "user", "content": "the test"})
+            convo.append({"role": "assistant", "content": "ok"})
+        convo.append({"role": "user", "content": "hello"})
+        ids, dropped = fit_to_context(fmt_ctx, convo, ctx_model.n_ctx, reserve=8)
+        check("fitting a long conversation drops the oldest exchanges",
+              dropped > 0 and len(ids) + 8 <= ctx_model.n_ctx, f"{dropped} {len(ids)}")
+        check("fitting never drops the system message or the newest turn",
+              convo[0]["role"] == "system" and convo[-1]["content"] == "hello" and
+              len(convo) == 2, str(convo))
+        # a conversation that only slightly overflows keeps what still fits
+        partial = [{"role": "user", "content": "the test"},
+                   {"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "hello"}]
+        _, part_dropped = fit_to_context(fmt_ctx, partial, ctx_model.n_ctx, reserve=2)
+        check("fitting drops whole exchanges, oldest first",
+              part_dropped in (0, 1) and partial[-1]["content"] == "hello",
+              f"{part_dropped} {partial}")
+        short = [{"role": "user", "content": "hi"}]
+        _, none_dropped = fit_to_context(fmt_ctx, short, ctx_model.n_ctx, reserve=8)
+        check("fitting a conversation that already fits drops nothing",
+              none_dropped == 0 and len(short) == 1)
+        huge = [{"role": "user", "content": "testing " * 200}]
+        _, cant = fit_to_context(fmt_ctx, huge, ctx_model.n_ctx, reserve=8)
+        check("fitting keeps the newest turn even when it cannot fit",
+              cant == 0 and len(huge) == 1)
+
+        # the REPL must survive a turn that cannot be answered: before, the
+        # RuntimeError propagated out of cmd_run and took the conversation
+        ctx_model.reset()
+        repl_out, repl_err = io.StringIO(), io.StringIO()
+        repl_in = io.StringIO("testing " * 200 + "\nhi\n/exit\n")
+        ctx_home = os.environ.get("ALPACCA_HOME")
+        old_std = (sys.stdin, sys.stdout, sys.stderr)
+        try:
+            os.environ["ALPACCA_HOME"] = str(tmp / "ctx-home")
+            sys.stdin, sys.stdout, sys.stderr = repl_in, repl_out, repl_err
+            chat_mod.interactive(ctx_model, ctx_params, model_name="ctx-test")
+            repl_failed = ""
+        except BaseException as e:                      # noqa: BLE001
+            repl_failed = f"{type(e).__name__}: {e}"
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = old_std
+            if ctx_home is None:
+                os.environ.pop("ALPACCA_HOME", None)
+            else:
+                os.environ["ALPACCA_HOME"] = ctx_home
+        check("the REPL survives a turn that overflows the context window",
+              not repl_failed and "was not sent" in repl_err.getvalue(),
+              repl_failed or repl_err.getvalue()[-300:])
+        check("the REPL keeps answering after the overflowing turn",
+              "tokens," in repl_err.getvalue(), repl_err.getvalue()[-300:])
+
         if not T.HAS_NUMPY:
             old_budget = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
             try:

@@ -202,6 +202,32 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
                             prompt_tokens=len(prompt_ids), stop_reason=reason)
 
 
+#: tokens held back for the reply when trimming a conversation to fit
+REPLY_RESERVE = 128
+
+
+def fit_to_context(fmt: "ChatFormat", messages: list[dict], n_ctx: int,
+                   reserve: int = REPLY_RESERVE) -> tuple[list[int], int]:
+    """Render `messages`, dropping the oldest exchanges until the prompt leaves
+    `reserve` tokens to answer in. Trims `messages` in place and returns the
+    rendered ids plus how many exchanges were dropped.
+
+    A leading system message is never dropped, and neither is the newest turn -
+    if that alone does not fit there is nothing left to give up.
+    """
+    keep = 1 if messages and messages[0].get("role") == "system" else 0
+    dropped = 0
+    while True:
+        ids = fmt.render(messages)
+        if len(ids) + reserve <= n_ctx or len(messages) - keep <= 1:
+            return ids, dropped
+        del messages[keep]
+        dropped += 1
+        # a user turn and the reply it drew go together
+        while len(messages) - keep > 1 and messages[keep].get("role") == "assistant":
+            del messages[keep]
+
+
 def chat_once(model: Model, messages: list[dict], params: SamplerParams,
               n_predict: int = -1, stream=None,
               stop_strings: list[str] | None = None) -> GenerationResult:
@@ -356,10 +382,24 @@ def interactive(model: Model, params: SamplerParams, system: str = "",
                 continue
             messages.append({"role": "user", "content": user})
             record_history("append_message", "user", user)
-            ids = fmt.render(messages)
-            res = generate(model, ids, params, n_predict,
-                           stream=lambda s: print(s, end="", flush=True))
+            ids, dropped = fit_to_context(fmt, messages, model.n_ctx)
+            if dropped:
+                print(f"(dropped {dropped} earlier turn"
+                      f"{'s' if dropped != 1 else ''} to fit the context window)",
+                      file=sys.stderr)
+            try:
+                res = generate(model, ids, params, n_predict,
+                               stream=lambda s: print(s, end="", flush=True))
+            except RuntimeError as e:
+                # the prompt does not fit even on its own - stay in the REPL
+                messages.pop()
+                print(f"({e}; that message was too long, so it was not sent - "
+                      f"/clear resets the conversation)", file=sys.stderr)
+                continue
             print()
+            if res.stop_reason == "context":
+                print("(the context window is full - /clear resets the conversation)",
+                      file=sys.stderr)
             print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
             messages.append({"role": "assistant", "content": res.text})
             record_history("append_message", "assistant", res.text,
