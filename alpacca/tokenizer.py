@@ -1,9 +1,10 @@
 # Alpacca - tokenizers implemented from scratch: SentencePiece-style
-# (Viterbi over piece scores, byte fallback) and byte-level BPE with a
-# GPT-2/llama-3 style pre-tokenizer built on unicodedata (no regex deps).
+# (greedy highest-score-first bigram merge, byte fallback) and byte-level BPE
+# with a GPT-2/llama-3 style pre-tokenizer built on unicodedata (no regex deps).
 # MIT License. See LICENSE.
 from __future__ import annotations
 
+import heapq
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -139,8 +140,8 @@ class Tokenizer:
     add_space_prefix: bool = True
     eog_ids: set = field(default_factory=set)
     byte_ids: dict[int, int] = field(default_factory=dict)  # byte -> token id
-    _max_piece_bytes: int = 1
-    _piece_bytes: dict[bytes, int] = field(default_factory=dict)
+    # SPM: pieces pulled out of the raw text before the merge pass, longest first
+    special_ids: list[int] = field(default_factory=list)
 
     # ---- construction --------------------------------------------------
 
@@ -183,12 +184,13 @@ class Tokenizer:
                 a, _, b = m.partition(" ")
                 t.merge_ranks[(a, b)] = rank
         else:
-            # SPM matches on UTF-8 bytes so byte-fallback composes correctly
-            for p, i in t.piece_to_id.items():
-                if t.types[i] in (TT_NORMAL, TT_USER_DEFINED):
-                    b = p.encode("utf-8")
-                    t._piece_bytes[b] = i
-                    t._max_piece_bytes = max(t._max_piece_bytes, len(b))
+            # SPM splits these out of the raw text before merging, longest
+            # first, so that e.g. Gemma 3's multi-space pieces win over the
+            # single-space piece they contain
+            t.special_ids = sorted(
+                (i for i, tt in enumerate(t.types)
+                 if tt in (TT_CONTROL, TT_USER_DEFINED, TT_UNKNOWN) and t.pieces[i]),
+                key=lambda i: len(t.pieces[i]), reverse=True)
         return t
 
     @property
@@ -206,55 +208,123 @@ class Tokenizer:
 
     # ---- encoding -------------------------------------------------------
 
-    def encode(self, text: str, add_bos: bool | None = None) -> list[int]:
-        ids = self._encode_spm(text) if self.model == "llama" else self._encode_bpe(text)
+    def encode(self, text: str, add_bos: bool | None = None,
+               parse_special: bool = False) -> list[int]:
+        ids = (self._encode_spm(text, parse_special) if self.model == "llama"
+               else self._encode_bpe(text))
         use_bos = self.add_bos if add_bos is None else add_bos
         if use_bos and self.bos_id >= 0:
             ids = [self.bos_id] + ids
         return ids
 
-    def _encode_spm(self, text: str) -> list[int]:
-        if not text:
-            return []
-        norm = text.replace(" ", SPM_SPACE)
-        if self.add_space_prefix and not norm.startswith(SPM_SPACE):
-            norm = SPM_SPACE + norm
-        data = norm.encode("utf-8")
-        n = len(data)
-        NEG = -1e30
-        best = [NEG] * (n + 1)
-        back: list[tuple[int, int]] = [(-1, -1)] * (n + 1)
-        best[0] = 0.0
-        for i in range(n):
-            if best[i] <= NEG:
-                continue
-            limit = min(self._max_piece_bytes, n - i)
-            for ln in range(1, limit + 1):
-                tid = self._piece_bytes.get(bytes(data[i:i + ln]))
-                if tid is not None:
-                    sc = best[i] + self.scores[tid]
-                    if sc > best[i + ln]:
-                        best[i + ln] = sc
-                        back[i + ln] = (i, tid)
-            bid = self.byte_ids.get(data[i])
-            if bid is not None:
-                sc = best[i] - 1e6  # byte fallback: heavily penalized
-                if sc > best[i + 1]:
-                    best[i + 1] = sc
-                    back[i + 1] = (i, bid)
-            elif best[i + 1] <= NEG and self.unk_id >= 0:
-                best[i + 1] = best[i] - 1e7
-                back[i + 1] = (i, self.unk_id)
-        if best[n] <= NEG:
-            return [self.unk_id] if self.unk_id >= 0 else []
+    # -- SentencePiece ----------------------------------------------------
+    #
+    # Greedy highest-score-first bigram merge, matching llama.cpp's
+    # llm_tokenizer_spm. This is *not* a unigram Viterbi: SPM `scores` are
+    # merge priorities, and for a BPE-trained vocab like Gemma 3's they are
+    # plain integer ranks, so maximizing their sum would just minimize the sum
+    # of token ids and shatter every long piece into short ones.
+
+    def _encode_spm(self, text: str, parse_special: bool = False) -> list[int]:
         ids: list[int] = []
-        pos = n
-        while pos > 0:
-            prev, tid = back[pos]
-            ids.append(tid)
-            pos = prev
-        ids.reverse()
+        if not text:
+            return ids
+        prev_special = True  # the first fragment gets the space prefix too
+        for tid, chunk in self._spm_fragments(text, parse_special):
+            if tid >= 0:
+                ids.append(tid)
+                prev_special = True
+                continue
+            if self.add_space_prefix and prev_special:
+                chunk = " " + chunk
+            self._spm_merge(chunk.replace(" ", SPM_SPACE), ids)
+            prev_special = False
         return ids
+
+    def _spm_fragments(self, text: str, parse_special: bool) -> list[tuple[int, str]]:
+        """Split off whole-vocabulary pieces before merging, longest first.
+
+        User-defined pieces always split (Gemma 3 stores its runs of spaces
+        that way); control and unknown pieces only when the caller asks, so a
+        user who types `<start_of_turn>` cannot forge a turn boundary.
+        """
+        frags: list[tuple[int, str]] = [(-1, text)]
+        for sid in self.special_ids:
+            if not parse_special and self.types[sid] in (TT_CONTROL, TT_UNKNOWN):
+                continue
+            piece = self.pieces[sid]
+            out: list[tuple[int, str]] = []
+            for tid, chunk in frags:
+                if tid >= 0 or piece not in chunk:
+                    out.append((tid, chunk))
+                    continue
+                pos = 0
+                while True:
+                    hit = chunk.find(piece, pos)
+                    if hit < 0:
+                        break
+                    if hit > pos:
+                        out.append((-1, chunk[pos:hit]))
+                    out.append((sid, ""))
+                    pos = hit + len(piece)
+                if pos < len(chunk):
+                    out.append((-1, chunk[pos:]))
+            frags = out
+        return frags
+
+    def _spm_merge(self, text: str, out: list[int]) -> None:
+        """One symbol per character, then merge the best-scoring adjacent pair
+        until no adjacent pair is a vocabulary piece."""
+        n = len(text)
+        if n == 0:
+            return
+        start = list(range(n))
+        size = [1] * n
+        prev = list(range(-1, n - 1))
+        nxt = list(range(1, n + 1))
+        nxt[n - 1] = -1
+        heap: list[tuple[float, int, int, int]] = []
+        get = self.piece_to_id.get
+        scores = self.scores
+
+        def add_bigram(left: int, right: int) -> None:
+            if left < 0 or right < 0:
+                return
+            width = size[left] + size[right]
+            tid = get(text[start[left]:start[left] + width])
+            if tid is not None:
+                # max-heap on score; ties go to the leftmost pair, and `width`
+                # dates the entry so a stale one is dropped rather than applied
+                heapq.heappush(heap, (-scores[tid], left, right, width))
+
+        for i in range(1, n):
+            add_bigram(i - 1, i)
+
+        while heap:
+            _, left, right, width = heapq.heappop(heap)
+            if size[left] == 0 or size[right] == 0 or size[left] + size[right] != width:
+                continue  # one side was swallowed by an earlier merge
+            size[left] = width
+            size[right] = 0
+            nxt[left] = nxt[right]
+            if nxt[right] >= 0:
+                prev[nxt[right]] = left
+            add_bigram(prev[left], left)
+            add_bigram(left, nxt[left])
+
+        i = 0
+        while i >= 0:
+            piece = text[start[i]:start[i] + size[i]]
+            tid = get(piece)
+            if tid is not None:
+                out.append(tid)
+            else:
+                # only ever a single character: anything merged was a piece
+                for b in piece.encode("utf-8"):
+                    bid = self.byte_ids.get(b, self.unk_id)
+                    if bid >= 0:
+                        out.append(bid)
+            i = nxt[i]
 
     def _encode_bpe(self, text: str) -> list[int]:
         ids: list[int] = []

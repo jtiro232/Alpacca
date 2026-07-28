@@ -27,6 +27,47 @@ N_FF = 128
 N_CTX = 256
 N_EXTRA = 48  # normal word-piece tokens on top of specials + bytes
 
+# The word-frequency corpus the fixture vocabulary is trained on. Real SPM
+# vocabularies are built by BPE, so every multi-character piece is reachable by
+# merging two shorter pieces that are themselves in the vocabulary; a
+# hand-written word list is not, and the tokenizer can then never produce its
+# longest pieces. Whole words carry most of the weight, as in real text.
+FIXTURE_WORDS = {
+    "▁hello": 9, "▁world": 8, "▁test": 7, "▁the": 6, "▁ok": 5,
+    "▁and": 4, "▁is": 4, "▁it": 4, "▁to": 3, "▁of": 3, "▁in": 3,
+    "▁a": 3, "▁I": 2, "▁you": 2, "▁can": 2, "▁not": 2, "▁one": 2,
+    "hello": 2, "world": 2, "testing": 2, "there": 1, "later": 1,
+}
+
+
+def bpe_vocab(words: dict[str, int], budget: int) -> list[str]:
+    """Train a miniature BPE vocabulary: the alphabet, then merges in order.
+
+    Returns pieces ordered by merge priority, which is what the SPM tokenizer
+    reads out of `tokenizer.ggml.scores` as a rank.
+    """
+    seqs = [(list(w), n) for w, n in words.items()]
+    pieces = sorted({ch for w in words for ch in w})
+    while len(pieces) < budget:
+        counts: dict[tuple[str, str], int] = {}
+        for seq, n in seqs:
+            for pair in zip(seq, seq[1:]):
+                counts[pair] = counts.get(pair, 0) + n
+        if not counts:
+            break
+        # deterministic: most frequent pair, ties broken alphabetically
+        best = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        merged = best[0] + best[1]
+        pieces.append(merged)
+        for seq, _ in seqs:
+            i = 0
+            while i < len(seq) - 1:
+                if (seq[i], seq[i + 1]) == best:
+                    seq[i:i + 2] = [merged]
+                else:
+                    i += 1
+    return pieces[:budget]
+
 
 def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
     rng = random.Random(42)
@@ -61,14 +102,11 @@ def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
     add("</s>", 0.0, 3)
     for b in range(256):
         add(f"<0x{b:02X}>", -1000.0, 6)
-    # a tiny "vocabulary" so the SPM tokenizer has real pieces to work with
-    words = ["\u2581the", "\u2581a", "\u2581and", "\u2581to", "\u2581of", "\u2581in", "\u2581is", "\u2581it",
-             "\u2581hello", "\u2581world", "\u2581test", "\u2581ok", "he", "llo", "wor", "ld",
-             "ing", "ed", "er", "es", "\u2581s", "\u2581b", "an", "at", "on", "or",
-             "\u2581c", "\u2581d", "\u2581f", "\u2581g", "\u2581h", "\u2581l", "\u2581m", "\u2581n", "\u2581p", "\u2581r",
-             "\u2581t", "\u2581w", "th", "en", "re", "nd", "st", "ar", "ou", "le",
-             "\u2581I", "\u2581you"]
-    for i, w in enumerate(words[:N_EXTRA]):
+    # a tiny BPE "vocabulary" so the SPM tokenizer has real pieces to work
+    # with. Scores are merge ranks, the way Gemma 3 and other BPE-trained SPM
+    # vocabularies store them - not unigram log-probabilities.
+    words = bpe_vocab(FIXTURE_WORDS, N_EXTRA)
+    for i, w in enumerate(words):
         add(w, -float(i + 1), 1)
 
     n_vocab = len(tokens)

@@ -690,6 +690,141 @@ def main() -> None:
                                capture_output=True, text=True)
             check(f"write tiny gemma3 {dtype} model", r.returncode == 0, r.stderr)
 
+        # ---- SPM tokenizer -----------------------------------------------
+        print("== SPM tokenizer (greedy merge, as llama.cpp) ==")
+        from alpacca.gguf import GGUFFile
+        from alpacca.tokenizer import (Tokenizer, TT_BYTE, TT_CONTROL,
+                                       TT_NORMAL, TT_USER_DEFINED)
+        with GGUFFile.open(str(srv / "model.gguf")) as _gf:
+            spm = Tokenizer.from_gguf(_gf.metadata)
+
+        hello = spm.encode("hello", add_bos=False)
+        check("SPM encodes a multi-character piece as one token",
+              [spm.piece(i) for i in hello] == ["▁hello"],
+              str([spm.piece(i) for i in hello]))
+        check("SPM encodes a sentence one piece per word",
+              [spm.piece(i) for i in spm.encode("hello world", add_bos=False)] ==
+              ["▁hello", "▁world"],
+              str(spm.encode("hello world", add_bos=False)))
+        check("SPM falls back to byte tokens outside the vocabulary",
+              [spm.piece(i) for i in spm.encode("z", add_bos=False)] ==
+              ["▁", "<0x7A>"],
+              str([spm.piece(i) for i in spm.encode("z", add_bos=False)]))
+        for text in ("hello world", "the test", "日本語", "\U0001f680 ok",
+                     "café", "a\tb\nc"):
+            # add_space_prefix inserts a leading space, exactly as sentencepiece does
+            check(f"SPM round-trips {text!r}",
+                  spm.decode(spm.encode(text, add_bos=False)) == " " + text,
+                  repr(spm.decode(spm.encode(text, add_bos=False))))
+        check("SPM encode of an empty string is empty",
+              spm.encode("", add_bos=False) == [])
+        check("SPM add_bos prepends exactly one BOS",
+              spm.encode("hello", add_bos=True) == [spm.bos_id] + hello)
+
+        # Gemma 3 stores BPE merge ranks in tokenizer.ggml.scores, so a long
+        # piece scores far worse than the sum of the short pieces it contains.
+        # These are the real numbers from the Gemma 3 vocabulary: a unigram
+        # Viterbi maximizes the sum and returns the four fragments (-222 beats
+        # -4785); the merge order has to return the one true piece.
+        rank_pieces = ["<unk>", "<s>", "</s>", "▁", "c", "a", "p", "i", "t", "l",
+                       "▁c", "ap", "it", "al", "▁cap", "ital", "▁capital"]
+        rank_scores = [0.0, 0.0, 0.0, -3.0, -9.0, -4.0, -30.0, -6.0, -5.0, -8.0,
+                       -11.0, -176.0, -15.0, -20.0, -300.0, -400.0, -4785.0]
+        ranks = Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.tokens": rank_pieces,
+            "tokenizer.ggml.scores": rank_scores,
+            "tokenizer.ggml.token_type": [2, 3, 3] + [TT_NORMAL] * 14,
+            "tokenizer.ggml.bos_token_id": 1,
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.add_space_prefix": True,
+        })
+        whole = ranks.token_id("▁capital")
+        pieces4 = [ranks.token_id(p) for p in ("▁c", "ap", "it", "al")]
+        check("SPM rank-scored vocabulary: fragments really do score higher",
+              sum(rank_scores[i] for i in pieces4) == -222.0 and
+              rank_scores[whole] == -4785.0)
+        check("SPM merges by rank order, not by maximizing the score sum",
+              ranks.encode("capital", add_bos=False) == [whole],
+              str([ranks.piece(i) for i in
+                   ranks.encode("capital", add_bos=False)]))
+
+        # A vocabulary whose user-defined pieces are runs of spaces: llama.cpp
+        # splits those off the raw text before merging, so they must win over
+        # the single-space piece they contain. Gemma 3 ships exactly this.
+        ud_pieces = ["<unk>", "<s>", "</s>", "▁", "a", "b", "  ", "   ",
+                     "<start_of_turn>"]
+        ud_types = [2, 3, 3, TT_NORMAL, TT_NORMAL, TT_NORMAL,
+                    TT_USER_DEFINED, TT_USER_DEFINED, TT_CONTROL]
+        ud = Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.tokens": ud_pieces,
+            "tokenizer.ggml.scores": [0.0, 0.0, 0.0, -1.0, -2.0, -3.0,
+                                      -4.0, -5.0, 0.0],
+            "tokenizer.ggml.token_type": ud_types,
+            "tokenizer.ggml.bos_token_id": 1,
+            "tokenizer.ggml.eos_token_id": 2,
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.add_space_prefix": False,
+        })
+        check("SPM splits user-defined pieces off the raw text, longest first",
+              [ud.piece(i) for i in ud.encode("a   b", add_bos=False)] ==
+              ["a", "   ", "b"],
+              str([ud.piece(i) for i in ud.encode("a   b", add_bos=False)]))
+        check("SPM user-defined split prefers the longer run",
+              [ud.piece(i) for i in ud.encode("a  b", add_bos=False)] ==
+              ["a", "  ", "b"],
+              str([ud.piece(i) for i in ud.encode("a  b", add_bos=False)]))
+        check("SPM leaves control tokens as text by default",
+              ud.encode("<start_of_turn>", add_bos=False) !=
+              [ud.token_id("<start_of_turn>")],
+              str(ud.encode("<start_of_turn>", add_bos=False)))
+        check("SPM parse_special splits control tokens on request",
+              ud.encode("<start_of_turn>a", add_bos=False, parse_special=True) ==
+              [ud.token_id("<start_of_turn>"), ud.token_id("a")],
+              str(ud.encode("<start_of_turn>a", add_bos=False, parse_special=True)))
+
+        # add_space_prefix must keep working, including after a special token
+        sp_on = Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.tokens": ud_pieces,
+            "tokenizer.ggml.scores": [0.0, 0.0, 0.0, -1.0, -2.0, -3.0,
+                                      -4.0, -5.0, 0.0],
+            "tokenizer.ggml.token_type": ud_types,
+            "tokenizer.ggml.bos_token_id": 1,
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.add_space_prefix": True,
+        })
+        check("SPM add_space_prefix prepends the space piece",
+              [sp_on.piece(i) for i in sp_on.encode("a", add_bos=False)] ==
+              ["▁", "a"],
+              str([sp_on.piece(i) for i in sp_on.encode("a", add_bos=False)]))
+        check("SPM add_space_prefix re-arms after a special token",
+              [sp_on.piece(i) for i in
+               sp_on.encode("<start_of_turn>a", add_bos=False,
+                            parse_special=True)] ==
+              ["<start_of_turn>", "▁", "a"],
+              str([sp_on.piece(i) for i in
+                   sp_on.encode("<start_of_turn>a", add_bos=False,
+                                parse_special=True)]))
+
+        # the BPE path is a different function and must be untouched by all this
+        bpe = Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.tokens": ["<|endoftext|>", "h", "e", "l", "o",
+                                      "he", "ll", "hell", "hello", "Ġw"],
+            "tokenizer.ggml.token_type": [TT_CONTROL] + [TT_NORMAL] * 9,
+            "tokenizer.ggml.merges": ["h e", "l l", "he ll", "hell o"],
+            "tokenizer.ggml.bos_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 0,
+            "tokenizer.ggml.add_bos_token": False,
+        })
+        check("BPE path still merges by rank and ignores SPM scores",
+              [bpe.piece(i) for i in bpe.encode("hello")] == ["hello"],
+              str([bpe.piece(i) for i in bpe.encode("hello")]))
+        check("BPE vocabulary builds no SPM special-token cache",
+              bpe.special_ids == [] and bpe.merge_ranks[("h", "e")] == 0)
+
         from alpacca.model import Model, auto_budget_fit_mb
         fit = auto_budget_fit_mb(str(srv / "tiny-q4.gguf"))
         # tiny-q4 (untied): eligible = 6 ffn x 32768B + 8 attn x 16384B +
