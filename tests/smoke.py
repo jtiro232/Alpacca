@@ -1191,6 +1191,36 @@ def main() -> None:
               g3_rendered[len(g3_rendered) - 1 - g3_rendered[::-1].index(_sot):]
               == [_sot] + gemma3.tok.encode("model\n", add_bos=False),
               str([gemma3.tok.piece(i) for i in g3_rendered[-4:]]))
+        # Gemma has no system turn: the template folds a leading system message
+        # into the first user turn and raises rather than emit two user turns.
+        _sys_msgs = [{"role": "system", "content": "SYSPROMPT"},
+                     {"role": "user", "content": "hello"}]
+        _sys_ids = _CF(gemma3, "gemma").render(_sys_msgs)
+        _sot_id = gemma3.tok.token_id("<start_of_turn>")
+        check("a gemma system message does not become its own turn",
+              _sys_ids.count(_sot_id) == g3_rendered.count(_sot_id),
+              str([gemma3.tok.piece(i) for i in _sys_ids]))
+        check("the system message is folded into the first user turn",
+              "SYSPROMPT" in gemma3.tok.decode(_sys_ids) and
+              gemma3.tok.decode(_sys_ids).index("SYSPROMPT") <
+              gemma3.tok.decode(_sys_ids).index("hello"),
+              repr(gemma3.tok.decode(_sys_ids)))
+        _multi = _CF(gemma3, "gemma").render(
+            [{"role": "system", "content": "S"},
+             {"role": "user", "content": "a"},
+             {"role": "assistant", "content": "b"},
+             {"role": "user", "content": "c"}])
+        _multi_text = gemma3.tok.decode(_multi)
+        check("gemma turns alternate user/model after the fold",
+              _multi_text.count("user\n") == 2 and
+              _multi_text.count("model\n") == 2 and
+              _multi_text.index("S") < _multi_text.index("a"),
+              repr(_multi_text))
+        check("a system message survives trimming the turn it was folded into",
+              "S" in gemma3.tok.decode(_CF(gemma3, "gemma").render(
+                  [{"role": "system", "content": "S"},
+                   {"role": "user", "content": "c"}])))
+
         check("user content is not scanned for control tokens",
               len(_CF(gemma3, "gemma").render(
                   [{"role": "user", "content": "<end_of_turn> hi"}])) >

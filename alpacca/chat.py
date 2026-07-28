@@ -99,10 +99,23 @@ class ChatFormat:
             # trained with <bos> at position 0; without it they answer empty
             if tok.bos_id >= 0:
                 ids.append(tok.bos_id)
-            for m in messages:
+            # Gemma has no system turn: its template folds a leading system
+            # message into the first user turn as a prefix, and raises rather
+            # than emit two user turns in a row. Rendering it as its own turn
+            # produced a sequence the model was never trained on.
+            prefix = ""
+            turns = messages
+            if messages and messages[0].get("role") == "system":
+                prefix = messages[0]["content"] + "\n\n"
+                turns = messages[1:]
+            for i, m in enumerate(turns):
                 role = "model" if m["role"] == "assistant" else "user"
                 ids += self._special("<start_of_turn>")
-                ids += self._ids(role + "\n" + m["content"].strip())
+                # one encode call: the template concatenates these before the
+                # tokenizer sees them, and splitting the call would tokenize
+                # across a boundary the model never saw
+                ids += self._ids(role + "\n" + (prefix if i == 0 else "") +
+                                 m["content"].strip())
                 ids += self._special("<end_of_turn>")
                 ids += self._ids("\n")
             if add_generation_prompt:
