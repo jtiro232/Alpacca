@@ -914,6 +914,16 @@ def main() -> None:
                                 "--arch", "gemma3", "--minimal"] + extra,
                                capture_output=True, text=True)
             check(f"write {name}", r.returncode == 0, r.stderr)
+        # fixtures carrying one invalid value each, to prove the loader
+        # rejects them up front instead of failing later on NaNs, on
+        # token-independent logits, or on a cryptic broadcast error
+        for _bad in ("rope_base", "embed_scale", "norm_size"):
+            r = subprocess.run([sys.executable, str(mk),
+                                str(srv / f"tiny-gemma3-bad-{_bad}.gguf"),
+                                "F32", "--arch", "gemma3", "--corrupt", _bad],
+                               capture_output=True, text=True)
+            check(f"write tiny-gemma3-bad-{_bad}.gguf", r.returncode == 0,
+                  r.stderr)
 
         # ---- SPM tokenizer -----------------------------------------------
         print("== SPM tokenizer (greedy merge, as llama.cpp) ==")
@@ -1171,6 +1181,19 @@ def main() -> None:
               abs(g3_27b.hp.attention_scale - g3min.hp.attention_scale) > 1e-3,
               str(g3_27b.hp.attention_scale))
 
+        # ---- invalid metadata is rejected at load, not much later ---------
+        for _bad, _needle in (("rope_base", "rope.freq_base"),
+                              ("embed_scale", "embedding_scale"),
+                              ("norm_size", "expected")):
+            _err = ""
+            try:
+                Model.load(str(srv / f"tiny-gemma3-bad-{_bad}.gguf"),
+                           progress=False)
+            except ValueError as e:
+                _err = str(e)
+            check(f"gemma3 rejects an invalid {_bad} at load",
+                  _needle in _err, repr(_err))
+
         # ---- the two RoPE tables must genuinely differ --------------------
         # The sliding/global parity test passes even if _rope_cos_swa were
         # never built, because both paths share the same silent fallback.
@@ -1240,7 +1263,8 @@ def main() -> None:
               "a user could forge a turn boundary")
         # every format whose template starts with bos_token must do the same
         for _fmt_name, _needle in (("gemma", "<start_of_turn>"),
-                                   ("llama3", "<|start_header_id|>")):
+                                   ("llama3", "<|start_header_id|>"),
+                                   ("llama2", "[INST]")):
             _md = dict(gemma3.metadata)
             _md["tokenizer.chat_template"] = "{{ bos_token }}" + _needle
             _m = Model.__new__(Model)

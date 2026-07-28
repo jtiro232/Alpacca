@@ -249,7 +249,11 @@ class Model:
             n_kv = int(meta("attention.head_count_kv", n_head) or n_head)
             head_dim = int(meta("attention.key_length", n_embd // n_head) or n_embd // n_head)
             n_layer = meta_required("block_count")
-            rope_base = float(meta("rope.freq_base", 10000.0) or 10000.0)
+            # not `or 10000.0`: that idiom coerces a stored 0.0 to the default
+            # and the check below could then never fire for the one value the
+            # check exists for. Absent key -> default; present key -> validated.
+            _rope_base_md = meta("rope.freq_base", None)
+            rope_base = 10000.0 if _rope_base_md is None else float(_rope_base_md)
             if not math.isfinite(rope_base) or rope_base <= 0.0:
                 raise ValueError(
                     f"{path}: {arch}.rope.freq_base must be positive and "
@@ -323,6 +327,19 @@ class Model:
                                 if meta("full_attention_interval") is not None
                                 else "default period 6")
 
+            # a stored 0 here silently makes every logit token-independent,
+            # so validate it the same way rope.freq_base is validated above
+            if arch in _GEMMA_ARCHES:
+                _embed_scale_md = meta("embedding_scale", None)
+                embed_scale = (math.sqrt(n_embd) if _embed_scale_md is None
+                               else float(_embed_scale_md))
+                if not math.isfinite(embed_scale) or embed_scale <= 0.0:
+                    raise ValueError(
+                        f"{path}: {arch}.embedding_scale must be positive and "
+                        f"finite, got {embed_scale}")
+            else:
+                embed_scale = 1.0
+
             hp = Hyperparams(
                 arch=arch,
                 n_layer=n_layer,
@@ -344,8 +361,7 @@ class Model:
                 sliding_layers=sliding_layers,
                 attention_scale=attention_scale,
                 final_logit_softcap=float(meta("final_logit_softcapping", 0.0) or 0.0),
-                embed_scale=(float(meta("embedding_scale", math.sqrt(n_embd)))
-                             if arch in _GEMMA_ARCHES else 1.0),
+                embed_scale=embed_scale,
                 full_attention_period=full_attention_period,
                 swa_rule=swa_rule,
                 attention_scale_from_metadata=meta("attention.scale") is not None,
@@ -446,29 +462,34 @@ class Model:
                 ly.k_norm = None
                 ly.post_attn_norm = None
                 ly.post_ffw_norm = None
-                ly.attn_norm = tensor_vec(p + "attn_norm.weight")
+                ly.attn_norm = tensor_vec(p + "attn_norm.weight", size=hp.n_embd)
                 ly.wq = tensor_mat(p + "attn_q.weight", q_dim, hp.n_embd)
                 ly.wk = tensor_mat(p + "attn_k.weight", kv_dim, hp.n_embd)
                 ly.wv = tensor_mat(p + "attn_v.weight", kv_dim, hp.n_embd)
                 ly.wo = tensor_mat(p + "attn_output.weight", hp.n_embd, q_dim)
-                ly.bq = tensor_vec(p + "attn_q.bias", required=False)
-                ly.bk = tensor_vec(p + "attn_k.bias", required=False)
-                ly.bv = tensor_vec(p + "attn_v.bias", required=False)
+                ly.bq = tensor_vec(p + "attn_q.bias", required=False, size=q_dim)
+                ly.bk = tensor_vec(p + "attn_k.bias", required=False, size=kv_dim)
+                ly.bv = tensor_vec(p + "attn_v.bias", required=False, size=kv_dim)
                 if arch == "gemma3":
-                    ly.q_norm = tensor_vec(p + "attn_q_norm.weight")
-                    ly.k_norm = tensor_vec(p + "attn_k_norm.weight")
-                    ly.post_attn_norm = tensor_vec(p + "post_attention_norm.weight")
-                ly.ffn_norm = tensor_vec(p + "ffn_norm.weight")
+                    # q/k-norm are per-head vectors shared across heads
+                    ly.q_norm = tensor_vec(p + "attn_q_norm.weight",
+                                           size=hp.head_dim)
+                    ly.k_norm = tensor_vec(p + "attn_k_norm.weight",
+                                           size=hp.head_dim)
+                    ly.post_attn_norm = tensor_vec(p + "post_attention_norm.weight",
+                                                   size=hp.n_embd)
+                ly.ffn_norm = tensor_vec(p + "ffn_norm.weight", size=hp.n_embd)
                 ly.w_gate = tensor_mat(p + "ffn_gate.weight", hp.n_ff, hp.n_embd)
                 ly.w_up = tensor_mat(p + "ffn_up.weight", hp.n_ff, hp.n_embd)
                 ly.w_down = tensor_mat(p + "ffn_down.weight", hp.n_embd, hp.n_ff)
                 if arch == "gemma3":
-                    ly.post_ffw_norm = tensor_vec(p + "post_ffw_norm.weight")
+                    ly.post_ffw_norm = tensor_vec(p + "post_ffw_norm.weight",
+                                                  size=hp.n_embd)
                 m.layers.append(ly)
             if progress:
                 print("\r" + " " * 40 + "\r", end="", flush=True, file=sys.stderr)
 
-            m.out_norm = tensor_vec("output_norm.weight")
+            m.out_norm = tensor_vec("output_norm.weight", size=hp.n_embd)
             m.output = tensor_mat("output.weight", hp.n_vocab, hp.n_embd, required=False)
             if m.output is None:
                 m.output = m.tok_embd  # tied embeddings

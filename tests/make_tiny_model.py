@@ -81,10 +81,13 @@ GEMMA_TEMPLATE = (
 
 def main(path: str, dtype: str = "F32", arch: str = "llama",
          minimal: bool = False, layers: int = 0,
-         swa_pattern: int | None = None) -> None:
+         swa_pattern: int | None = None, corrupt: str = "") -> None:
     """`minimal` omits every gemma3 metadata key that no real Gemma 3 GGUF
     carries, so the fixture takes the same fallback paths production does.
-    `swa_pattern` writes the key as a scalar period instead of a bool array."""
+    `swa_pattern` writes the key as a scalar period instead of a bool array.
+    `corrupt` writes one deliberately invalid value so the loader's
+    validation can be tested: a value the engine would otherwise accept and
+    then fail on much later with an unrelated error."""
     rng = random.Random(42)
     if arch == "gemma3":
         n_embd = 64
@@ -149,7 +152,10 @@ def main(path: str, dtype: str = "F32", arch: str = "llama",
         w.add("gemma3.attention.key_length", gguf.T_UINT32, head_dim)
         w.add("gemma3.attention.value_length", gguf.T_UINT32, head_dim)
         w.add("gemma3.attention.sliding_window", gguf.T_UINT32, 3)
-        w.add("gemma3.rope.freq_base", gguf.T_FLOAT32, 1000000.0)
+        w.add("gemma3.rope.freq_base", gguf.T_FLOAT32,
+              0.0 if corrupt == "rope_base" else 1000000.0)
+        if corrupt == "embed_scale":
+            w.add("gemma3.embedding_scale", gguf.T_FLOAT32, 0.0)
         w.add("gemma3.rope.freq_base_swa", gguf.T_FLOAT32, 10000.0)
         # None of these exist in a real Gemma 3 GGUF. The minimal variant
         # leaves them out so the fallbacks production takes get exercised:
@@ -295,7 +301,10 @@ def main(path: str, dtype: str = "F32", arch: str = "llama",
                rand(n_vocab * n_embd), dtype)
     for i in range(n_layer):
         p = f"blk.{i}."
-        add_weight(p + "attn_norm.weight", (n_embd,), normish(n_embd), "F32")
+        # a wrong-length norm vector loads cleanly without validation and
+        # then fails mid-generation with a cryptic broadcast error
+        _norm_n = n_embd - 1 if corrupt == "norm_size" else n_embd
+        add_weight(p + "attn_norm.weight", (_norm_n,), normish(_norm_n), "F32")
         add_weight(p + "attn_q.weight", (n_embd, q_dim),
                    rand(n_embd * q_dim), dtype)
         add_weight(p + "attn_k.weight", (n_embd, kv_dim),
@@ -345,6 +354,10 @@ if __name__ == "__main__":
                     help="override the block count (62 selects the 27B rules)")
     ap.add_argument("--swa-pattern", type=int, default=None,
                     help="write sliding_window_pattern as a scalar period")
+    ap.add_argument("--corrupt", default="",
+                    choices=["", "rope_base", "embed_scale", "norm_size"],
+                    help="write one invalid value, to test load validation")
     args = ap.parse_args()
     main(args.path, args.dtype, arch=args.arch, minimal=args.minimal,
-         layers=args.layers, swa_pattern=args.swa_pattern)
+         layers=args.layers, swa_pattern=args.swa_pattern,
+         corrupt=args.corrupt)

@@ -158,20 +158,25 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
     from . import tensor
     if not tensor.HAS_NUMPY or os.environ.get("ALPACCA_F32"):
         return
-    if os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None:
-        return
     from . import kernels
+    pinned = os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None
     if kernels.available():
         # fused quantized kernels read ~1.1-1.3 B/weight at native speed:
         # faster than dense BLAS (4 B/weight) AND ~3x less RAM, so the
         # fastest default is to keep everything quantized
         kernels.warmup()
-        print(f"{kernels.status()}: keeping weights quantized "
+        print(kernels.status() if pinned else
+              f"{kernels.status()}: keeping weights quantized "
               f"(fastest path, lowest RAM)", file=sys.stderr)
         return
+    # report the missing kernels even when the budget is pinned:
+    # ALPACCA_DENSE_WEIGHT_MB=0 is the fully-quantized mode, which is
+    # exactly where their absence costs the most
     print(f"alpacca: {kernels.status()}; NumPy decode is several times slower "
           f"than the fused kernels (pip install \"numba=={kernels.NUMBA_PIN}\" "
           f"to enable them)", file=sys.stderr)
+    if pinned:
+        return
     avail = _available_ram_mb()
     if avail is None:
         print("alpacca: could not detect available RAM; keeping weights "
