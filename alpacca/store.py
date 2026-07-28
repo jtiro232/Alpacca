@@ -426,9 +426,17 @@ def list_models() -> list[dict]:
         if not size:
             size = sum(f.stat().st_size for f in d.glob("*.gguf"))
         name = manifest.get("name", d.name)
+        # nickname_for_model canonicalises through parse_model_ref before
+        # comparing; match on the same form so the two never disagree about
+        # whether a model has an alias
+        try:
+            canonical = parse_model_ref(name).display()
+        except ValueError:
+            canonical = name
         out.append({
             "name": name,
-            "nickname": model_to_nickname.get(name, ""),
+            "nickname": (model_to_nickname.get(canonical)
+                         or model_to_nickname.get(name, "")),
             "source": manifest.get("source", "?"),
             "size": int(size),
             "pulled_at": manifest.get("pulled_at", ""),

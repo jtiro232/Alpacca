@@ -240,7 +240,11 @@ class Model:
             n_kv = int(meta("attention.head_count_kv", n_head) or n_head)
             head_dim = int(meta("attention.key_length", n_embd // n_head) or n_embd // n_head)
             n_layer = meta_required("block_count")
-            rope_base = float(meta("rope.freq_base", 10000.0))
+            rope_base = float(meta("rope.freq_base", 10000.0) or 10000.0)
+            if not math.isfinite(rope_base) or rope_base <= 0.0:
+                raise ValueError(
+                    f"{path}: {arch}.rope.freq_base must be positive and "
+                    f"finite, got {rope_base}")
             rope_base_swa = float(meta("rope.freq_base_swa", 0.0) or 0.0)
             sliding_window = int(meta("attention.sliding_window", 0) or 0)
             if arch == "gemma3" and sliding_window > 0 and rope_base_swa <= 0.0:
@@ -252,15 +256,37 @@ class Model:
                 meta("rope.scaling.factor",
                      rope_scale_legacy if rope_scale_legacy is not None else 1.0) or 1.0)
             rope_freq_scale = 1.0
-            if (rope_scaling_factor > 0.0 and
-                    (rope_scaling_type == "linear" or rope_scale_legacy is not None)):
+            # llama.cpp treats a bare rope.scaling.factor as linear, so a file
+            # that omits the type still scales. Applies to every architecture,
+            # which is what upstream does - yarn/longrope are not implemented
+            # and are deliberately left unscaled rather than scaled wrongly.
+            if rope_scaling_factor > 0.0 and rope_scaling_type in ("", "linear"):
                 rope_freq_scale = 1.0 / rope_scaling_factor
+            elif rope_scaling_type not in ("", "linear", "none"):
+                print(f"warning: {path}: rope scaling type "
+                      f"'{rope_scaling_type}' is not implemented; "
+                      f"running unscaled", file=sys.stderr)
 
             fallback_attn_scale = 1.0 / math.sqrt(head_dim)
+            # Gemma 3 27B alone scales by the per-head width rather than the
+            # key length. llama.cpp keys this on the layer count alone
+            # (src/models/gemma3.cpp: case 62 -> LLM_TYPE_27B), so keep the
+            # same rule rather than inventing a stricter one.
             if arch == "gemma3" and n_layer == 62:
                 fallback_attn_scale = 1.0 / math.sqrt(n_embd / n_head)
             attention_scale = float(meta("attention.scale", fallback_attn_scale)
                                     or fallback_attn_scale)
+            # llama.cpp never reads this key - it always computes the scale -
+            # so anything writing it is third-party. A real scale is a
+            # reciprocal square root and so lies in (0, 1]; a converter using
+            # query_pre_attn_scalar semantics would write 256 instead of
+            # 0.0625 and every softmax would be catastrophically mis-scaled.
+            if not math.isfinite(attention_scale) or not 0.0 < attention_scale <= 1.0:
+                print(f"warning: {path}: {arch}.attention.scale is "
+                      f"{attention_scale}, which is not a reciprocal square "
+                      f"root; using {fallback_attn_scale:.6g} instead",
+                      file=sys.stderr)
+                attention_scale = fallback_attn_scale
 
             sliding_layers: tuple[bool, ...] = ()
             full_attention_period = 0
@@ -313,6 +339,8 @@ class Model:
             m.metadata = {k: v for k, v in gf.metadata.items()
                           if not isinstance(v, list) or len(v) < 64}
             dense_matrices = 0
+            dense_bytes = 0
+            quantized_bytes = 0
             quantized_matrices: dict[str, int] = {}
             fallback_matrices: dict[str, int] = {}
             densified_names: list[str] = []
@@ -348,7 +376,7 @@ class Model:
                                 densified_bytes += nbytes
 
             def tensor_mat(name, rows, cols, required=True):
-                nonlocal dense_matrices
+                nonlocal dense_matrices, dense_bytes, quantized_bytes
                 info = gf.tensors.get(name)
                 if info is None:
                     if required:
@@ -363,6 +391,7 @@ class Model:
                         T.can_quantized_matvec(info.dtype, cols)):
                     quantized_matrices[info.dtype] = (
                         quantized_matrices.get(info.dtype, 0) + 1)
+                    quantized_bytes += info.n_bytes
                     return T.quantized_matrix(gf.tensor_bytes(name), info.dtype, rows, cols)
                 if name in densify_plan:
                     densified_names.append(name)
@@ -370,15 +399,20 @@ class Model:
                     fallback_matrices[info.dtype] = (
                         fallback_matrices.get(info.dtype, 0) + 1)
                 dense_matrices += 1
+                dense_bytes += info.n_elements * 4
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
                 return T.matrix(vals, rows, cols)
 
-            def tensor_vec(name, required=True):
+            def tensor_vec(name, required=True, size=None):
                 info = gf.tensors.get(name)
                 if info is None:
                     if required:
                         raise ValueError(f"missing tensor {name} in {path}")
                     return None
+                if size is not None and info.n_elements != size:
+                    raise ValueError(
+                        f"tensor {name} has {info.n_elements} elements, "
+                        f"expected {size}")
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
                 return T.vector(vals)
 
@@ -424,6 +458,8 @@ class Model:
 
             m.weight_storage = {
                 "dense": dense_matrices,
+                "dense_bytes": dense_bytes,
+                "quantized_bytes": quantized_bytes,
                 "quantized": dict(sorted(quantized_matrices.items())),
                 "fallback": dict(sorted(fallback_matrices.items())),
                 "densified": sorted(densified_names),
@@ -599,12 +635,15 @@ class Model:
         out = np.einsum("tkgs,skh->tkgh", w, V, optimize=True)
         return out.reshape(len(q), hp.n_head * hp.head_dim)
 
-    def forward_batch(self, tokens: list[int]):
-        """Process a NumPy batch at the current position; returns last-token logits."""
+    def forward_batch(self, tokens: list[int], want_logits: bool = True):
+        """Process a NumPy batch at the current position; returns last-token
+        logits, or None when `want_logits` is False - prefill discards every
+        chunk's logits but the last, and on a tied 262144-row head that
+        projection is a large share of the chunk's work."""
         if not T.HAS_NUMPY:
             raise RuntimeError("forward_batch requires the NumPy backend")
         if self.hp.arch == "gemma3":
-            return self._forward_batch_gemma3_np(tokens)
+            return self._forward_batch_gemma3_np(tokens, want_logits)
         if not tokens:
             return None
         if self.n_past + len(tokens) > self.n_ctx:
@@ -653,6 +692,8 @@ class Model:
 
         self.n_past += len(tokens)
         self.cached_ids.extend(tokens)
+        if not want_logits:
+            return None
         return T.matvec(self.output, T.rmsnorm(x[-1], self.out_norm, hp.rms_eps))
 
     def _forward_np(self, token: int):
@@ -783,7 +824,7 @@ class Model:
             return np.tanh(logits / cap) * cap
         return [math.tanh(v / cap) * cap for v in logits]
 
-    def _forward_batch_gemma3_np(self, tokens: list[int]):
+    def _forward_batch_gemma3_np(self, tokens: list[int], want_logits: bool = True):
         if not tokens:
             return None
         if self.n_past + len(tokens) > self.n_ctx:
@@ -837,6 +878,8 @@ class Model:
 
         self.n_past += len(tokens)
         self.cached_ids.extend(tokens)
+        if not want_logits:
+            return None
         logits = T.matvec(self.output, T.rmsnorm(x[-1], self.out_norm, hp.rms_eps))
         return self._softcap_logits(logits)
 
@@ -1028,7 +1071,8 @@ class Model:
             except ValueError:
                 chunk = 256
             for i in range(0, len(suffix), chunk):
-                logits = self.forward_batch(suffix[i:i + chunk])
+                logits = self.forward_batch(suffix[i:i + chunk],
+                                            want_logits=i + chunk >= len(suffix))
         else:
             for t in suffix:
                 logits = self.forward(t)
@@ -1058,24 +1102,32 @@ class Model:
                 f"~{params / 1e6:.0f}M params | {ctx} | "
                 f"backend {T.backend_name()} | {storage}")
 
+    @staticmethod
+    def _size(nbytes: float) -> str:
+        mb = nbytes / (1024 * 1024)
+        return f"{mb / 1024:.1f} GiB" if mb >= 1024 else f"{mb:.0f} MiB"
+
     def _storage_description(self) -> str:
         q = self.weight_storage.get("quantized", {})
         dense = int(self.weight_storage.get("dense", 0) or 0)
         fallback = self.weight_storage.get("fallback", {})
         densified = self.weight_storage.get("densified") or []
+        q_bytes = self.weight_storage.get("quantized_bytes", 0)
+        d_bytes = self.weight_storage.get("dense_bytes", 0)
+        # matrix counts alone say nothing about the RAM this actually costs
         if q:
             q_desc = "/".join(q.keys())
             total_q = sum(q.values())
-            parts = [f"weights quantized {q_desc} ({total_q} matrices)"]
+            parts = [f"weights quantized {q_desc} "
+                     f"({total_q} matrices, {self._size(q_bytes)})"]
             if dense:
-                parts.append(f"dense {dense}")
+                parts.append(f"dense {dense} ({self._size(d_bytes)})")
         else:
-            parts = [f"weights dense ({dense} matrices)"]
+            parts = [f"weights dense ({dense} matrices, {self._size(d_bytes)})"]
         if fallback:
             fb_desc = "/".join(fallback.keys())
             parts.append(f"dense fallback {fb_desc}")
         if densified:
-            mb = self.weight_storage.get("densified_bytes", 0) / (1024 * 1024)
-            size = f"{mb / 1024:.1f} GiB" if mb >= 1024 else f"{mb:.1f} MiB"
+            size = self._size(self.weight_storage.get("densified_bytes", 0))
             parts.append(f"dense budget {len(densified)} matrices ({size})")
         return ", ".join(parts)

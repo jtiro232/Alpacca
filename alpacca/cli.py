@@ -169,6 +169,9 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
         print(f"{kernels.status()}: keeping weights quantized "
               f"(fastest path, lowest RAM)", file=sys.stderr)
         return
+    print(f"alpacca: {kernels.status()}; NumPy decode is several times slower "
+          f"than the fused kernels (pip install \"numba=={kernels.NUMBA_PIN}\" "
+          f"to enable them)", file=sys.stderr)
     avail = _available_ram_mb()
     if avail is None:
         print("alpacca: could not detect available RAM; keeping weights "
@@ -222,13 +225,13 @@ def cmd_list(_args) -> int:
     if not models:
         print("no models installed - try: alpacca pull llama3.2:1b")
         return 0
-    width = max(4, max(len(m["name"]) for m in models))
+    width = max(4, max(_display_width(m["name"]) for m in models))
     nicks = {m["name"]: _clip(m.get("nickname", ""), 32) for m in models}
-    nick_width = max(8, max(len(n) for n in nicks.values()))
-    print(f"{'NAME':<{width}}  {'NICKNAME':<{nick_width}}  "
+    nick_width = max(8, max(_display_width(n) for n in nicks.values()))
+    print(f"{_pad('NAME', width)}  {_pad('NICKNAME', nick_width)}  "
           f"{'SOURCE':<8}  {'SIZE':<10}  PULLED")
     for m in models:
-        print(f"{m['name']:<{width}}  {nicks[m['name']]:<{nick_width}}  "
+        print(f"{_pad(m['name'], width)}  {_pad(nicks[m['name']], nick_width)}  "
               f"{m['source']:<8}  {human_size(m['size']):<10}  {m['pulled_at']}")
     return 0
 
@@ -344,6 +347,21 @@ def cmd_tokenize(args) -> int:
 
 
 def cmd_nickname(args) -> int:
+    if getattr(args, "list", False):
+        from .store import list_nicknames
+        nicks = list_nicknames()
+        if not nicks:
+            print("no nicknames set")
+            return 0
+        installed = {m["name"] for m in list_models()}
+        width = max(8, max(_display_width(n) for n in nicks))
+        print(f"{_pad('NICKNAME', width)}  MODEL")
+        for nick, target in sorted(nicks.items(), key=lambda kv: kv[0].lower()):
+            note = "" if target in installed else "   (not installed)"
+            print(f"{_pad(nick, width)}  {target}{note}")
+        return 0
+    if not args.model:
+        raise ValueError("a model is required unless --list is used")
     if args.clear:
         removed = clear_model_nickname(args.model)
         if removed:
@@ -359,11 +377,34 @@ def cmd_nickname(args) -> int:
 
 
 
+def _display_width(text: str) -> int:
+    """Terminal columns `text` occupies. CJK and emoji are double-width, and
+    combining marks take none, so len() misaligns every column after them."""
+    import unicodedata
+    total = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
+
 def _clip(text: str, width: int) -> str:
     text = " ".join(str(text).split())
-    if len(text) <= width:
+    if _display_width(text) <= width:
         return text
-    return text[:max(0, width - 3)].rstrip() + "..."
+    out, used = "", 0
+    for ch in text:
+        w = _display_width(ch)
+        if used + w > max(0, width - 3):
+            break
+        out += ch
+        used += w
+    return out.rstrip() + "..."
 
 
 def _default_model_file() -> Path:
@@ -575,7 +616,7 @@ def _print_controls() -> None:
     print("  alpacca menu")
     print("  alpacca list")
     print("  alpacca pull <model>")
-    print("  alpacca nickname <model> <nickname>")
+    print("  alpacca nickname <model> <nickname>  |  alpacca nickname --list")
     print("  alpacca run <model-or-nickname> [prompt text]")
     print("  alpacca serve <model-or-nickname> [--host HOST] [--port PORT]")
     print("  alpacca history list|show|stats|rm|clear --yes")
@@ -804,9 +845,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("nickname", aliases=["nick"],
                        help="set or clear a nickname for an installed model")
-    p.add_argument("model")
+    p.add_argument("model", nargs="?")
     p.add_argument("nickname", nargs="*", help="nickname text, spaces allowed")
     p.add_argument("--clear", action="store_true", help="remove this model's nickname")
+    p.add_argument("--list", action="store_true",
+                   help="list every nickname and what it points at")
     p.set_defaults(func=cmd_nickname)
 
     p = sub.add_parser("menu", help="open the local terminal app menu")

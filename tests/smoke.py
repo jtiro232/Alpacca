@@ -730,6 +730,21 @@ def main() -> None:
               "ollama:user/name:tag",
               parse_model_ref("ollama:user/name:tag").display())
 
+        # ---- column alignment for wide characters -------------------------
+        from alpacca.cli import _clip, _display_width, _pad
+        check("display width counts CJK and emoji as two columns",
+              _display_width("日本語") == 6 and _display_width("abc") == 3 and
+              _display_width("\U0001f680") == 2,
+              str([_display_width("日本語"), _display_width("\U0001f680")]))
+        check("display width ignores combining marks",
+              _display_width("é") == 1)
+        check("padding lines up a CJK cell with an ASCII one",
+              _display_width(_pad("日本", 8)) == _display_width(_pad("ab", 8)) == 8,
+              str([_display_width(_pad("日本", 8)), _display_width(_pad("ab", 8))]))
+        check("clipping counts columns, not code points",
+              _display_width(_clip("日本語日本語日本語", 10)) <= 10,
+              repr(_clip("日本語日本語日本語", 10)))
+
         # ---- a corrupt nicknames file is preserved, not destroyed ---------
         from alpacca.store import _nicknames_file, _read_nicknames
         nick_home = os.environ.get("ALPACCA_HOME")
@@ -1183,6 +1198,21 @@ def main() -> None:
                       f"sequential (diff {g3_ch_diff:.2e})",
                       g3_ch_diff < 1e-5 and g3_ch.n_past == len(g3_ids),
                       str(g3_ch_diff))
+            # prefill discards every chunk's logits but the last, and on a
+            # tied 262144-row head that projection is ~218 ms of wasted work
+            # per chunk on the real model
+            g3_skip = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+            check("forward_batch can skip the output projection",
+                  g3_skip.forward_batch(g3_ids[:4], want_logits=False) is None and
+                  g3_skip.n_past == 4)
+            g3_skip_logits = g3_skip.forward_batch(g3_ids[4:], want_logits=True)
+            g3_skip_diff = max(abs(float(a) - float(b))
+                               for a, b in zip(T.to_list(g3_last),
+                                               T.to_list(g3_skip_logits)))
+            check(f"skipping the projection does not change the answer "
+                  f"(diff {g3_skip_diff:.2e})", g3_skip_diff < 1e-5,
+                  str(g3_skip_diff))
+
             # prefix reuse: re-prefilling a shared prefix must not change the
             # answer, and must actually reuse the cache rather than redo it
             g3_re = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
@@ -1757,6 +1787,10 @@ def main() -> None:
               r.stdout + r.stderr)
         r = run_cli("list", env=env)
         check("list shows model nickname", "Tiny Buddy" in r.stdout, r.stdout)
+        r = run_cli("nickname", "--list", env=env)
+        check("nickname --list shows every alias and its target",
+              "Tiny Buddy" in r.stdout and "tiny" in r.stdout,
+              r.stdout + r.stderr)
         r = run_cli("show", "Tiny Buddy", env=env)
         check("show resolves model nickname",
               '"name": "tiny"' in r.stdout and '"nickname": "Tiny Buddy"' in r.stdout,
@@ -1961,7 +1995,7 @@ def main() -> None:
                          env={**env, "ALPACCA_DENSE_WEIGHT_MB": "0"})
             check("ALPACCA_DENSE_WEIGHT_MB=0 keeps the CLI fully quantized",
                   "auto dense-weight budget:" not in r0.stderr and
-                  "weights quantized Q4_0 (16 matrices)" in r0.stderr,
+                  "weights quantized Q4_0 (16 matrices," in r0.stderr,
                   r0.stderr[-500:])
         else:
             check("pure backend skips the auto dense-weight budget",

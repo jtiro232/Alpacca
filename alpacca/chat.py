@@ -21,6 +21,17 @@ _FORMAT_NEEDLES = [
     ("<|user|>", "zephyr"),
 ]
 
+# Pieces that open a turn. If the model emits one it has started speaking as
+# somebody else and its own reply is over. They are control tokens, so they
+# decode to empty text and a stop *string* can never catch them - without this
+# a runaway turn silently role-plays the user with no visible separator.
+_FORMAT_TURN_STARTS = {
+    "llama3": ("<|start_header_id|>",),
+    "chatml": ("<|im_start|>",),
+    "gemma": ("<start_of_turn>",),
+    "zephyr": ("<|user|>", "<|system|>"),
+}
+
 
 def detect_format(metadata: dict) -> str:
     template = str(metadata.get("tokenizer.chat_template", ""))
@@ -42,6 +53,15 @@ class ChatFormat:
     def _special(self, piece: str) -> list[int]:
         tid = self.model.tok.token_id(piece)
         return [tid] if tid >= 0 else self._ids(piece)
+
+    def stop_tokens(self) -> set[int]:
+        """Token ids that end the assistant's turn on top of the EOG set."""
+        out = set()
+        for piece in _FORMAT_TURN_STARTS.get(self.name, ()):
+            tid = self.model.tok.token_id(piece)
+            if tid >= 0:
+                out.add(tid)
+        return out
 
     def render(self, messages: list[dict], add_generation_prompt: bool = True) -> list[int]:
         tok = self.model.tok
@@ -148,8 +168,8 @@ class GenerationResult:
 
 
 def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
-             n_predict: int = -1, stream=None, stop_strings: list[str] | None = None
-             ) -> GenerationResult:
+             n_predict: int = -1, stream=None, stop_strings: list[str] | None = None,
+             stop_tokens: set[int] | None = None) -> GenerationResult:
     """Generate until EOG / n_predict / a stop string. `stream` is an
     optional callable receiving text fragments as they decode."""
     if not prompt_ids:
@@ -183,6 +203,9 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
         sampler.accept(tid)
         if model.tok.is_eog(tid):
             break  # never forwarded into the cache, so never counted either
+        if stop_tokens and tid in stop_tokens:
+            reason = "stop"
+            break
         n_tokens += 1
         text += dec.feed(tid)
         if stop_strings:
@@ -239,7 +262,8 @@ def chat_once(model: Model, messages: list[dict], params: SamplerParams,
               stop_strings: list[str] | None = None) -> GenerationResult:
     fmt = ChatFormat(model, detect_format(model.metadata))
     ids = fmt.render(messages)
-    return generate(model, ids, params, n_predict, stream, stop_strings)
+    return generate(model, ids, params, n_predict, stream, stop_strings,
+                    stop_tokens=fmt.stop_tokens())
 
 
 def _read_chat_line(prompt: str = "> ", stdin: TextIO | None = None,
@@ -395,7 +419,8 @@ def interactive(model: Model, params: SamplerParams, system: str = "",
                       file=sys.stderr)
             try:
                 res = generate(model, ids, params, n_predict,
-                               stream=lambda s: print(s, end="", flush=True))
+                               stream=lambda s: print(s, end="", flush=True),
+                               stop_tokens=fmt.stop_tokens())
             except RuntimeError as e:
                 # the prompt does not fit even on its own - stay in the REPL
                 messages.pop()
