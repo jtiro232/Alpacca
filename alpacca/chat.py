@@ -135,6 +135,12 @@ class GenerationResult:
     text: str
     tokens: int
     seconds: float
+    prompt_tokens: int = 0
+    # why generation ended: "eog" (the model finished), "stop" (a stop string
+    # matched), "length" (the n_predict budget ran out) or "context" (no room
+    # left in the context window). "context" with tokens == 0 is the caller's
+    # signal that the prompt itself left nothing to generate into.
+    stop_reason: str = "eog"
 
     @property
     def tok_per_sec(self) -> float:
@@ -162,7 +168,14 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
     budget = n_predict if n_predict and n_predict > 0 else (model.n_ctx - model.n_past)
 
     text = ""
-    while n_tokens < budget and model.n_past < model.n_ctx:
+    reason = "eog"
+    while True:
+        if model.n_past >= model.n_ctx:
+            reason = "context"   # checked first: no room beats no budget
+            break
+        if n_tokens >= budget:
+            reason = "length"
+            break
         tid = sampler.sample(logits)
         sampler.accept(tid)
         if model.tok.is_eog(tid):
@@ -173,17 +186,20 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             hit = next((s for s in stop_strings if s and s in text), None)
             if hit:
                 text = text[:text.index(hit)]
+                reason = "stop"
                 break
         if stream is not None and len(text) > emitted:
             stream(text[emitted:])
             emitted = len(text)
         if n_tokens >= budget:
+            reason = "length"
             break
         logits = model.forward(tid)
     text += dec.flush()
     if stream is not None and len(text) > emitted:
         stream(text[emitted:])
-    return GenerationResult(text=text, tokens=n_tokens, seconds=time.time() - t0)
+    return GenerationResult(text=text, tokens=n_tokens, seconds=time.time() - t0,
+                            prompt_tokens=len(prompt_ids), stop_reason=reason)
 
 
 def chat_once(model: Model, messages: list[dict], params: SamplerParams,

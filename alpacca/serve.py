@@ -62,9 +62,30 @@ def _params_from(body: dict, defaults: SamplerParams) -> SamplerParams:
     )
 
 
-def _finish_reason(tokens: int, n_predict: int) -> str:
-    """OpenAI semantics: "length" when the token budget ran out, else "stop"."""
-    return "length" if n_predict > 0 and tokens >= n_predict else "stop"
+def _finish_reason(res) -> str:
+    """OpenAI semantics: "length" when the answer was cut short, else "stop".
+
+    Both budgets count as "length": the n_predict one and the context window.
+    Inferring this from the token count alone gets both edges wrong - a stop
+    string landing on the budget-th token is a clean stop, and running out of
+    context is a truncation no matter how few tokens were asked for.
+    """
+    return "length" if res.stop_reason in ("length", "context") else "stop"
+
+
+def _messages_from(body: dict) -> list[dict]:
+    """Validate before rendering: ChatFormat indexes role/content directly, and
+    a KeyError escaping the handler drops the socket with no response."""
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages required")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            raise ValueError(f"messages[{i}] must be an object")
+        for key in ("role", "content"):
+            if not isinstance(m.get(key), str):
+                raise ValueError(f"messages[{i}].{key} must be a string")
+    return messages
 
 
 def _stop_from(body: dict) -> list[str]:
@@ -119,8 +140,11 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
         def do_POST(self):
             path = self.path.split("?")[0]
-            body = self.read_body()
             try:
+                # inside the try: a bad Content-Length or a body that is not
+                # UTF-8 both raise ValueError, and outside it they would take
+                # the socket down without any HTTP response at all
+                body = self.read_body()
                 if path == "/v1/chat/completions":
                     return self.chat_completions(body)
                 if path == "/completion":
@@ -149,9 +173,7 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             })
 
         def chat_completions(self, body: dict):
-            messages = body.get("messages") or []
-            if not isinstance(messages, list) or not messages:
-                return self.send_json({"error": "messages required"}, 400)
+            messages = _messages_from(body)
             params = _params_from(body, defaults)
             n_predict = _int_param(body, ("max_tokens", "max_completion_tokens"), 512)
             stop = _stop_from(body)
@@ -177,36 +199,40 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
                 piece({"role": "assistant"})
                 try:
-                    with lock:
-                        res = chat.chat_once(model, messages, params, n_predict,
-                                             stream=lambda s: piece({"content": s}),
-                                             stop_strings=stop)
-                    finish = _finish_reason(res.tokens, n_predict)
-                except (TypeError, ValueError, RuntimeError) as e:
-                    # the 200 and the first delta are already on the wire, so
-                    # close the stream cleanly instead of dropping the socket
-                    piece({"content": ""}, finish="error")
-                    chunk({"error": {"message": str(e), "type": "invalid_request_error"}})
-                    finish = None
-                if finish is not None:
-                    piece({}, finish=finish)
-                tail = b"data: [DONE]\n\n"
-                self.wfile.write(f"{len(tail):x}\r\n".encode() + tail + b"\r\n")
-                self.wfile.write(b"0\r\n\r\n")
+                    try:
+                        with lock:
+                            res = chat.chat_once(model, messages, params, n_predict,
+                                                 stream=lambda s: piece({"content": s}),
+                                                 stop_strings=stop)
+                        piece({}, finish=_finish_reason(res))
+                    except Exception as e:
+                        # the 200 and the first delta are already on the wire, so
+                        # any failure has to close the stream rather than drop the
+                        # socket and leave the client on an unterminated body
+                        self.log_message("stream failed: %r", e)
+                        piece({"content": ""}, finish="length")
+                        chunk({"error": {"message": str(e),
+                                         "type": "invalid_request_error"}})
+                finally:
+                    tail = b"data: [DONE]\n\n"
+                    self.wfile.write(f"{len(tail):x}\r\n".encode() + tail + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
                 return
 
             with lock:
                 res = chat.chat_once(model, messages, params, n_predict, stop_strings=stop)
-            prompt_tokens = max(0, model.n_past - res.tokens)
             self.send_json({
                 "id": rid, "object": "chat.completion", "created": created,
                 "model": model_name,
                 "choices": [{"index": 0,
-                             "finish_reason": _finish_reason(res.tokens, n_predict),
+                             "finish_reason": _finish_reason(res),
                              "message": {"role": "assistant", "content": res.text}}],
-                "usage": {"prompt_tokens": prompt_tokens,
+                # counted by generate(), not inferred from n_past: the last
+                # sampled token is never forwarded into the cache, so n_past
+                # under-reports the prompt by one on every truncated answer
+                "usage": {"prompt_tokens": res.prompt_tokens,
                           "completion_tokens": res.tokens,
-                          "total_tokens": prompt_tokens + res.tokens},
+                          "total_tokens": res.prompt_tokens + res.tokens},
             })
 
     httpd = _Server((host, port), Handler)

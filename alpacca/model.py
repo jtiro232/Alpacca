@@ -266,13 +266,12 @@ class Model:
                             "gemma3.attention.sliding_window_pattern has "
                             f"{len(pattern)} entries, expected {n_layer}")
                     sliding_layers = tuple(bool(v) for v in pattern)
-                elif isinstance(pattern, bool) or (pattern is not None
-                                                   and int(pattern) <= 1):
-                    # a scalar bool (or 0/1) is not a period: int(True) == 1
-                    # makes every layer full-attention and silently disables
-                    # sliding-window attention entirely
-                    full_attention_period = int(meta("full_attention_interval", 6) or 6)
                 elif pattern is not None:
+                    # a scalar is a period, llama.cpp's set_swa_pattern:
+                    #   is_swa[i] = n == 0 or (i % n < n - 1)
+                    # so 1 means "no sliding window at all" and 0 means "every
+                    # layer slides". A converter writes 1 for exactly the
+                    # models that have no SWA, so do not second-guess it.
                     full_attention_period = int(pattern)
                 else:
                     full_attention_period = int(meta("full_attention_interval", 6) or 6)
@@ -675,8 +674,10 @@ class Model:
             return False
         if hp.sliding_layers:
             return hp.sliding_layers[layer_index]
-        return (hp.full_attention_period > 0 and
-                (layer_index + 1) % hp.full_attention_period != 0)
+        if hp.full_attention_period <= 0:
+            # llama.cpp reads a period of 0 as "every layer slides"
+            return hp.arch == "gemma3"
+        return (layer_index + 1) % hp.full_attention_period != 0
 
     def _rope_np_gemma3(self, vec, n_heads: int, pos: int, sliding: bool):
         cos = self._rope_cos_swa if sliding else self._rope_cos

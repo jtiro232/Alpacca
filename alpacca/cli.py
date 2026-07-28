@@ -254,7 +254,9 @@ def cmd_show(args) -> int:
     if local is None:
         raise SystemExit(f"alpacca: {ref.display()} is not installed")
     manifest = dict(local.manifest or {"model_file": str(local.model_path)})
-    nickname = nickname_for_model(ref.display())
+    # a file ref's display() is a bare path, which re-parses as a registry
+    # name - so `alpacca show ./tiny` would claim the registry model's alias
+    nickname = "" if ref.source == "file" else nickname_for_model(ref.display())
     if nickname:
         manifest["nickname"] = nickname
     print(json.dumps(manifest, indent=2))

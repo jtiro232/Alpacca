@@ -34,6 +34,11 @@ def _topk_indices(logits: list, k: int) -> list[int]:
         import numpy as np
 
         arr = np.asarray(logits, dtype=np.float64)
+        if np.isnan(arr).any():
+            # NaN sorts as the largest value for argpartition but compares
+            # False against everything, so the masks below would select
+            # nothing and hand the caller an empty list. Infinities are fine.
+            return sorted(range(n), key=logits.__getitem__, reverse=True)[:k]
         # argpartition alone is not enough: when logits tie across the cut it
         # keeps an arbitrary one, where the stable sort keeps the lowest index.
         # So take everything strictly above the k-th value, then fill from the

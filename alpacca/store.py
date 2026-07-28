@@ -55,7 +55,9 @@ class ModelRef:
         if self.source == "hf":
             s = f"hf:{self.ns}/{self.name}"
             return f"{s}:{self.tag}" if self.tag else s
-        s = self.name if self.ns == "library" else f"{self.ns}/{self.name}"
+        # must re-parse to the same ref: a bare "ns/name" is read as Hugging
+        # Face, so a non-library namespace has to keep its disambiguator
+        s = self.name if self.ns == "library" else f"ollama:{self.ns}/{self.name}"
         return f"{s}:{self.tag}" if self.tag != "latest" else s
 
     def store_dir(self) -> Path:
@@ -148,9 +150,11 @@ def write_manifest(d: Path, manifest: dict) -> None:
 
 def _clean_nickname(nickname: str) -> str:
     # nicknames are echoed to a terminal and written into JSON, so replace
-    # control characters with spaces before they can be stored - notably ESC,
-    # which would otherwise let a nickname emit ANSI escape sequences
-    text = "".join(" " if unicodedata.category(ch) == "Cc" else ch
+    # anything invisible or direction-changing with a space before it can be
+    # stored: Cc for ESC (which would emit ANSI escape sequences), Cf for the
+    # bidi overrides that reorder the rest of the line and for zero-width
+    # joiners, and Cs for lone surrogates arriving from argv
+    text = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf", "Cs") else ch
                    for ch in str(nickname))
     return " ".join(text.strip().split())
 
@@ -158,7 +162,9 @@ def _clean_nickname(nickname: str) -> str:
 def _read_nicknames() -> dict[str, str]:
     try:
         data = json.loads(_nicknames_file().read_text("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        # RecursionError is a RuntimeError, not a ValueError: deeply nested
+        # JSON would otherwise fail every command that touches the map
         return {}
     if isinstance(data, dict) and isinstance(data.get("nicknames"), dict):
         data = data["nicknames"]
@@ -419,12 +425,17 @@ def remove_model(ref: ModelRef) -> bool:
     for f in sorted(d.rglob("*"), reverse=True):
         f.unlink() if f.is_file() else f.rmdir()
     d.rmdir()
-    try:  # the model is already gone; never report rm as failed over an alias
+    # the model is already gone, so nothing below here may report rm as failed:
+    # not the alias bookkeeping, and not pruning the now-empty parents
+    try:
         _remove_nicknames_for_model(name)
     except OSError:
         pass
-    parent = d.parent
-    while parent != models_root() and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
-        parent = parent.parent
+    try:
+        parent = d.parent
+        while parent != models_root() and parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    except OSError:
+        pass
     return True

@@ -627,6 +627,111 @@ def main() -> None:
             check(f"numpy grouped attention matches per-head loop (diff {aerr:.2e})",
                   aerr < 1e-6)
 
+        # ---- top-k selection ---------------------------------------------
+        # This had no direct coverage at all, which is how a first version
+        # that lost the tie-break at the cut passed the whole suite.
+        import random
+        from alpacca.sample import Sampler, SamplerParams, _topk_indices
+
+        def topk_ref(vals, k):
+            return sorted(range(len(vals)), key=vals.__getitem__,
+                          reverse=True)[:k]
+
+        topk_bad = []
+        rng_tk = random.Random(7)
+        for trial in range(300):
+            n = rng_tk.choice([1, 2, 3, 8, 40, 257])
+            # a small alphabet on purpose: ties across the cut are the bug
+            vals = [float(rng_tk.randrange(4)) for _ in range(n)]
+            for k in {1, 2, n // 2 or 1, n - 1 or 1, n, n + 3}:
+                if k < 1:
+                    continue
+                got = _topk_indices(vals, k)
+                if got != topk_ref(vals, min(k, n)):
+                    topk_bad.append((vals, k, got))
+        check("top-k matches the stable descending sort, ties included",
+              not topk_bad, str(topk_bad[:2]))
+        check("top-k on all-equal logits keeps ascending index order",
+              _topk_indices([1.0] * 64, 5) == [0, 1, 2, 3, 4],
+              str(_topk_indices([1.0] * 64, 5)))
+        check("top-k with k >= n returns every index",
+              _topk_indices([3.0, 1.0, 2.0], 9) == [0, 2, 1])
+        check("top-k handles infinities",
+              _topk_indices([float("-inf"), 1.0, float("inf"), 1.0], 3) ==
+              [2, 1, 3], str(_topk_indices([float("-inf"), 1.0,
+                                            float("inf"), 1.0], 3)))
+        nan_top = _topk_indices([1.0] * 99 + [float("nan")], 40)
+        check("top-k returns k indices even when a logit is NaN",
+              len(nan_top) == 40, str(len(nan_top)))
+        nan_sampled = Sampler(SamplerParams(temperature=0.8, seed=1)).sample(
+            [1.0] * 99 + [float("nan")])
+        check("sampling a NaN logit vector does not raise",
+              isinstance(nan_sampled, int))
+
+        # ---- generation stop reasons -------------------------------------
+        from alpacca.chat import GenerationResult
+        from alpacca.serve import _finish_reason, _messages_from
+        check("finish_reason maps a spent budget to length",
+              _finish_reason(GenerationResult("", 4, 0.1, stop_reason="length"))
+              == "length")
+        check("finish_reason maps a full context window to length",
+              _finish_reason(GenerationResult("", 0, 0.1, stop_reason="context"))
+              == "length")
+        check("finish_reason maps a stop string to stop",
+              _finish_reason(GenerationResult("", 4, 0.1, stop_reason="stop"))
+              == "stop")
+        check("finish_reason maps end-of-generation to stop",
+              _finish_reason(GenerationResult("", 4, 0.1, stop_reason="eog"))
+              == "stop")
+        # ---- model reference round-tripping ------------------------------
+        from alpacca.store import _clean_nickname, parse_model_ref
+        round_trip = ["llama3.2:1b", "llama3.2", "ollama:user/name:tag",
+                      "ollama:user/name", "hf:org/repo", "hf:org/repo:Q4_K_M",
+                      "org/repo"]
+        rt_bad = []
+        for raw in round_trip:
+            ref = parse_model_ref(raw)
+            again = parse_model_ref(ref.display())
+            if (again.source, again.ns, again.name, again.tag) != \
+                    (ref.source, ref.ns, ref.name, ref.tag):
+                rt_bad.append((raw, ref.display(), again.source))
+        check("every model reference survives display() -> parse_model_ref",
+              not rt_bad, str(rt_bad))
+        check("a non-library ollama ref keeps its disambiguator",
+              parse_model_ref("ollama:user/name:tag").display() ==
+              "ollama:user/name:tag",
+              parse_model_ref("ollama:user/name:tag").display())
+
+        # ---- nickname sanitizing -----------------------------------------
+        check("nickname sanitizing strips ANSI escapes",
+              _clean_nickname("a\x1b[31mred") == "a [31mred",
+              repr(_clean_nickname("a\x1b[31mred")))
+        check("nickname sanitizing strips bidi overrides and zero-width chars",
+              _clean_nickname("safe‮gpj.exe") == "safe gpj.exe" and
+              _clean_nickname("a​b") == "a b" and
+              _clean_nickname("a﻿b") == "a b",
+              repr(_clean_nickname("safe‮gpj.exe")))
+        check("a nickname made only of invisible characters cleans to empty",
+              _clean_nickname("‮​⁦") == "",
+              repr(_clean_nickname("‮​⁦")))
+        check("nickname sanitizing strips lone surrogates",
+              _clean_nickname("a\udc80b") == "a b",
+              repr(_clean_nickname("a\udc80b")))
+
+        bad_messages = [{"messages": [{"role": "user"}]},
+                        {"messages": [{"content": "hi"}]},
+                        {"messages": [{"role": "user", "content": None}]},
+                        {"messages": ["hi"]},
+                        {"messages": []}]
+        rejected = 0
+        for payload in bad_messages:
+            try:
+                _messages_from(payload)
+            except ValueError:
+                rejected += 1
+        check("serve rejects malformed messages instead of raising KeyError",
+              rejected == len(bad_messages), str(rejected))
+
         from alpacca.tokenizer import pretokenize
         toks = pretokenize("Hello there, world! It's 2026...\n  indented")
         check("BPE pretokenizer splits text", "".join(toks) == "Hello there, world! It's 2026...\n  indented",
