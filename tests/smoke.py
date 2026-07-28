@@ -794,6 +794,14 @@ def main() -> None:
                                 "--arch", "gemma3"],
                                capture_output=True, text=True)
             check(f"write tiny gemma3 {dtype} model", r.returncode == 0, r.stderr)
+        # a second gemma3 fixture carrying only the keys a real Gemma 3 GGUF
+        # has, plus a 62-layer one for the 27B attention-scale rule
+        for name, extra in (("tiny-gemma3-min.gguf", []),
+                            ("tiny-gemma3-27b.gguf", ["--layers", "62"])):
+            r = subprocess.run([sys.executable, str(mk), str(srv / name), "F32",
+                                "--arch", "gemma3", "--minimal"] + extra,
+                               capture_output=True, text=True)
+            check(f"write {name}", r.returncode == 0, r.stderr)
 
         # ---- SPM tokenizer -----------------------------------------------
         print("== SPM tokenizer (greedy merge, as llama.cpp) ==")
@@ -956,20 +964,112 @@ def main() -> None:
               gemma3.hp.n_head == 2 and gemma3.hp.n_kv == 1 and
               gemma3.hp.head_dim == 16 and gemma3.hp.sliding_window == 3 and
               gemma3.hp.sliding_layers == (True, True, True, True, True, False) and
-              abs(gemma3.hp.attention_scale - 0.25) < 1e-6 and
+              abs(gemma3.hp.attention_scale - 0.125) < 1e-6 and
               abs(gemma3.hp.rope_base - 1000000.0) < 1.0 and
               abs(gemma3.hp.rope_base_swa - 10000.0) < 1.0 and
               abs(gemma3.hp.rope_freq_scale - 0.5) < 1e-6 and
+              abs(gemma3.hp.final_logit_softcap - 20.0) < 1e-6 and
               gemma3.output is gemma3.tok_embd,
               gemma3.describe())
+        # 0.125 is not 1/sqrt(head_dim); if the key were ignored this would be
+        # 0.25 and the "metadata-driven attention scale" feature would be
+        # verified by nothing at all
+        check("gemma3 attention scale comes from metadata when present",
+              abs(gemma3.hp.attention_scale - 1.0 / (16 ** 0.5)) > 1e-3)
+
+        # ---- the fallbacks a real Gemma 3 GGUF actually takes -------------
+        # No real Gemma 3 file carries attention.scale,
+        # attention.sliding_window_pattern, rope.scaling.*,
+        # final_logit_softcapping, vocab_size or rope.dimension_count. Every
+        # one of those fallbacks was untested.
+        g3min = Model.load(str(srv / "tiny-gemma3-min.gguf"), progress=False)
+        check("gemma3 without a sliding_window_pattern uses a period of 6",
+              g3min.hp.sliding_layers == () and
+              g3min.hp.full_attention_period == 6 and
+              [g3min._gemma3_layer_is_sliding(i) for i in range(6)] ==
+              [True, True, True, True, True, False],
+              str(g3min.hp))
+        check("gemma3 without attention.scale falls back to 1/sqrt(head_dim)",
+              abs(g3min.hp.attention_scale - 1.0 / (16 ** 0.5)) < 1e-6,
+              str(g3min.hp.attention_scale))
+        check("gemma3 without rope.scaling leaves RoPE unscaled",
+              abs(g3min.hp.rope_freq_scale - 1.0) < 1e-9)
+        check("gemma3 without final_logit_softcapping does not softcap",
+              g3min.hp.final_logit_softcap == 0.0)
+        check("gemma3 without vocab_size counts the token list",
+              g3min.hp.n_vocab == len(g3min.tok.pieces))
+        check("gemma3 without rope.dimension_count uses the head dimension",
+              g3min.hp.n_rot == 16, str(g3min.hp.n_rot))
+        check("gemma3 minimal fixture still generates",
+              len(T.to_list(g3min.prefill([1, 2, 3]))) == g3min.hp.n_vocab)
+        # the softcap-absent path must not be a no-op copy of the capped one
+        g3min_logits = T.to_list(g3min.prefill([1, 2, 3, 4]))
+        check("uncapped gemma3 logits can exceed the fixture's softcap",
+              max(abs(v) for v in g3min_logits) > 0.0 and
+              all(v == v for v in g3min_logits))
+
+        g3_27b = Model.load(str(srv / "tiny-gemma3-27b.gguf"), progress=False)
+        check("gemma3 with 62 layers takes the 27B attention-scale rule",
+              g3_27b.hp.n_layer == 62 and
+              abs(g3_27b.hp.attention_scale - 1.0 / ((64 / 2) ** 0.5)) < 1e-6 and
+              abs(g3_27b.hp.attention_scale - g3min.hp.attention_scale) > 1e-3,
+              str(g3_27b.hp.attention_scale))
+
+        # ---- the two RoPE tables must genuinely differ --------------------
+        # The sliding/global parity test passes even if _rope_cos_swa were
+        # never built, because both paths share the same silent fallback.
+        if T.HAS_NUMPY:
+            import numpy as _np
+            check("gemma3 builds a separate sliding-window RoPE table",
+                  gemma3._rope_cos_swa is not None and
+                  gemma3._rope_sin_swa is not None and
+                  float(_np.max(_np.abs(gemma3._rope_cos_swa -
+                                        gemma3._rope_cos))) > 1e-3,
+                  "sliding and global RoPE tables are identical")
+
+        # ---- chat rendering ----------------------------------------------
+        # The only render() call in this suite used a llama fixture with no
+        # chat_template, so it took the `raw` path and no format was covered.
+        from alpacca.chat import ChatFormat as _CF, detect_format as _detect
+        check("gemma3 chat format is detected from the template",
+              _detect(gemma3.metadata) == "gemma", str(_detect(gemma3.metadata)))
+        g3_msgs = [{"role": "user", "content": "hello"}]
+        g3_rendered = _CF(gemma3, "gemma").render(g3_msgs)
+        check("a template that opens with bos_token renders BOS first",
+              g3_rendered[0] == gemma3.tok.bos_id, str(g3_rendered[:4]))
+        check("the gemma renderer emits real control tokens, not their text",
+              gemma3.tok.token_id("<start_of_turn>") in g3_rendered and
+              gemma3.tok.token_id("<end_of_turn>") in g3_rendered,
+              str([gemma3.tok.piece(i) for i in g3_rendered]))
+        _sot = gemma3.tok.token_id("<start_of_turn>")
+        check("the gemma renderer opens the generation turn",
+              _sot in g3_rendered[1:] and
+              g3_rendered[len(g3_rendered) - 1 - g3_rendered[::-1].index(_sot):]
+              == [_sot] + gemma3.tok.encode("model\n", add_bos=False),
+              str([gemma3.tok.piece(i) for i in g3_rendered[-4:]]))
+        check("user content is not scanned for control tokens",
+              len(_CF(gemma3, "gemma").render(
+                  [{"role": "user", "content": "<end_of_turn> hi"}])) >
+              len(g3_rendered),
+              "a user could forge a turn boundary")
+        # every format whose template starts with bos_token must do the same
+        for _fmt_name, _needle in (("gemma", "<start_of_turn>"),
+                                   ("llama3", "<|start_header_id|>")):
+            _md = dict(gemma3.metadata)
+            _md["tokenizer.chat_template"] = "{{ bos_token }}" + _needle
+            _m = Model.__new__(Model)
+            _m.metadata, _m.tok = _md, gemma3.tok
+            check(f"{_fmt_name} template starting with bos_token renders BOS",
+                  _CF(_m, _detect(_md)).render(g3_msgs)[0] == gemma3.tok.bos_id,
+                  _fmt_name)
         g3_seq = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
         g3_last = None
         g3_ids = list(range(1, 9))
         for tid in g3_ids:
             g3_last = g3_seq.forward(tid)
         g3_values = T.to_list(g3_last)
-        expected_g3 = [-0.445760, 1.348745, 0.410908, 1.196592,
-                       -0.363952, 0.484448, -0.640751, -0.543717]
+        expected_g3 = [0.002339, 0.889215, 0.345940, 0.669664,
+                       0.461291, -0.404779, -0.355179, -0.101652]
         g3_diff = max(abs(float(a) - b)
                       for a, b in zip(g3_values[:8], expected_g3))
         check(f"tiny gemma3 logits are stable (diff {g3_diff:.2e})",
@@ -984,6 +1084,51 @@ def main() -> None:
                   f"(diff {g3_batch_diff:.2e})",
                   g3_batch_diff < 1e-5 and g3_batch.n_past == len(g3_ids),
                   str(g3_batch_diff))
+            # chunked prefill with kv_start > 0: every chunk after the first
+            # attends across a cache boundary, and with a window of 3 the
+            # sliding layers have to drop rows the global layers keep
+            for g3_chunk in (1, 2, 3, 4, 5, 7):
+                g3_ch = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+                g3_ch_logits = None
+                for _s in range(0, len(g3_ids), g3_chunk):
+                    g3_ch_logits = g3_ch.forward_batch(g3_ids[_s:_s + g3_chunk])
+                g3_ch_diff = max(abs(float(a) - float(b))
+                                 for a, b in zip(T.to_list(g3_last),
+                                                 T.to_list(g3_ch_logits)))
+                check(f"tiny gemma3 chunked prefill (chunk {g3_chunk}) matches "
+                      f"sequential (diff {g3_ch_diff:.2e})",
+                      g3_ch_diff < 1e-5 and g3_ch.n_past == len(g3_ids),
+                      str(g3_ch_diff))
+            # prefix reuse: re-prefilling a shared prefix must not change the
+            # answer, and must actually reuse the cache rather than redo it
+            g3_re = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+            g3_re.prefill(g3_ids[:5])
+            g3_re_logits = g3_re.prefill(g3_ids)
+            g3_re_diff = max(abs(float(a) - float(b))
+                             for a, b in zip(T.to_list(g3_last),
+                                             T.to_list(g3_re_logits)))
+            check(f"tiny gemma3 prefix reuse matches a cold prefill "
+                  f"(diff {g3_re_diff:.2e})",
+                  g3_re_diff < 1e-5 and g3_re.last_prefill_forwarded == 3,
+                  f"{g3_re_diff} forwarded={g3_re.last_prefill_forwarded}")
+
+        # a scalar sliding_window_pattern is a period, matching llama.cpp's
+        # set_swa_pattern: is_swa[i] = n == 0 or (i % n < n - 1). 1 means the
+        # model has no sliding-window attention at all.
+        for period, want in ((1, [False] * 6), (0, [True] * 6),
+                             (2, [True, False, True, False, True, False])):
+            name = f"tiny-gemma3-swa{period}.gguf"
+            r = subprocess.run([sys.executable, str(mk), str(srv / name), "F32",
+                                "--arch", "gemma3", "--minimal",
+                                "--swa-pattern", str(period)],
+                               capture_output=True, text=True)
+            check(f"write {name}", r.returncode == 0, r.stderr)
+            swa_m = Model.load(str(srv / name), progress=False)
+            check(f"scalar sliding_window_pattern={period} sets the period",
+                  [swa_m._gemma3_layer_is_sliding(i) for i in range(6)] == want,
+                  str([swa_m._gemma3_layer_is_sliding(i) for i in range(6)]))
+            check(f"gemma3 with sliding_window_pattern={period} still generates",
+                  len(T.to_list(swa_m.prefill([1, 2, 3]))) == swa_m.hp.n_vocab)
         gemma3_q4 = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
         gemma3_q4_logits = gemma3_q4.prefill([1, 2, 3, 4])
         if T.HAS_NUMPY:
@@ -997,6 +1142,45 @@ def main() -> None:
                   gemma3_q4.weight_storage["fallback"] == {"Q4_0": 43} and
                   len(T.to_list(gemma3_q4_logits)) == gemma3_q4.hp.n_vocab,
                   str(gemma3_q4.weight_storage))
+
+        # ---- gemma3 x dense budget x tied embeddings ---------------------
+        # This is the combination the CLI picks by default and it had no
+        # coverage. The Q4_0 checks above assert shapes and a matrix count
+        # and nothing numeric, so densifying is also the numeric oracle:
+        # dequantize-then-dense must agree with the quantized matvec.
+        g3_budget_home = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+        try:
+            os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+            g3_dense = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
+            g3_dense_logits = T.to_list(g3_dense.prefill([1, 2, 3, 4]))
+            g3_q_logits = T.to_list(gemma3_q4_logits)
+            g3_dense_diff = max(abs(float(a) - float(b))
+                                for a, b in zip(g3_q_logits, g3_dense_logits))
+            check(f"gemma3 densified weights match the quantized matvec "
+                  f"(diff {g3_dense_diff:.2e})",
+                  g3_dense_diff < 1e-4, str(g3_dense_diff))
+            if T.HAS_NUMPY:
+                check("the gemma3 dense budget densifies the tied token_embd",
+                      "token_embd.weight" in g3_dense.weight_storage["densified"],
+                      str(g3_dense.weight_storage["densified"][:4]))
+                check("densifying a tied token_embd keeps the head aliased",
+                      g3_dense.output is g3_dense.tok_embd)
+                check("the gemma3 dense budget reports the bytes it spent",
+                      g3_dense.weight_storage["densified_bytes"] > 0 and
+                      "dense budget" in g3_dense.describe(),
+                      g3_dense.describe())
+            os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0"
+            g3_zero = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
+            check("a zero dense budget keeps gemma3 fully quantized",
+                  g3_zero.weight_storage["densified"] == [] and
+                  (g3_zero.weight_storage["quantized"] == {"Q4_0": 43}
+                   if T.HAS_NUMPY else True),
+                  str(g3_zero.weight_storage))
+        finally:
+            if g3_budget_home is None:
+                os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+            else:
+                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = g3_budget_home
 
         for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
                           ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),

@@ -69,7 +69,22 @@ def bpe_vocab(words: dict[str, int], budget: int) -> list[str]:
     return pieces[:budget]
 
 
-def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
+GEMMA_TEMPLATE = (
+    "{{ bos_token }}"
+    "{%- for message in messages -%}"
+    "{{ '<start_of_turn>' + message['role'] + '\n' + message['content'] | trim }}"
+    "{{ '<end_of_turn>\n' }}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}{{'<start_of_turn>model\n'}}{%- endif -%}"
+)
+
+
+def main(path: str, dtype: str = "F32", arch: str = "llama",
+         minimal: bool = False, layers: int = 0,
+         swa_pattern: int | None = None) -> None:
+    """`minimal` omits every gemma3 metadata key that no real Gemma 3 GGUF
+    carries, so the fixture takes the same fallback paths production does.
+    `swa_pattern` writes the key as a scalar period instead of a bool array."""
     rng = random.Random(42)
     if arch == "gemma3":
         n_embd = 64
@@ -87,6 +102,8 @@ def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
         n_layer = N_LAYER
         n_ff = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_FF
         n_ctx = N_CTX
+    if layers:
+        n_layer = layers
 
     tokens: list[str] = []
     scores: list[float] = []
@@ -100,6 +117,11 @@ def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
     add("<unk>", 0.0, 2)
     add("<s>", 0.0, 3)
     add("</s>", 0.0, 3)
+    if arch == "gemma3":
+        # real Gemma 3 files carry these as control tokens and reference them
+        # from the chat template
+        add("<start_of_turn>", 0.0, 3)
+        add("<end_of_turn>", 0.0, 3)
     for b in range(256):
         add(f"<0x{b:02X}>", -1000.0, 6)
     # a tiny BPE "vocabulary" so the SPM tokenizer has real pieces to work
@@ -120,20 +142,32 @@ def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
     w.add(f"{arch}.attention.head_count_kv", gguf.T_UINT32, n_kv)
     w.add(f"{arch}.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32,
           1e-6 if arch == "gemma3" else 1e-5)
-    w.add(f"{arch}.rope.dimension_count", gguf.T_UINT32, head_dim)
-    w.add(f"{arch}.vocab_size", gguf.T_UINT32, n_vocab)
+    if not minimal:
+        w.add(f"{arch}.rope.dimension_count", gguf.T_UINT32, head_dim)
+        w.add(f"{arch}.vocab_size", gguf.T_UINT32, n_vocab)
     if arch == "gemma3":
         w.add("gemma3.attention.key_length", gguf.T_UINT32, head_dim)
         w.add("gemma3.attention.value_length", gguf.T_UINT32, head_dim)
         w.add("gemma3.attention.sliding_window", gguf.T_UINT32, 3)
-        w.add_array("gemma3.attention.sliding_window_pattern", gguf.T_BOOL,
-                    [(i + 1) % 6 != 0 for i in range(n_layer)])
-        w.add("gemma3.attention.scale", gguf.T_FLOAT32, 1.0 / (head_dim ** 0.5))
         w.add("gemma3.rope.freq_base", gguf.T_FLOAT32, 1000000.0)
         w.add("gemma3.rope.freq_base_swa", gguf.T_FLOAT32, 10000.0)
-        w.add("gemma3.rope.scaling.type", gguf.T_STRING, "linear")
-        w.add("gemma3.rope.scaling.factor", gguf.T_FLOAT32, 2.0)
-        w.add("gemma3.final_logit_softcapping", gguf.T_FLOAT32, 20.0)
+        # None of these exist in a real Gemma 3 GGUF. The minimal variant
+        # leaves them out so the fallbacks production takes get exercised:
+        # the full_attention_period=6 default, the 1/sqrt(head_dim) attention
+        # scale (and the n_layer==62 27B rule), unscaled RoPE, and no softcap.
+        if swa_pattern is not None:
+            w.add("gemma3.attention.sliding_window_pattern", gguf.T_UINT32,
+                  swa_pattern)
+        if not minimal:
+            w.add_array("gemma3.attention.sliding_window_pattern", gguf.T_BOOL,
+                        [(i + 1) % 6 != 0 for i in range(n_layer)])
+            # deliberately NOT 1/sqrt(head_dim): if the fixture used the same
+            # value as the fallback, nothing would prove the key is read
+            w.add("gemma3.attention.scale", gguf.T_FLOAT32, 0.125)
+            w.add("gemma3.rope.scaling.type", gguf.T_STRING, "linear")
+            w.add("gemma3.rope.scaling.factor", gguf.T_FLOAT32, 2.0)
+            w.add("gemma3.final_logit_softcapping", gguf.T_FLOAT32, 20.0)
+        w.add("tokenizer.chat_template", gguf.T_STRING, GEMMA_TEMPLATE)
 
     w.add("tokenizer.ggml.model", gguf.T_STRING, "llama")
     w.add_array("tokenizer.ggml.tokens", gguf.T_STRING, tokens)
@@ -293,7 +327,8 @@ def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
                    rand(n_vocab * n_embd), dtype)
 
     w.write()
-    print(f"wrote {path} (arch={arch}, vocab={n_vocab}, dtype={dtype})")
+    print(f"wrote {path} (arch={arch}, vocab={n_vocab}, dtype={dtype}, "
+          f"layers={n_layer}{', minimal metadata' if minimal else ''})")
 
 
 if __name__ == "__main__":
@@ -303,5 +338,12 @@ if __name__ == "__main__":
     ap.add_argument("--arch", default="llama",
                     choices=["llama", "mistral", "qwen2", "qwen3",
                              "stablelm", "gemma", "gemma3"])
+    ap.add_argument("--minimal", action="store_true",
+                    help="omit every key no real Gemma 3 GGUF carries")
+    ap.add_argument("--layers", type=int, default=0,
+                    help="override the block count (62 selects the 27B rules)")
+    ap.add_argument("--swa-pattern", type=int, default=None,
+                    help="write sliding_window_pattern as a scalar period")
     args = ap.parse_args()
-    main(args.path, args.dtype, arch=args.arch)
+    main(args.path, args.dtype, arch=args.arch, minimal=args.minimal,
+         layers=args.layers, swa_pattern=args.swa_pattern)

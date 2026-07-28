@@ -8,6 +8,14 @@ mimic larger models, e.g. a TinyLlama-1.1B-like GQA shape:
     python3 tests/make_bench_model.py /tmp/b1.gguf Q4_0 \\
         --embd 2048 --ff 5632 --layers 22 --heads 32 --kv 4 --untied
 
+--arch gemma3 writes the Gemma 3 shape instead: per-head q/k norms, the
+post-attention and post-FFN norms, sliding-window attention and the dual RoPE
+bases. A Gemma-3-1B-like model is
+
+    python3 tests/make_bench_model.py /tmp/g3.gguf Q4_0 --arch gemma3 \\
+        --vocab 262144 --embd 1152 --ff 6912 --layers 26 \\
+        --heads 4 --kv 1 --head-dim 256
+
 Weights are deterministic random values, so prefill/decode cost and
 weight-memory behaviour match a real model of the same shape without
 needing network access. The output is gibberish; only use it for
@@ -69,12 +77,15 @@ def _np_quantize_q4_0(vals) -> bytes:
 def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
          n_embd: int = N_EMBD, n_head: int = N_HEAD, n_kv: int = 0,
          n_layer: int = N_LAYER, n_ff: int = N_FF, n_ctx: int = N_CTX,
-         tied: bool = True) -> None:
+         tied: bool = True, arch: str = "llama", head_dim: int = 0) -> None:
     if dtype not in ("F32", "Q8_0", "Q4_0"):
         raise SystemExit(f"unsupported bench dtype {dtype}")
     n_kv = n_kv or n_head
-    head_dim = n_embd // n_head
+    head_dim = head_dim or n_embd // n_head
     kv_dim = n_kv * head_dim
+    q_dim = n_head * head_dim
+    if arch == "gemma3":
+        tied = True  # Gemma 3 has no output.weight
 
     tokens: list[str] = ["<unk>", "<s>", "</s>"]
     scores: list[float] = [0.0, 0.0, 0.0]
@@ -88,17 +99,25 @@ def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
         scores.append(-float(i + 1))
         types.append(1)
 
-    w = gguf.GGUFWriter(path, "llama")
-    w.add("general.name", gguf.T_STRING, "alpacca-bench-synthetic")
-    w.add("llama.context_length", gguf.T_UINT32, n_ctx)
-    w.add("llama.embedding_length", gguf.T_UINT32, n_embd)
-    w.add("llama.block_count", gguf.T_UINT32, n_layer)
-    w.add("llama.feed_forward_length", gguf.T_UINT32, n_ff)
-    w.add("llama.attention.head_count", gguf.T_UINT32, n_head)
-    w.add("llama.attention.head_count_kv", gguf.T_UINT32, n_kv)
-    w.add("llama.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32, 1e-5)
-    w.add("llama.rope.dimension_count", gguf.T_UINT32, head_dim)
-    w.add("llama.vocab_size", gguf.T_UINT32, n_vocab)
+    w = gguf.GGUFWriter(path, arch)
+    w.add("general.name", gguf.T_STRING, f"alpacca-bench-synthetic-{arch}")
+    w.add(f"{arch}.context_length", gguf.T_UINT32, n_ctx)
+    w.add(f"{arch}.embedding_length", gguf.T_UINT32, n_embd)
+    w.add(f"{arch}.block_count", gguf.T_UINT32, n_layer)
+    w.add(f"{arch}.feed_forward_length", gguf.T_UINT32, n_ff)
+    w.add(f"{arch}.attention.head_count", gguf.T_UINT32, n_head)
+    w.add(f"{arch}.attention.head_count_kv", gguf.T_UINT32, n_kv)
+    w.add(f"{arch}.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32,
+          1e-6 if arch == "gemma3" else 1e-5)
+    w.add(f"{arch}.rope.dimension_count", gguf.T_UINT32, head_dim)
+    w.add(f"{arch}.vocab_size", gguf.T_UINT32, n_vocab)
+    if arch == "gemma3":
+        # only the keys a real Gemma 3 GGUF carries
+        w.add("gemma3.attention.key_length", gguf.T_UINT32, head_dim)
+        w.add("gemma3.attention.value_length", gguf.T_UINT32, head_dim)
+        w.add("gemma3.attention.sliding_window", gguf.T_UINT32, 512)
+        w.add("gemma3.rope.freq_base", gguf.T_FLOAT32, 1000000.0)
+        w.add("gemma3.rope.freq_base_swa", gguf.T_FLOAT32, 10000.0)
     w.add("tokenizer.ggml.model", gguf.T_STRING, "llama")
     w.add_array("tokenizer.ggml.tokens", gguf.T_STRING, tokens)
     w.add_array("tokenizer.ggml.scores", gguf.T_FLOAT32, scores)
@@ -138,8 +157,9 @@ def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
             else:
                 w.add_raw_tensor(name, shape, "Q4_0", quants.quantize_q4_0(vals))
 
-    def add_norm(name: str) -> None:
-        w.add_tensor(name, (n_embd,), [1.0] * n_embd, "F32")
+    def add_norm(name: str, size: int = 0) -> None:
+        n = size or n_embd
+        w.add_tensor(name, (n,), [1.0] * n, "F32")
 
     # tied embeddings by default (no output.weight), like stories15M;
     # --untied adds a separate output matrix, like llama-3-class models
@@ -147,22 +167,28 @@ def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
     for i in range(n_layer):
         p = f"blk.{i}."
         add_norm(p + "attn_norm.weight")
-        add_matrix(p + "attn_q.weight", (n_embd, n_embd))
+        add_matrix(p + "attn_q.weight", (n_embd, q_dim))
         add_matrix(p + "attn_k.weight", (n_embd, kv_dim))
         add_matrix(p + "attn_v.weight", (n_embd, kv_dim))
-        add_matrix(p + "attn_output.weight", (n_embd, n_embd))
+        add_matrix(p + "attn_output.weight", (q_dim, n_embd))
+        if arch == "gemma3":
+            add_norm(p + "attn_q_norm.weight", head_dim)
+            add_norm(p + "attn_k_norm.weight", head_dim)
+            add_norm(p + "post_attention_norm.weight")
         add_norm(p + "ffn_norm.weight")
         add_matrix(p + "ffn_gate.weight", (n_embd, n_ff))
         add_matrix(p + "ffn_up.weight", (n_embd, n_ff))
         add_matrix(p + "ffn_down.weight", (n_ff, n_embd))
+        if arch == "gemma3":
+            add_norm(p + "post_ffw_norm.weight")
     add_norm("output_norm.weight")
     if not tied:
         add_matrix("output.weight", (n_embd, n_vocab))
 
     w.write()
     size_mb = Path(path).stat().st_size / (1024 * 1024)
-    print(f"wrote {path} ({dtype}, embd {n_embd} ff {n_ff} layers {n_layer} "
-          f"heads {n_head}/{n_kv} vocab {n_vocab} "
+    print(f"wrote {path} ({arch}, {dtype}, embd {n_embd} ff {n_ff} "
+          f"layers {n_layer} heads {n_head}/{n_kv} vocab {n_vocab} "
           f"{'tied' if tied else 'untied'}, {size_mb:.1f} MiB)")
 
 
@@ -180,7 +206,12 @@ if __name__ == "__main__":
     ap.add_argument("--ctx", type=int, default=N_CTX)
     ap.add_argument("--untied", action="store_true",
                     help="write a separate output.weight matrix")
+    ap.add_argument("--arch", default="llama", choices=["llama", "gemma3"],
+                    help="gemma3 adds the q/k norms, post norms and dual RoPE")
+    ap.add_argument("--head-dim", type=int, default=0,
+                    help="head dimension (default: embd / heads; Gemma 3 uses 256)")
     args = ap.parse_args()
     main(args.out, args.dtype, n_vocab=args.vocab, n_embd=args.embd,
          n_head=args.heads, n_kv=args.kv, n_layer=args.layers, n_ff=args.ff,
-         n_ctx=args.ctx, tied=not args.untied)
+         n_ctx=args.ctx, tied=not args.untied, arch=args.arch,
+         head_dim=args.head_dim)

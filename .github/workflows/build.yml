@@ -38,6 +38,19 @@ jobs:
       - name: Offline smoke suite (mock registry + tiny models)
         run: python tests/smoke.py
 
+      # tests/bench.py and tests/make_bench_model.py are not part of the smoke
+      # suite, so nothing noticed when the bench fixture could only write
+      # llama-architecture files. Run both shapes on a tiny synthetic model.
+      - name: Bench harness (synthetic llama + gemma3)
+        run: |
+          python tests/make_bench_model.py bench-llama.gguf Q4_0 \
+            --vocab 2000 --embd 128 --ff 256 --layers 2 --heads 4
+          python tests/bench.py --model bench-llama.gguf --prefill 32 --decode 8
+          python tests/make_bench_model.py bench-gemma3.gguf Q4_0 --arch gemma3 \
+            --vocab 2000 --embd 128 --ff 256 --layers 2 --heads 4 --kv 1 \
+            --head-dim 32
+          python tests/bench.py --model bench-gemma3.gguf --prefill 32 --decode 8
+
   real-model:
     # True correctness gate: real trained weights through the whole engine.
     name: real model (stories15M from Hugging Face)
