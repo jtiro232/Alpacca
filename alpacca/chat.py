@@ -202,6 +202,7 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
 
     text = ""
     reason = "eog"
+    truncated = False
     # a stop string is only detectable once its last character arrives, so
     # hold back that much of the tail or the caller sees the beginning of it
     hold = max((len(s) for s in stop_strings or [] if s), default=1) - 1
@@ -217,7 +218,7 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
         if model.tok.is_eog(tid):
             break  # never forwarded into the cache, so never counted either
         if stop_tokens and tid in stop_tokens:
-            reason = "stop"
+            reason = "stop"   # a turn-start token: the reply is complete
             break
         n_tokens += 1
         text += dec.feed(tid)
@@ -226,6 +227,7 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             if hit:
                 text = text[:text.index(hit)]
                 reason = "stop"
+                truncated = True
                 break
         if stream is not None and len(text) - hold > emitted:
             stream(text[emitted:len(text) - hold])
@@ -234,8 +236,11 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             reason = "length"
             break
         logits = model.forward(tid)
-    if reason == "stop":
-        dec.pending = b""   # whatever is left belongs to the stop string
+    if truncated:
+        # only a stop STRING invalidates the tail: those bytes are part of the
+        # match. A stop token breaks before decoding, so its pending bytes are
+        # ordinary text and still belong in the answer.
+        dec.pending = b""
     else:
         text += dec.flush()
     if stream is not None and len(text) > emitted:
