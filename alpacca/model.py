@@ -26,6 +26,7 @@ SUPPORTED_ARCHES = {
     "qwen3": "neox",
     "stablelm": "neox",
     "gemma": "neox",
+    "gemma3": "neox",
 }
 
 _KNOWN_QUANT_DTYPES = {
@@ -146,11 +147,20 @@ class Hyperparams:
     rms_eps: float
     rope_base: float
     rope_style: str
+    rope_freq_scale: float = 1.0
+    rope_base_swa: float = 0.0
+    sliding_window: int = 0
+    sliding_layers: tuple[bool, ...] = ()
+    attention_scale: float = 0.0
+    final_logit_softcap: float = 0.0
+    embed_scale: float = 1.0
+    full_attention_period: int = 0
 
 
 class Layer:
     __slots__ = ("attn_norm", "wq", "wk", "wv", "wo", "bq", "bk", "bv",
-                 "ffn_norm", "w_gate", "w_up", "w_down")
+                 "q_norm", "k_norm", "post_attn_norm",
+                 "ffn_norm", "w_gate", "w_up", "w_down", "post_ffw_norm")
 
 
 class Model:
@@ -167,13 +177,22 @@ class Model:
         self.cached_ids: list[int] = []
         self.last_prefill_forwarded = 0
         self._rope_inv_freq = None
+        self._rope_inv_freq_swa = None
         self._rope_cos = None
         self._rope_sin = None
+        self._rope_cos_swa = None
+        self._rope_sin_swa = None
         if T.HAS_NUMPY:
             half = hp.n_rot // 2
             self._rope_inv_freq = (
+                hp.rope_freq_scale *
                 hp.rope_base ** (-2.0 * np.arange(half, dtype=np.float32) / hp.n_rot)
             )
+            if hp.rope_base_swa > 0.0:
+                self._rope_inv_freq_swa = (
+                    hp.rope_base_swa **
+                    (-2.0 * np.arange(half, dtype=np.float32) / hp.n_rot)
+                )
 
     # ---- loading --------------------------------------------------------
 
@@ -199,9 +218,47 @@ class Model:
             n_head = int(meta("attention.head_count"))
             n_kv = int(meta("attention.head_count_kv", n_head) or n_head)
             head_dim = int(meta("attention.key_length", n_embd // n_head) or n_embd // n_head)
+            n_layer = int(meta("block_count"))
+            rope_base = float(meta("rope.freq_base", 10000.0))
+            rope_base_swa = float(meta("rope.freq_base_swa", 0.0) or 0.0)
+            sliding_window = int(meta("attention.sliding_window", 0) or 0)
+            if arch == "gemma3" and sliding_window > 0 and rope_base_swa <= 0.0:
+                rope_base_swa = 10000.0
+
+            rope_scale_legacy = meta("rope.scale_linear", None)
+            rope_scaling_type = str(meta("rope.scaling.type", "") or "").lower()
+            rope_scaling_factor = float(
+                meta("rope.scaling.factor",
+                     rope_scale_legacy if rope_scale_legacy is not None else 1.0) or 1.0)
+            rope_freq_scale = 1.0
+            if (rope_scaling_factor > 0.0 and
+                    (rope_scaling_type == "linear" or rope_scale_legacy is not None)):
+                rope_freq_scale = 1.0 / rope_scaling_factor
+
+            fallback_attn_scale = 1.0 / math.sqrt(head_dim)
+            if arch == "gemma3" and n_layer == 62:
+                fallback_attn_scale = 1.0 / math.sqrt(n_embd / n_head)
+            attention_scale = float(meta("attention.scale", fallback_attn_scale)
+                                    or fallback_attn_scale)
+
+            sliding_layers: tuple[bool, ...] = ()
+            full_attention_period = 0
+            if arch == "gemma3":
+                pattern = meta("attention.sliding_window_pattern", None)
+                if isinstance(pattern, list):
+                    if len(pattern) != n_layer:
+                        raise ValueError(
+                            "gemma3.attention.sliding_window_pattern has "
+                            f"{len(pattern)} entries, expected {n_layer}")
+                    sliding_layers = tuple(bool(v) for v in pattern)
+                elif pattern is not None:
+                    full_attention_period = int(pattern)
+                else:
+                    full_attention_period = int(meta("full_attention_interval", 6) or 6)
+
             hp = Hyperparams(
                 arch=arch,
-                n_layer=int(meta("block_count")),
+                n_layer=n_layer,
                 n_embd=n_embd,
                 n_head=n_head,
                 n_kv=n_kv,
@@ -212,8 +269,17 @@ class Model:
                 head_dim=head_dim,
                 n_rot=int(meta("rope.dimension_count", head_dim) or head_dim),
                 rms_eps=float(meta("attention.layer_norm_rms_epsilon", 1e-5)),
-                rope_base=float(meta("rope.freq_base", 10000.0)),
+                rope_base=rope_base,
                 rope_style=SUPPORTED_ARCHES[arch],
+                rope_freq_scale=rope_freq_scale,
+                rope_base_swa=rope_base_swa,
+                sliding_window=sliding_window,
+                sliding_layers=sliding_layers,
+                attention_scale=attention_scale,
+                final_logit_softcap=float(meta("final_logit_softcapping", 0.0) or 0.0),
+                embed_scale=(float(meta("embedding_scale", math.sqrt(n_embd)))
+                             if arch == "gemma3" else 1.0),
+                full_attention_period=full_attention_period,
             )
 
             tokenizer = Tokenizer.from_gguf(gf.metadata)
@@ -300,6 +366,10 @@ class Model:
                           flush=True, file=sys.stderr)
                 p = f"blk.{i}."
                 ly = Layer()
+                ly.q_norm = None
+                ly.k_norm = None
+                ly.post_attn_norm = None
+                ly.post_ffw_norm = None
                 ly.attn_norm = tensor_vec(p + "attn_norm.weight")
                 ly.wq = tensor_mat(p + "attn_q.weight", q_dim, hp.n_embd)
                 ly.wk = tensor_mat(p + "attn_k.weight", kv_dim, hp.n_embd)
@@ -308,10 +378,16 @@ class Model:
                 ly.bq = tensor_vec(p + "attn_q.bias", required=False)
                 ly.bk = tensor_vec(p + "attn_k.bias", required=False)
                 ly.bv = tensor_vec(p + "attn_v.bias", required=False)
+                if arch == "gemma3":
+                    ly.q_norm = tensor_vec(p + "attn_q_norm.weight")
+                    ly.k_norm = tensor_vec(p + "attn_k_norm.weight")
+                    ly.post_attn_norm = tensor_vec(p + "post_attention_norm.weight")
                 ly.ffn_norm = tensor_vec(p + "ffn_norm.weight")
                 ly.w_gate = tensor_mat(p + "ffn_gate.weight", hp.n_ff, hp.n_embd)
                 ly.w_up = tensor_mat(p + "ffn_up.weight", hp.n_ff, hp.n_embd)
                 ly.w_down = tensor_mat(p + "ffn_down.weight", hp.n_embd, hp.n_ff)
+                if arch == "gemma3":
+                    ly.post_ffw_norm = tensor_vec(p + "post_ffw_norm.weight")
                 m.layers.append(ly)
             if progress:
                 print("\r" + " " * 40 + "\r", end="", flush=True, file=sys.stderr)
@@ -354,6 +430,13 @@ class Model:
                          self._rope_inv_freq[None, :])
                 self._rope_cos = np.cos(theta)
                 self._rope_sin = np.sin(theta)
+            if self._rope_inv_freq_swa is not None and (
+                    self._rope_cos_swa is None or
+                    len(self._rope_cos_swa) != self.n_ctx):
+                theta = (np.arange(self.n_ctx, dtype=np.float32)[:, None] *
+                         self._rope_inv_freq_swa[None, :])
+                self._rope_cos_swa = np.cos(theta)
+                self._rope_sin_swa = np.sin(theta)
         else:
             self.cache_k = [[] for _ in range(hp.n_layer)]
             self.cache_v = [[] for _ in range(hp.n_layer)]
@@ -379,6 +462,11 @@ class Model:
     # ---- rotary embeddings ----------------------------------------------
 
     def _rope_pure(self, vec: list, n_heads: int, pos: int) -> list:
+        return self._rope_pure_base(vec, n_heads, pos, self.hp.rope_base,
+                                    self.hp.rope_freq_scale)
+
+    def _rope_pure_base(self, vec: list, n_heads: int, pos: int,
+                        rope_base: float, freq_scale: float = 1.0) -> list:
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         out = list(vec)
@@ -386,7 +474,7 @@ class Model:
         for h in range(n_heads):
             base = h * hd
             for i in range(half):
-                theta = pos * hp.rope_base ** (-2.0 * i / n_rot)
+                theta = pos * freq_scale * rope_base ** (-2.0 * i / n_rot)
                 c, s = math.cos(theta), math.sin(theta)
                 if hp.rope_style == "norm":
                     a, b = base + 2 * i, base + 2 * i + 1
@@ -440,7 +528,11 @@ class Model:
         """Process one token at the current position; returns logits."""
         if self.n_past >= self.n_ctx:
             raise RuntimeError(f"context window full ({self.n_ctx} tokens)")
-        logits = self._forward_np(token) if T.HAS_NUMPY else self._forward_pure(token)
+        if self.hp.arch == "gemma3":
+            logits = (self._forward_gemma3_np(token) if T.HAS_NUMPY
+                      else self._forward_gemma3_pure(token))
+        else:
+            logits = self._forward_np(token) if T.HAS_NUMPY else self._forward_pure(token)
         self.cached_ids.append(token)
         return logits
 
@@ -470,6 +562,8 @@ class Model:
         """Process a NumPy batch at the current position; returns last-token logits."""
         if not T.HAS_NUMPY:
             raise RuntimeError("forward_batch requires the NumPy backend")
+        if self.hp.arch == "gemma3":
+            return self._forward_batch_gemma3_np(tokens)
         if not tokens:
             return None
         if self.n_past + len(tokens) > self.n_ctx:
@@ -553,6 +647,253 @@ class Model:
 
         self.n_past += 1
         return T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
+
+    def _gemma3_layer_is_sliding(self, layer_index: int) -> bool:
+        hp = self.hp
+        if hp.sliding_window <= 0:
+            return False
+        if hp.sliding_layers:
+            return hp.sliding_layers[layer_index]
+        return (hp.full_attention_period > 0 and
+                (layer_index + 1) % hp.full_attention_period != 0)
+
+    def _rope_np_gemma3(self, vec, n_heads: int, pos: int, sliding: bool):
+        cos = self._rope_cos_swa if sliding else self._rope_cos
+        sin = self._rope_sin_swa if sliding else self._rope_sin
+        if cos is None or sin is None:
+            cos, sin = self._rope_cos, self._rope_sin
+        hp = self.hp
+        hd, n_rot = hp.head_dim, hp.n_rot
+        half = n_rot // 2
+        v = vec.reshape(n_heads, hd).copy()
+        c, s = cos[pos], sin[pos]
+        x0 = v[:, :half].copy()
+        x1 = v[:, half:n_rot].copy()
+        v[:, :half] = x0 * c - x1 * s
+        v[:, half:n_rot] = x0 * s + x1 * c
+        return v.reshape(-1)
+
+    def _rope_batch_np_gemma3(self, vecs, n_heads: int, positions, sliding: bool):
+        cos = self._rope_cos_swa if sliding else self._rope_cos
+        sin = self._rope_sin_swa if sliding else self._rope_sin
+        if cos is None or sin is None:
+            cos, sin = self._rope_cos, self._rope_sin
+        hp = self.hp
+        hd, n_rot = hp.head_dim, hp.n_rot
+        half = n_rot // 2
+        v = vecs.reshape(len(vecs), n_heads, hd).copy()
+        c = cos[positions][:, None, :]
+        s = sin[positions][:, None, :]
+        x0 = v[:, :, :half].copy()
+        x1 = v[:, :, half:n_rot].copy()
+        v[:, :, :half] = x0 * c - x1 * s
+        v[:, :, half:n_rot] = x0 * s + x1 * c
+        return v.reshape(len(vecs), -1)
+
+    def _rmsnorm_heads_np(self, vec, n_heads: int, weight):
+        hp = self.hp
+        return T.rmsnorm(vec.reshape(n_heads, hp.head_dim), weight,
+                         hp.rms_eps).reshape(-1)
+
+    def _rmsnorm_heads_batch_np(self, vecs, n_heads: int, weight):
+        hp = self.hp
+        return T.rmsnorm(vecs.reshape(len(vecs), n_heads, hp.head_dim), weight,
+                         hp.rms_eps).reshape(len(vecs), -1)
+
+    def _rmsnorm_heads_pure(self, vec: list, n_heads: int, weight) -> list:
+        hp = self.hp
+        out: list[float] = []
+        for h in range(n_heads):
+            start = h * hp.head_dim
+            out.extend(T.rmsnorm(vec[start:start + hp.head_dim], weight,
+                                 hp.rms_eps))
+        return out
+
+    def _attention_batch_window_np(self, q, K, V, positions, group: int,
+                                   inv_sqrt: float, window: int = 0,
+                                   kv_start: int = 0):
+        hp = self.hp
+        qg = q.reshape(len(q), hp.n_kv, group, hp.head_dim)
+        scores = np.einsum("tkgh,skh->tkgs", qg, K, optimize=True) * inv_sqrt
+        kv_pos = np.arange(kv_start, kv_start + K.shape[0], dtype=np.int32)
+        allowed = kv_pos[None, :] <= positions[:, None]
+        if window > 0:
+            allowed &= kv_pos[None, :] > (positions[:, None] - window)
+        scores = np.where(allowed[:, None, None, :], scores, -1.0e30)
+        scores -= scores.max(axis=-1, keepdims=True)
+        w = np.exp(scores)
+        w /= w.sum(axis=-1, keepdims=True)
+        out = np.einsum("tkgs,skh->tkgh", w, V, optimize=True)
+        return out.reshape(len(q), hp.n_head * hp.head_dim)
+
+    def _softcap_logits(self, logits):
+        cap = self.hp.final_logit_softcap
+        if cap <= 0.0:
+            return logits
+        if T.HAS_NUMPY:
+            return np.tanh(logits / cap) * cap
+        return [math.tanh(v / cap) * cap for v in logits]
+
+    def _forward_batch_gemma3_np(self, tokens: list[int]):
+        if not tokens:
+            return None
+        if self.n_past + len(tokens) > self.n_ctx:
+            raise RuntimeError(f"context window full ({self.n_ctx} tokens)")
+
+        hp = self.hp
+        pos0 = self.n_past
+        positions = np.arange(pos0, pos0 + len(tokens), dtype=np.int32)
+        x = T.matrix_rows(self.tok_embd, tokens) * hp.embed_scale
+        inv_sqrt = hp.attention_scale
+        group = hp.n_head // hp.n_kv
+
+        for li, ly in enumerate(self.layers):
+            h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            q = T.matmul_t(h, ly.wq)
+            k = T.matmul_t(h, ly.wk)
+            v = T.matmul_t(h, ly.wv)
+            if ly.bq is not None:
+                q = q + ly.bq
+            if ly.bk is not None:
+                k = k + ly.bk
+            if ly.bv is not None:
+                v = v + ly.bv
+            q = self._rmsnorm_heads_batch_np(q, hp.n_head, ly.q_norm)
+            k = self._rmsnorm_heads_batch_np(k, hp.n_kv, ly.k_norm)
+            sliding = self._gemma3_layer_is_sliding(li)
+            q = self._rope_batch_np_gemma3(q, hp.n_head, positions, sliding).reshape(
+                len(tokens), hp.n_head, hp.head_dim)
+            k = self._rope_batch_np_gemma3(k, hp.n_kv, positions, sliding).reshape(
+                len(tokens), hp.n_kv, hp.head_dim)
+            self.cache_k[li][pos0:pos0 + len(tokens)] = k
+            self.cache_v[li][pos0:pos0 + len(tokens)] = v.reshape(
+                len(tokens), hp.n_kv, hp.head_dim)
+
+            window = hp.sliding_window if sliding else 0
+            kv_start = max(0, int(positions[0]) - window + 1) if window > 0 else 0
+            K = self.cache_k[li][kv_start:pos0 + len(tokens)]
+            V = self.cache_v[li][kv_start:pos0 + len(tokens)]
+            att_out = self._attention_batch_window_np(q, K, V, positions,
+                                                       group, inv_sqrt, window,
+                                                       kv_start)
+            att_proj = T.matmul_t(att_out, ly.wo)
+            x = x + T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps)
+
+            h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            gate = T.matmul_t(h, ly.w_gate)
+            up = T.matmul_t(h, ly.w_up)
+            act = T.gelu_pytorch_tanh(gate) * up
+            ffn_out = T.matmul_t(act, ly.w_down)
+            x = x + T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps)
+
+        self.n_past += len(tokens)
+        self.cached_ids.extend(tokens)
+        logits = T.matvec(self.output, T.rmsnorm(x[-1], self.out_norm, hp.rms_eps))
+        return self._softcap_logits(logits)
+
+    def _forward_gemma3_np(self, token: int):
+        hp = self.hp
+        pos = self.n_past
+        x = T.matrix_row(self.tok_embd, token) * hp.embed_scale
+        inv_sqrt = hp.attention_scale
+        group = hp.n_head // hp.n_kv
+
+        for li, ly in enumerate(self.layers):
+            h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            q = T.matvec(ly.wq, h)
+            k = T.matvec(ly.wk, h)
+            v = T.matvec(ly.wv, h)
+            if ly.bq is not None:
+                q = q + ly.bq
+            if ly.bk is not None:
+                k = k + ly.bk
+            if ly.bv is not None:
+                v = v + ly.bv
+            q = self._rmsnorm_heads_np(q, hp.n_head, ly.q_norm)
+            k = self._rmsnorm_heads_np(k, hp.n_kv, ly.k_norm)
+            sliding = self._gemma3_layer_is_sliding(li)
+            q = self._rope_np_gemma3(q, hp.n_head, pos, sliding).reshape(
+                hp.n_head, hp.head_dim)
+            k = self._rope_np_gemma3(k, hp.n_kv, pos, sliding).reshape(
+                hp.n_kv, hp.head_dim)
+            self.cache_k[li][pos] = k
+            self.cache_v[li][pos] = v.reshape(hp.n_kv, hp.head_dim)
+
+            start = max(0, pos - hp.sliding_window + 1) if sliding else 0
+            K = self.cache_k[li][start:pos + 1]
+            V = self.cache_v[li][start:pos + 1]
+            att_out = self._attention_np(q, K, V, group, inv_sqrt)
+            att_proj = T.matvec(ly.wo, att_out.reshape(-1))
+            x = x + T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps)
+
+            h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            act = T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)) * T.matvec(ly.w_up, h)
+            ffn_out = T.matvec(ly.w_down, act)
+            x = x + T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps)
+
+        self.n_past += 1
+        logits = T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
+        return self._softcap_logits(logits)
+
+    def _forward_gemma3_pure(self, token: int):
+        hp = self.hp
+        pos = self.n_past
+        x = T.scale(T.matrix_row(self.tok_embd, token), hp.embed_scale)
+        inv_sqrt = hp.attention_scale
+        group = hp.n_head // hp.n_kv
+        hd = hp.head_dim
+
+        for li, ly in enumerate(self.layers):
+            h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            q = T.matvec(ly.wq, h)
+            k = T.matvec(ly.wk, h)
+            v = T.matvec(ly.wv, h)
+            if ly.bq is not None:
+                q = T.add(q, ly.bq)
+            if ly.bk is not None:
+                k = T.add(k, ly.bk)
+            if ly.bv is not None:
+                v = T.add(v, ly.bv)
+            q = self._rmsnorm_heads_pure(q, hp.n_head, ly.q_norm)
+            k = self._rmsnorm_heads_pure(k, hp.n_kv, ly.k_norm)
+            sliding = self._gemma3_layer_is_sliding(li)
+            base = hp.rope_base_swa if sliding else hp.rope_base
+            freq_scale = 1.0 if sliding else hp.rope_freq_scale
+            q = self._rope_pure_base(q, hp.n_head, pos, base, freq_scale)
+            k = self._rope_pure_base(k, hp.n_kv, pos, base, freq_scale)
+            self.cache_k[li].append(k)
+            self.cache_v[li].append(v)
+
+            start = max(0, pos - hp.sliding_window + 1) if sliding else 0
+            att_out = [0.0] * (hp.n_head * hd)
+            for hh in range(hp.n_head):
+                kvh = hh // group
+                qh = q[hh * hd:(hh + 1) * hd]
+                scores = []
+                for t in range(start, pos + 1):
+                    kt = self.cache_k[li][t][kvh * hd:(kvh + 1) * hd]
+                    scores.append(T.dot(qh, kt) * inv_sqrt)
+                w = T.softmax(scores)
+                acc = [0.0] * hd
+                for offs, wt in enumerate(w):
+                    if wt == 0.0:
+                        continue
+                    vt = self.cache_v[li][start + offs][kvh * hd:(kvh + 1) * hd]
+                    for d in range(hd):
+                        acc[d] += wt * vt[d]
+                att_out[hh * hd:(hh + 1) * hd] = acc
+            att_proj = T.matvec(ly.wo, att_out)
+            x = T.add(x, T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps))
+
+            h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            act = T.mul(T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)),
+                        T.matvec(ly.w_up, h))
+            ffn_out = T.matvec(ly.w_down, act)
+            x = T.add(x, T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps))
+
+        self.n_past += 1
+        logits = T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
+        return self._softcap_logits(logits)
 
     def _forward_pure(self, token: int):
         hp = self.hp
@@ -645,6 +986,9 @@ class Model:
         params = hp.n_vocab * hp.n_embd
         for ly in range(hp.n_layer):
             params += 2 * hp.n_embd  # norms
+            if hp.arch == "gemma3":
+                params += hp.n_head * hp.head_dim + hp.n_kv * hp.head_dim
+                params += 2 * hp.n_embd  # post-attention/post-ffw norms
             params += hp.n_embd * hp.n_head * hp.head_dim * 2  # wq, wo
             params += hp.n_embd * hp.n_kv * hp.head_dim * 2    # wk, wv
             params += 3 * hp.n_embd * hp.n_ff

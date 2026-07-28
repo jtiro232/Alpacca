@@ -160,6 +160,14 @@ def silu(x):
     return out
 
 
+def gelu_pytorch_tanh(x):
+    c = 0.7978845608028654
+    if HAS_NUMPY:
+        return 0.5 * x * (1.0 + _np.tanh(c * (x + 0.044715 * x * x * x)))
+    return [0.5 * v * (1.0 + math.tanh(c * (v + 0.044715 * v * v * v)))
+            for v in x]
+
+
 def rmsnorm(x, weight, eps: float):
     if HAS_NUMPY:
         arr = x if getattr(x, "dtype", None) == _np.float32 else x.astype(_np.float32)

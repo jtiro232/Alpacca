@@ -164,7 +164,12 @@ The server is OpenAI-compatible - point any OpenAI client at
 the llama.cpp-style `POST /completion`.
 
 Supported architectures: llama (1/2/3, TinyLlama, Mistral-family), qwen2/3,
-stablelm, gemma. Chat templates are detected from the model's metadata.
+stablelm, gemma, and Gemma 3 text GGUFs. Gemma 3 support includes Q/K
+normalization, local sliding-window attention patterns, dual RoPE bases, linear
+RoPE scaling, metadata-driven attention scale, GELU FFNs, post-attention/post-FFN
+norms, tied output embeddings, and optional final logit softcapping. Chat
+templates are detected from the model's metadata. Gemma 3 support is text-only;
+multimodal projector/vision support is outside Alpacca's current engine scope.
 
 ### Honest performance expectations
 

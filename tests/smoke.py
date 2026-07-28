@@ -677,6 +677,18 @@ def main() -> None:
             r = subprocess.run([sys.executable, str(mk), str(srv / name), dtype],
                                capture_output=True, text=True)
             check(f"write tiny {dtype} model", r.returncode == 0, r.stderr)
+        for arch in ("qwen2", "qwen3", "gemma"):
+            r = subprocess.run([sys.executable, str(mk),
+                                str(srv / f"tiny-{arch}.gguf"), "F32",
+                                "--arch", arch],
+                               capture_output=True, text=True)
+            check(f"write tiny {arch} model", r.returncode == 0, r.stderr)
+        for dtype, name in (("F32", "tiny-gemma3.gguf"),
+                            ("Q4_0", "tiny-gemma3-q4.gguf")):
+            r = subprocess.run([sys.executable, str(mk), str(srv / name), dtype,
+                                "--arch", "gemma3"],
+                               capture_output=True, text=True)
+            check(f"write tiny gemma3 {dtype} model", r.returncode == 0, r.stderr)
 
         from alpacca.model import Model, auto_budget_fit_mb
         fit = auto_budget_fit_mb(str(srv / "tiny-q4.gguf"))
@@ -689,6 +701,63 @@ def main() -> None:
               str(fit))
         check("auto budget fit sizing is None for unreadable models",
               auto_budget_fit_mb(str(srv / "does-not-exist.gguf")) is None)
+        for arch in ("qwen2", "qwen3", "gemma"):
+            arch_model = Model.load(str(srv / f"tiny-{arch}.gguf"), progress=False)
+            arch_logits = arch_model.prefill([1])
+            check(f"load tiny {arch} keeps existing neox architecture path",
+                  arch_model.hp.arch == arch and
+                  arch_model.hp.rope_style == "neox" and
+                  len(T.to_list(arch_logits)) == arch_model.hp.n_vocab,
+                  arch_model.describe())
+
+        gemma3 = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+        check("load tiny gemma3 reads architecture-specific metadata",
+              gemma3.hp.arch == "gemma3" and
+              gemma3.hp.n_head == 2 and gemma3.hp.n_kv == 1 and
+              gemma3.hp.head_dim == 16 and gemma3.hp.sliding_window == 3 and
+              gemma3.hp.sliding_layers == (True, True, True, True, True, False) and
+              abs(gemma3.hp.attention_scale - 0.25) < 1e-6 and
+              abs(gemma3.hp.rope_base - 1000000.0) < 1.0 and
+              abs(gemma3.hp.rope_base_swa - 10000.0) < 1.0 and
+              abs(gemma3.hp.rope_freq_scale - 0.5) < 1e-6 and
+              gemma3.output is gemma3.tok_embd,
+              gemma3.describe())
+        g3_seq = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+        g3_last = None
+        g3_ids = list(range(1, 9))
+        for tid in g3_ids:
+            g3_last = g3_seq.forward(tid)
+        g3_values = T.to_list(g3_last)
+        expected_g3 = [-0.445760, 1.348745, 0.410908, 1.196592,
+                       -0.363952, 0.484448, -0.640751, -0.543717]
+        g3_diff = max(abs(float(a) - b)
+                      for a, b in zip(g3_values[:8], expected_g3))
+        check(f"tiny gemma3 logits are stable (diff {g3_diff:.2e})",
+              g3_diff < 1e-5, str(g3_values[:8]))
+        if T.HAS_NUMPY:
+            g3_batch = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
+            g3_batch_logits = g3_batch.forward_batch(g3_ids)
+            g3_batch_diff = max(abs(float(a) - float(b))
+                                for a, b in zip(T.to_list(g3_last),
+                                                T.to_list(g3_batch_logits)))
+            check(f"tiny gemma3 batch matches sequential across sliding window "
+                  f"(diff {g3_batch_diff:.2e})",
+                  g3_batch_diff < 1e-5 and g3_batch.n_past == len(g3_ids),
+                  str(g3_batch_diff))
+        gemma3_q4 = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
+        gemma3_q4_logits = gemma3_q4.prefill([1, 2, 3, 4])
+        if T.HAS_NUMPY:
+            check("load tiny gemma3 Q4_0 keeps matrix weights quantized",
+                  gemma3_q4.weight_storage["quantized"] == {"Q4_0": 43} and
+                  not gemma3_q4.weight_storage["fallback"] and
+                  len(T.to_list(gemma3_q4_logits)) == gemma3_q4.hp.n_vocab,
+                  str(gemma3_q4.weight_storage))
+        else:
+            check("load tiny gemma3 Q4_0 falls back to dense without NumPy",
+                  gemma3_q4.weight_storage["fallback"] == {"Q4_0": 43} and
+                  len(T.to_list(gemma3_q4_logits)) == gemma3_q4.hp.n_vocab,
+                  str(gemma3_q4.weight_storage))
+
         for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
                           ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
                           ("Q5_1", "tiny-q51.gguf"),

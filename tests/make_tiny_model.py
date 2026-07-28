@@ -3,13 +3,14 @@
 GGUF writer - no third-party packages needed.
 
 The model is gibberish but loads and generates, which is what the tests
-need. usage: python3 tests/make_tiny_model.py out.gguf [dtype]
+need. usage: python3 tests/make_tiny_model.py out.gguf [dtype] [--arch ARCH]
 (dtype: F32 (default), F16, Q8_0, Q4_0, or raw Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/
 Q5_K/Q6_K - quantized variants exercise the dequantizers and quantized
 matvec loader paths. Raw classic variants keep their norm vectors F32.)
 """
 from __future__ import annotations
 
+import argparse
 import random
 import struct
 import sys
@@ -27,10 +28,24 @@ N_CTX = 256
 N_EXTRA = 48  # normal word-piece tokens on top of specials + bytes
 
 
-def main(path: str, dtype: str = "F32") -> None:
+def main(path: str, dtype: str = "F32", arch: str = "llama") -> None:
     rng = random.Random(42)
-    n_embd = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_EMBD
-    n_ff = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_FF
+    if arch == "gemma3":
+        n_embd = 64
+        n_head = 2
+        n_kv = 1
+        head_dim = 16
+        n_layer = 6
+        n_ff = 128
+        n_ctx = 32
+    else:
+        n_embd = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_EMBD
+        n_head = N_HEAD
+        n_kv = N_HEAD
+        head_dim = n_embd // n_head
+        n_layer = N_LAYER
+        n_ff = 256 if dtype in ("Q2_K", "Q4_K", "Q5_K", "Q6_K") else N_FF
+        n_ctx = N_CTX
 
     tokens: list[str] = []
     scores: list[float] = []
@@ -57,17 +72,30 @@ def main(path: str, dtype: str = "F32") -> None:
         add(w, -float(i + 1), 1)
 
     n_vocab = len(tokens)
-    w = gguf.GGUFWriter(path, "llama")
-    w.add("general.name", gguf.T_STRING, "alpacca-tiny-test")
-    w.add("llama.context_length", gguf.T_UINT32, N_CTX)
-    w.add("llama.embedding_length", gguf.T_UINT32, n_embd)
-    w.add("llama.block_count", gguf.T_UINT32, N_LAYER)
-    w.add("llama.feed_forward_length", gguf.T_UINT32, n_ff)
-    w.add("llama.attention.head_count", gguf.T_UINT32, N_HEAD)
-    w.add("llama.attention.head_count_kv", gguf.T_UINT32, N_HEAD)
-    w.add("llama.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32, 1e-5)
-    w.add("llama.rope.dimension_count", gguf.T_UINT32, n_embd // N_HEAD)
-    w.add("llama.vocab_size", gguf.T_UINT32, n_vocab)
+    w = gguf.GGUFWriter(path, arch)
+    w.add("general.name", gguf.T_STRING, f"alpacca-tiny-{arch}-test")
+    w.add(f"{arch}.context_length", gguf.T_UINT32, n_ctx)
+    w.add(f"{arch}.embedding_length", gguf.T_UINT32, n_embd)
+    w.add(f"{arch}.block_count", gguf.T_UINT32, n_layer)
+    w.add(f"{arch}.feed_forward_length", gguf.T_UINT32, n_ff)
+    w.add(f"{arch}.attention.head_count", gguf.T_UINT32, n_head)
+    w.add(f"{arch}.attention.head_count_kv", gguf.T_UINT32, n_kv)
+    w.add(f"{arch}.attention.layer_norm_rms_epsilon", gguf.T_FLOAT32,
+          1e-6 if arch == "gemma3" else 1e-5)
+    w.add(f"{arch}.rope.dimension_count", gguf.T_UINT32, head_dim)
+    w.add(f"{arch}.vocab_size", gguf.T_UINT32, n_vocab)
+    if arch == "gemma3":
+        w.add("gemma3.attention.key_length", gguf.T_UINT32, head_dim)
+        w.add("gemma3.attention.value_length", gguf.T_UINT32, head_dim)
+        w.add("gemma3.attention.sliding_window", gguf.T_UINT32, 3)
+        w.add_array("gemma3.attention.sliding_window_pattern", gguf.T_BOOL,
+                    [(i + 1) % 6 != 0 for i in range(n_layer)])
+        w.add("gemma3.attention.scale", gguf.T_FLOAT32, 1.0 / (head_dim ** 0.5))
+        w.add("gemma3.rope.freq_base", gguf.T_FLOAT32, 1000000.0)
+        w.add("gemma3.rope.freq_base_swa", gguf.T_FLOAT32, 10000.0)
+        w.add("gemma3.rope.scaling.type", gguf.T_STRING, "linear")
+        w.add("gemma3.rope.scaling.factor", gguf.T_FLOAT32, 2.0)
+        w.add("gemma3.final_logit_softcapping", gguf.T_FLOAT32, 20.0)
 
     w.add("tokenizer.ggml.model", gguf.T_STRING, "llama")
     w.add_array("tokenizer.ggml.tokens", gguf.T_STRING, tokens)
@@ -83,6 +111,9 @@ def main(path: str, dtype: str = "F32") -> None:
 
     def ones(n: int) -> list[float]:
         return [1.0] * n
+
+    def normish(n: int, base: float = 1.0) -> list[float]:
+        return [base + ((i % 7) - 3) * 0.03125 for i in range(n)]
 
     def raw_q2_k(n: int) -> bytes:
         if n % 256:
@@ -186,34 +217,53 @@ def main(path: str, dtype: str = "F32") -> None:
             w.add_tensor(name, shape, values, tdtype)
 
     # note: GGUF shape order is (cols, rows) - shape[0] is the input dim
+    q_dim = n_head * head_dim
+    kv_dim = n_kv * head_dim
     add_weight("token_embd.weight", (n_embd, n_vocab),
                rand(n_vocab * n_embd), dtype)
-    for i in range(N_LAYER):
+    for i in range(n_layer):
         p = f"blk.{i}."
-        add_weight(p + "attn_norm.weight", (n_embd,), ones(n_embd), dtype)
-        add_weight(p + "attn_q.weight", (n_embd, n_embd),
-                   rand(n_embd * n_embd), dtype)
-        add_weight(p + "attn_k.weight", (n_embd, n_embd),
-                   rand(n_embd * n_embd), dtype)
-        add_weight(p + "attn_v.weight", (n_embd, n_embd),
-                   rand(n_embd * n_embd), dtype)
-        add_weight(p + "attn_output.weight", (n_embd, n_embd),
-                   rand(n_embd * n_embd), dtype)
-        add_weight(p + "ffn_norm.weight", (n_embd,), ones(n_embd), dtype)
+        add_weight(p + "attn_norm.weight", (n_embd,), normish(n_embd), "F32")
+        add_weight(p + "attn_q.weight", (n_embd, q_dim),
+                   rand(n_embd * q_dim), dtype)
+        add_weight(p + "attn_k.weight", (n_embd, kv_dim),
+                   rand(n_embd * kv_dim), dtype)
+        add_weight(p + "attn_v.weight", (n_embd, kv_dim),
+                   rand(n_embd * kv_dim), dtype)
+        add_weight(p + "attn_output.weight", (q_dim, n_embd),
+                   rand(q_dim * n_embd), dtype)
+        if arch == "gemma3":
+            add_weight(p + "attn_q_norm.weight", (head_dim,),
+                       normish(head_dim, 0.875), "F32")
+            add_weight(p + "attn_k_norm.weight", (head_dim,),
+                       normish(head_dim, 1.125), "F32")
+            add_weight(p + "post_attention_norm.weight", (n_embd,),
+                       normish(n_embd, 0.75), "F32")
+        add_weight(p + "ffn_norm.weight", (n_embd,), normish(n_embd, 1.25), "F32")
         add_weight(p + "ffn_gate.weight", (n_embd, n_ff),
                    rand(n_embd * n_ff), dtype)
         add_weight(p + "ffn_up.weight", (n_embd, n_ff),
                    rand(n_embd * n_ff), dtype)
         add_weight(p + "ffn_down.weight", (n_ff, n_embd),
                    rand(n_ff * n_embd), dtype)
-    add_weight("output_norm.weight", (n_embd,), ones(n_embd), dtype)
-    add_weight("output.weight", (n_embd, n_vocab),
-               rand(n_vocab * n_embd), dtype)
+        if arch == "gemma3":
+            add_weight(p + "post_ffw_norm.weight", (n_embd,),
+                       normish(n_embd, 0.625), "F32")
+    add_weight("output_norm.weight", (n_embd,), normish(n_embd, 1.5), "F32")
+    if arch != "gemma3":
+        add_weight("output.weight", (n_embd, n_vocab),
+                   rand(n_vocab * n_embd), dtype)
 
     w.write()
-    print(f"wrote {path} (vocab={n_vocab}, dtype={dtype})")
+    print(f"wrote {path} (arch={arch}, vocab={n_vocab}, dtype={dtype})")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "tiny.gguf",
-         sys.argv[2] if len(sys.argv) > 2 else "F32")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", nargs="?", default="tiny.gguf")
+    ap.add_argument("dtype", nargs="?", default="F32")
+    ap.add_argument("--arch", default="llama",
+                    choices=["llama", "mistral", "qwen2", "qwen3",
+                             "stablelm", "gemma", "gemma3"])
+    args = ap.parse_args()
+    main(args.path, args.dtype, arch=args.arch)
