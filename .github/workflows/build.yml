@@ -42,6 +42,7 @@ jobs:
       # suite, so nothing noticed when the bench fixture could only write
       # llama-architecture files. Run both shapes on a tiny synthetic model.
       - name: Bench harness (synthetic llama + gemma3)
+        shell: bash   # the Windows runner defaults to PowerShell, where "\" is not a line continuation
         run: |
           python tests/make_bench_model.py bench-llama.gguf Q4_0 \
             --vocab 2000 --embd 128 --ff 256 --layers 2 --heads 4
