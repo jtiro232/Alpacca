@@ -513,6 +513,21 @@ class Model:
     # ---- KV cache -------------------------------------------------------
 
     def _init_cache(self):
+        """Allocate the KV cache at the full context for every layer.
+
+        Sliding-window layers only ever read the last `sliding_window` rows, so
+        this over-allocates - 1.35 GiB at a 32k context on Gemma 3, though the
+        default 4096 clamp bounds it to ~154 MiB and np.zeros is lazily mapped,
+        so nothing is touched until it is written.
+
+        A ring buffer indexed by `pos % window` would reclaim that, and it
+        would be WRONG here. `_truncate_cache` plus `prefill`'s prefix reuse can
+        restart at position 100 after the cache has reached 3000, and slot
+        `100 % window` would still hold position 2659's K. Any fix has to keep
+        absolute-position semantics or invalidate the cache on truncation. Note
+        also that the batch path writes up to `window + chunk - 1` rows, so a
+        window-sized buffer is too small at the default chunk of 256.
+        """
         hp = self.hp
         if T.HAS_NUMPY:
             self.cache_k = [np.zeros((self.n_ctx, hp.n_kv, hp.head_dim), dtype=np.float32)
