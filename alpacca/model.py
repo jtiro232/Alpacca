@@ -78,8 +78,9 @@ def auto_budget_fit_mb(path: str, n_ctx: int = 0):
     header alone: (eligible_mb, fixed_mb) where eligible_mb is the dense
     float32 size of every matrix the densify plan could select, and
     fixed_mb covers what stays resident regardless - residual quantized
-    storage (~1.3 B/weight upper bound), the KV cache at the effective
-    context, and a runtime baseline. Matrices with unsupported dtypes
+    storage (~1.3 B/weight upper bound, counted for the token embedding
+    whether or not it is tied), the KV cache at the effective context, and a
+    runtime baseline. Matrices with unsupported dtypes
     load dense float32 regardless of any budget and are counted in
     neither term, so mixed-format files understate fixed memory (same
     blind spot as the fallback formula). Returns None if the header
@@ -121,11 +122,15 @@ def auto_budget_fit_mb(path: str, n_ctx: int = 0):
                         continue
                     if T.can_quantized_matvec(info.dtype, int(info.shape[0])):
                         eligible += info.n_elements * 4
-        if not tied:
-            embd = gf.tensors.get("token_embd.weight")
-            if embd is not None and len(embd.shape) >= 2 and \
-                    T.can_quantized_matvec(embd.dtype, int(embd.shape[0])):
-                residual += int(embd.n_elements * 1.3)
+        # The token embedding is resident either way: quantized if the budget
+        # does not reach it, dense (already in `eligible`) if it does. Counting
+        # the quantized form unconditionally makes `fixed` an upper bound
+        # rather than leaving a *tied* embedding out of both terms - on a
+        # Gemma 3 1B that gap was 374 MiB of unaccounted memory.
+        embd = gf.tensors.get("token_embd.weight")
+        if embd is not None and len(embd.shape) >= 2 and \
+                T.can_quantized_matvec(embd.dtype, int(embd.shape[0])):
+            residual += int(embd.n_elements * 1.3)
 
         ctx_eff = min(train_ctx, n_ctx) if n_ctx else min(train_ctx, 4096)
         kv_bytes = 2 * n_layer * max(ctx_eff, 0) * n_kv * head_dim * 4

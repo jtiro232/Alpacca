@@ -1061,6 +1061,18 @@ def main() -> None:
               str(fit))
         check("auto budget fit sizing is None for unreadable models",
               auto_budget_fit_mb(str(srv / "does-not-exist.gguf")) is None)
+        # a TIED embedding is eligible for densification, but if the budget
+        # does not reach it the quantized copy is still resident - it used to
+        # be counted in neither term (374 MiB unaccounted on a Gemma 3 1B)
+        tied_fit = auto_budget_fit_mb(str(srv / "tiny-gemma3-q4.gguf"))
+        with GGUFFile.open(str(srv / "tiny-gemma3-q4.gguf")) as _tf:
+            tied_embd = _tf.tensors["token_embd.weight"].n_elements
+            check("the gemma3 fixture really is tied",
+                  "output.weight" not in _tf.tensors)
+        check("a tied token embedding is counted in the fixed memory term",
+              tied_fit is not None and
+              tied_fit[1] - 512.0 > tied_embd * 1.3 / (1024 * 1024) * 0.99,
+              str(tied_fit))
         for arch in ("qwen2", "qwen3", "gemma"):
             arch_model = Model.load(str(srv / f"tiny-{arch}.gguf"), progress=False)
             arch_logits = arch_model.prefill([1])

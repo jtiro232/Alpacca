@@ -353,11 +353,22 @@ def cmd_nickname(args) -> int:
         if not nicks:
             print("no nicknames set")
             return 0
+        from .store import find_local
         installed = {m["name"] for m in list_models()}
         width = max(8, max(_display_width(n) for n in nicks))
         print(f"{_pad('NICKNAME', width)}  MODEL")
         for nick, target in sorted(nicks.items(), key=lambda kv: kv[0].lower()):
-            note = "" if target in installed else "   (not installed)"
+            note = ""
+            if target not in installed:
+                note = "   (target not installed)"
+            else:
+                # installed canonical names beat nicknames, so a nickname that
+                # is itself an installed model's name can never be honoured
+                try:
+                    if find_local(parse_model_ref(nick)) is not None:
+                        note = "   (shadowed by an installed model of that name)"
+                except ValueError:
+                    pass
             print(f"{_pad(nick, width)}  {target}{note}")
         return 0
     if not args.model:
