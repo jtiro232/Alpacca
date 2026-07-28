@@ -17,12 +17,12 @@ git log --oneline -4
 git status -sb
 ```
 
-Expected (the top SHA is this document's own commit):
+Expected (the top two are this document's own commits):
 ```
+f18aabf docs: retarget the audit handoff at a local CLI run
 de67bd6 docs: audit handoff for the remaining Gemma 3 / nickname fixes
 1109c5e fix: close audit findings in Gemma 3 chat, model store, and serve
 426b43a Add Gemma 3 text GGUF support
-d14f0b1 Add model nicknames to manager
 ```
 
 If `1109c5e` is missing, stop and say so — §1 would be wrong and you would be
@@ -88,9 +88,6 @@ takes, and none of them are covered by the test fixture (see Task 3a):
 `attention.scale`, `attention.sliding_window_pattern`, `full_attention_interval`,
 `vocab_size`, `rope.scaling.*`, `rope.dimension_count`, `embedding_scale`,
 `final_logit_softcapping`, and `output.weight` (so embeddings are **tied**).
-
-Every one of those absences is a fallback path the code takes in production and
-the test fixture does not exercise — see Task 3a.
 
 ### Things verified CORRECT — do not "fix" these
 
