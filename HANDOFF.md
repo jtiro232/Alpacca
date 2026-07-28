@@ -7,17 +7,19 @@ pushed** — do not redo them. Your job is the rest.
 
 ## Setup
 
-You are reading this from the repo, on branch `alpacca-gemma3-615`. Confirm the
-fix commit is in your history before trusting §1:
+The repo is already checked out at `/home/hoopbot/alpacca` on branch
+`alpacca-gemma3-615`, and you are reading this from its root. Confirm the fix
+commit is in your history before trusting §1:
 
 ```sh
+cd /home/hoopbot/alpacca
 git log --oneline -4
-git cat-file -e 1109c5e^{commit} && echo "fix commit present"
+git status -sb
 ```
 
-Expected (the top SHA is this document's own commit and will differ):
+Expected (the top SHA is this document's own commit):
 ```
-<docs>  docs: audit handoff for the remaining Gemma 3 / nickname fixes
+de67bd6 docs: audit handoff for the remaining Gemma 3 / nickname fixes
 1109c5e fix: close audit findings in Gemma 3 chat, model store, and serve
 426b43a Add Gemma 3 text GGUF support
 d14f0b1 Add model nicknames to manager
@@ -31,9 +33,18 @@ because the Critical in Task 1 is still open. Do not merge or push to `main`.
 Commit to `alpacca-gemma3-615` as you go; do not force-push. Delete this file
 when the work is done.
 
-The engine is dependency-free by design (pure Python, NumPy optional). Install
-`numpy` for the fast path. `numba` is optional and was absent during the audit,
-so `alpacca.kernels.available()` was False for every measurement quoted here.
+### This machine
+
+Python 3.12.3, numpy 1.26.4. **numba is not installed**, so
+`alpacca.kernels.available()` is False and every performance number quoted here
+was measured on the numpy path against reference netlib BLAS. The engine is
+dependency-free by design (pure Python, NumPy optional) — keep it that way.
+
+PyPI is reachable and `pip` works, so you *can* install a reference tokenizer
+for verification (see Task 0a). Anything you install for that purpose must not
+become a runtime dependency.
+
+Run the CLI as `python3 -m alpacca ...` from the repo root.
 
 ---
 
@@ -44,9 +55,23 @@ except where Task 0 explicitly tells you to.
 
 ### The model this branch exists to support
 
-The audit used a real Gemma-3-1B GGUF that is **not in this repo** and is not
-available to you by default. Its metadata, which you should treat as the
-reference for what a real Gemma 3 file looks like:
+A real Gemma-3-1B GGUF **is installed on this machine** and is what the audit
+used end to end. It is aliased `"Gemma heretic"`, so `python3 -m alpacca run
+"Gemma heretic" ...` works, and the file itself is at:
+
+```
+/home/hoopbot/.alpacca/models/hf/Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF/default/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_Q4_k_m.gguf
+```
+
+It is ~806 MB, loads in ~2 s and decodes at ~1.4 tok/s fully quantized — set
+`ALPACCA_DENSE_WEIGHT_MB=0` to hold RAM near 1 GB. Metadata-only reads
+(`GGUFFile.open` + `.metadata` / `.tensors`) are cheap; prefer them when you do
+not need weights. `llama3.2:1b` is also installed and uses
+`tokenizer.ggml.model="gpt2"` (BPE), so it exercises the *other* tokenizer path
+and is your control for Task 1.
+
+Its metadata, which you should treat as the reference for what a real Gemma 3
+file looks like:
 
 ```
 block_count=26  context_length=32768  embedding_length=1152
@@ -64,18 +89,8 @@ takes, and none of them are covered by the test fixture (see Task 3a):
 `vocab_size`, `rope.scaling.*`, `rope.dimension_count`, `embedding_scale`,
 `final_logit_softcapping`, and `output.weight` (so embeddings are **tied**).
 
-If you have network egress, you can fetch it — it is ~806 MB, loads in ~2 s and
-decodes at ~1.4 tok/s fully quantized (use `ALPACCA_DENSE_WEIGHT_MB=0` to hold
-RAM near 1 GB):
-
-```sh
-python3 -m alpacca pull hf:Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF
-```
-
-This is **optional but high value** — it is the only way to reproduce the
-end-to-end checks. If you skip it, say so explicitly in your report and rely on
-the tiny fixtures instead. Metadata-only reads (`GGUFFile.open` + `.metadata` /
-`.tensors`) are cheap even for large files.
+Every one of those absences is a fallback path the code takes in production and
+the test fixture does not exercise — see Task 3a.
 
 ### Things verified CORRECT — do not "fix" these
 
@@ -148,19 +163,20 @@ its own conclusions. That is not review. Do this first, and do it sceptically �
 if something below is wrong, everything built on it inherits the error.
 
 **0a. Re-derive the tokenizer diagnosis yourself. You are better placed to do
-this than the agent that wrote it.** That agent had no independent tokenizer
-library available and had to hand-port llama.cpp's algorithm from memory —
-twice, by two sub-agents who could share a blind spot. If you have network
-egress, you do not have that limitation:
+this than the agent that wrote it.** That agent worked with no independent
+tokenizer library installed and had to hand-port llama.cpp's algorithm from
+memory — twice, by two sub-agents who could share a blind spot. PyPI is
+reachable here, so you do not have that limitation:
 
 ```sh
-pip install sentencepiece transformers    # or fetch llama.cpp's gguf-py / tokenizer
+pip install --user sentencepiece transformers    # or llama.cpp's gguf-py
 ```
 
 Independently establish (i) what `tokenizer.ggml.scores` actually means for a
 Gemma vocab, and (ii) what llama.cpp's SPM tokenizer actually does. Then decide
 whether Task 1's diagnosis holds. **Report disagreement loudly** rather than
-working around it. This single check is the highest-value thing you can do.
+working around it. This single check is the highest-value thing you can do, and
+it is the one check the original audit could not perform.
 
 **0b. Review commit `1109c5e`.** It passes both suites, but passing tests only
 proves the tests did not catch a bug. Look hardest at:
@@ -464,20 +480,21 @@ env PYTHONDONTWRITEBYTECODE=1 ALPACCA_PURE=1 python3 tests/smoke.py    # expect:
 The counts should only go **up** as you add tests. If a count drops, you removed
 coverage — say so and justify it.
 
-If you pulled the real model (§0), this must keep producing a correct answer:
+And this end-to-end check on the real installed model must keep producing a
+correct answer (~40 s including load):
 
 ```sh
-env ALPACCA_DENSE_WEIGHT_MB=0 python3 -m alpacca run \
-  hf:Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF \
+env ALPACCA_DENSE_WEIGHT_MB=0 python3 -m alpacca run "Gemma heretic" \
   "What is the capital of France?" -n 24 --seed 1 -c 256
 # expect something equivalent to: The capital of France is **Paris**.
 ```
 
-If you did not pull it, state that plainly in your report and note which claims
-you therefore could not verify.
+Before `1109c5e` that same command produced
+`Francia é tbe capan e tbe fcapiti al de Frane tbe capan.` — if you ever see
+output like that again, you have reintroduced the BOS or tokenizer defect.
 
 For Task 1 specifically, also report before/after token counts for the table in
-§2 Task 1, and confirm a BPE model's output is byte-identical.
+§2 Task 1, and confirm `llama3.2:1b` (BPE path) output is byte-identical.
 
 Report exact commands and outcomes. If a fix turns out to be wrong or a claim
 above does not reproduce, say so plainly rather than working around it — several
