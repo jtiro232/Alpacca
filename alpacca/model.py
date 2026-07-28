@@ -376,6 +376,7 @@ class Model:
             quantized_bytes = 0
             quantized_matrices: dict[str, int] = {}
             fallback_matrices: dict[str, int] = {}
+            shape_blocked: dict[str, int] = {}
             densified_names: list[str] = []
 
             # ALPACCA_DENSE_WEIGHT_MB: pick which quantizable matrices to
@@ -431,6 +432,12 @@ class Model:
                 elif info.dtype in _KNOWN_QUANT_DTYPES:
                     fallback_matrices[info.dtype] = (
                         fallback_matrices.get(info.dtype, 0) + 1)
+                    # distinguish "this format has no kernel" from "this
+                    # matrix is the wrong width for one": Q4_K/Q6_K need a
+                    # multiple of 256 columns, and a third-party conversion
+                    # that ignores that goes fully dense with no other clue
+                    if T.can_quantized_matvec(info.dtype, 256):
+                        shape_blocked[info.dtype] = cols
                 dense_matrices += 1
                 dense_bytes += info.n_elements * 4
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
@@ -514,8 +521,20 @@ class Model:
                                and len(gf.tensors[nm].shape) >= 2)
                 fb_mb = fb_bytes / (1024 * 1024)
                 size = f"{fb_mb / 1024:.1f} GiB" if fb_mb >= 1024 else f"{fb_mb:.0f} MiB"
-                print(f"warning: alpacca has no quantized matvec for "
-                      f"{'/'.join(sorted(fallback_matrices))}, so "
+                # a file can hit both causes at once, so report them apart
+                unsupported = sorted(set(fallback_matrices) - set(shape_blocked))
+                reasons = []
+                if shape_blocked:
+                    reasons.append(
+                        "%s needs a column count that is a multiple of its "
+                        "block size and this file has %s"
+                        % ("/".join(sorted(shape_blocked)),
+                           "/".join(str(shape_blocked[d])
+                                    for d in sorted(shape_blocked))))
+                if unsupported:
+                    reasons.append("alpacca has no quantized matvec for %s"
+                                   % "/".join(unsupported))
+                print(f"warning: {'; '.join(reasons)}, so "
                       f"{sum(fallback_matrices.values())} matrices load as dense "
                       f"float32 ({size}) - no memory budget accounts for this",
                       file=sys.stderr)
