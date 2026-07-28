@@ -178,9 +178,7 @@ def _read_nicknames() -> dict[str, str]:
     path = _nicknames_file()
     try:
         data = json.loads(path.read_text("utf-8"))
-    except FileNotFoundError:
-        return {}
-    except OSError:
+    except OSError:   # missing, unreadable, a directory - nothing to quarantine
         return {}
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         # RecursionError is a RuntimeError, not a ValueError: deeply nested
