@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 
@@ -28,6 +29,11 @@ SUPPORTED_ARCHES = {
     "gemma": "neox",
     "gemma3": "neox",
 }
+
+# The Gemma family scales the embedding by sqrt(n_embd) on the way in and uses
+# GELU rather than SiLU in the MLP. Gemma 1 otherwise runs the llama-class
+# decoder; Gemma 3 has its own forward pass for the extra norms and dual RoPE.
+_GEMMA_ARCHES = ("gemma", "gemma3")
 
 _KNOWN_QUANT_DTYPES = {
     "Q2_K", "Q3_K", "Q4_0", "Q4_1", "Q4_K", "Q5_0", "Q5_1", "Q5_K",
@@ -298,7 +304,7 @@ class Model:
                 attention_scale=attention_scale,
                 final_logit_softcap=float(meta("final_logit_softcapping", 0.0) or 0.0),
                 embed_scale=(float(meta("embedding_scale", math.sqrt(n_embd)))
-                             if arch == "gemma3" else 1.0),
+                             if arch in _GEMMA_ARCHES else 1.0),
                 full_attention_period=full_attention_period,
             )
 
@@ -379,7 +385,6 @@ class Model:
             kv_dim = hp.n_kv * hp.head_dim
             q_dim = hp.n_head * hp.head_dim
             m.tok_embd = tensor_mat("token_embd.weight", hp.n_vocab, hp.n_embd)
-            import sys
             for i in range(hp.n_layer):
                 if progress:
                     print(f"\rloading layers {i + 1}/{hp.n_layer}", end="",
@@ -424,6 +429,22 @@ class Model:
                 "densified": sorted(densified_names),
                 "densified_bytes": densified_bytes,
             }
+
+            # A quantization the engine cannot matvec is dequantized to dense
+            # float32 at load - Q2_K weights become 8x their file size, which
+            # neither budget formula accounts for. Say so before the RAM goes.
+            if fallback_matrices and progress:
+                fb_bytes = sum(gf.tensors[nm].n_elements * 4
+                               for nm in gf.tensors
+                               if gf.tensors[nm].dtype in fallback_matrices
+                               and len(gf.tensors[nm].shape) >= 2)
+                fb_mb = fb_bytes / (1024 * 1024)
+                size = f"{fb_mb / 1024:.1f} GiB" if fb_mb >= 1024 else f"{fb_mb:.0f} MiB"
+                print(f"warning: alpacca has no quantized matvec for "
+                      f"{'/'.join(sorted(fallback_matrices))}, so "
+                      f"{sum(fallback_matrices.values())} matrices load as dense "
+                      f"float32 ({size}) - no memory budget accounts for this",
+                      file=sys.stderr)
 
             m.n_ctx = min(n_ctx, hp.n_ctx_train) if n_ctx else min(hp.n_ctx_train, 4096)
             m._init_cache()
@@ -594,6 +615,8 @@ class Model:
         positions = np.arange(pos0, pos0 + len(tokens), dtype=np.int32)
         # matrix_rows returns a fresh float32 array for dense and quantized
         x = T.matrix_rows(self.tok_embd, tokens)
+        if hp.embed_scale != 1.0:
+            x = x * hp.embed_scale
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
@@ -624,7 +647,8 @@ class Model:
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
             gate = T.matmul_t(h, ly.w_gate)
             up = T.matmul_t(h, ly.w_up)
-            act = gate / (1.0 + np.exp(-gate)) * up
+            act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
+                   else gate / (1.0 + np.exp(-gate))) * up
             x = x + T.matmul_t(act, ly.w_down)
 
         self.n_past += len(tokens)
@@ -635,6 +659,8 @@ class Model:
         hp = self.hp
         pos = self.n_past
         x = T.matrix_row(self.tok_embd, token)  # fresh float32 copy
+        if hp.embed_scale != 1.0:
+            x = x * hp.embed_scale
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
@@ -662,7 +688,8 @@ class Model:
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
             gate = T.matvec(ly.w_gate, h)
             up = T.matvec(ly.w_up, h)
-            act = gate / (1.0 + np.exp(-gate)) * up
+            act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
+                   else gate / (1.0 + np.exp(-gate))) * up
             x = x + T.matvec(ly.w_down, act)
 
         self.n_past += 1
@@ -921,6 +948,8 @@ class Model:
         hp = self.hp
         pos = self.n_past
         x = T.matrix_row(self.tok_embd, token)
+        if hp.embed_scale != 1.0:
+            x = T.scale(x, hp.embed_scale)
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
         hd = hp.head_dim
@@ -962,7 +991,9 @@ class Model:
             x = T.add(x, T.matvec(ly.wo, att_out))
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            act = T.mul(T.silu(T.matvec(ly.w_gate, h)), T.matvec(ly.w_up, h))
+            gate = T.matvec(ly.w_gate, h)
+            act = T.mul(T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
+                        else T.silu(gate), T.matvec(ly.w_up, h))
             x = T.add(x, T.matvec(ly.w_down, act))
 
         self.n_past += 1

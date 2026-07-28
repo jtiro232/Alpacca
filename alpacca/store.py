@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import unicodedata
@@ -159,12 +160,34 @@ def _clean_nickname(nickname: str) -> str:
     return " ".join(text.strip().split())
 
 
-def _read_nicknames() -> dict[str, str]:
+def _quarantine_nicknames(path: Path, err: Exception) -> None:
+    """Move an unreadable nicknames file aside and say so, once."""
+    spoiled = path.with_suffix(path.suffix + ".corrupt")
     try:
-        data = json.loads(_nicknames_file().read_text("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        os.replace(path, spoiled)
+    except OSError:
+        print(f"alpacca: warning: {path} is unreadable ({err}); "
+              f"model nicknames are being ignored", file=sys.stderr)
+        return
+    print(f"alpacca: warning: {path} is unreadable ({err}); "
+          f"moved it to {spoiled.name} and starting a new nickname file",
+          file=sys.stderr)
+
+
+def _read_nicknames() -> dict[str, str]:
+    path = _nicknames_file()
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         # RecursionError is a RuntimeError, not a ValueError: deeply nested
-        # JSON would otherwise fail every command that touches the map
+        # JSON would otherwise fail every command that touches the map.
+        # The file is readable but unusable - the next write would replace it,
+        # so put it out of harm's way rather than destroying the only copy.
+        _quarantine_nicknames(path, e)
         return {}
     if isinstance(data, dict) and isinstance(data.get("nicknames"), dict):
         data = data["nicknames"]

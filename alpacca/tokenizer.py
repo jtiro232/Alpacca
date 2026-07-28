@@ -380,15 +380,26 @@ class StreamDecoder:
 
     def feed(self, token_id: int) -> str:
         self.pending += self.tok.token_bytes(token_id)
-        # emit the longest prefix that is valid UTF-8
-        for cut in range(len(self.pending), max(len(self.pending) - 4, -1), -1):
-            try:
-                text = self.pending[:cut].decode("utf-8")
-                self.pending = self.pending[cut:]
-                return text
-            except UnicodeDecodeError:
-                continue
-        return ""
+        out = ""
+        while self.pending:
+            # emit the longest prefix that is valid UTF-8
+            for cut in range(len(self.pending), max(len(self.pending) - 4, -1), -1):
+                try:
+                    out += self.pending[:cut].decode("utf-8")
+                    self.pending = self.pending[cut:]
+                    return out
+                except UnicodeDecodeError:
+                    continue
+            # No prefix decoded, so the head is broken rather than merely
+            # truncated. Only the last 3 bytes can still be the start of a
+            # character; replace the rest instead of holding a poisoned buffer
+            # and emitting nothing for the whole rest of the response - which
+            # also stopped stop-strings from ever matching again.
+            if len(self.pending) <= 3:
+                return out
+            out += self.pending[:-3].decode("utf-8", errors="replace")
+            self.pending = self.pending[-3:]
+        return out
 
     def flush(self) -> str:
         text = self.pending.decode("utf-8", errors="replace")

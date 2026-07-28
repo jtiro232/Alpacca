@@ -683,6 +683,34 @@ def main() -> None:
         check("finish_reason maps end-of-generation to stop",
               _finish_reason(GenerationResult("", 4, 0.1, stop_reason="eog"))
               == "stop")
+        # ---- incremental detokenizing ------------------------------------
+        # One undecodable byte used to poison the buffer for the rest of the
+        # response: nothing was emitted again, which also stopped stop-strings
+        # from ever matching.
+        import alpacca.tokenizer as _tokmod
+        from alpacca.tokenizer import StreamDecoder, TT_BYTE
+        byte_tok = _tokmod.Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.tokens": ["<unk>"] + [f"<0x{b:02X}>" for b in range(256)],
+            "tokenizer.ggml.token_type": [2] + [TT_BYTE] * 256,
+            "tokenizer.ggml.unknown_token_id": 0,
+        })
+        dec = StreamDecoder(byte_tok)
+        bad = byte_tok.token_id("<0xFF>")
+        emitted = "".join(dec.feed(t) for t in
+                          [bad] + [byte_tok.token_id(f"<0x{ord(c):02X}>")
+                                   for c in "hello world"])
+        emitted += dec.flush()
+        check("the stream decoder keeps emitting after an undecodable byte",
+              "hello world" in emitted, repr(emitted))
+        # a genuinely split multi-byte character must still be held back
+        dec2 = StreamDecoder(byte_tok)
+        euro = "€".encode("utf-8")   # 3 bytes
+        parts = [dec2.feed(byte_tok.token_id(f"<0x{b:02X}>")) for b in euro]
+        check("the stream decoder holds back a split multi-byte character",
+              parts[0] == "" and parts[1] == "" and parts[2] == "€",
+              str(parts))
+
         # ---- model reference round-tripping ------------------------------
         from alpacca.store import _clean_nickname, parse_model_ref
         round_trip = ["llama3.2:1b", "llama3.2", "ollama:user/name:tag",
@@ -701,6 +729,30 @@ def main() -> None:
               parse_model_ref("ollama:user/name:tag").display() ==
               "ollama:user/name:tag",
               parse_model_ref("ollama:user/name:tag").display())
+
+        # ---- a corrupt nicknames file is preserved, not destroyed ---------
+        from alpacca.store import _nicknames_file, _read_nicknames
+        nick_home = os.environ.get("ALPACCA_HOME")
+        try:
+            os.environ["ALPACCA_HOME"] = str(tmp / "nick-corrupt-home")
+            nf = _nicknames_file()
+            nf.parent.mkdir(parents=True, exist_ok=True)
+            nf.write_text('{"nicknames": {"a": ', "utf-8")   # truncated JSON
+            spoiled = nf.with_suffix(nf.suffix + ".corrupt")
+            check("a corrupt nicknames file degrades to an empty map",
+                  _read_nicknames() == {})
+            check("a corrupt nicknames file is moved aside, not overwritten",
+                  spoiled.exists() and not nf.exists() and
+                  spoiled.read_text("utf-8") == '{"nicknames": {"a": ',
+                  str(list(nf.parent.iterdir())))
+            nf.write_text("[" * 200000, "utf-8")  # RecursionError from json
+            check("deeply nested nicknames JSON does not escape as RuntimeError",
+                  _read_nicknames() == {})
+        finally:
+            if nick_home is None:
+                os.environ.pop("ALPACCA_HOME", None)
+            else:
+                os.environ["ALPACCA_HOME"] = nick_home
 
         # ---- nickname sanitizing -----------------------------------------
         check("nickname sanitizing strips ANSI escapes",
@@ -957,6 +1009,38 @@ def main() -> None:
                   arch_model.hp.rope_style == "neox" and
                   len(T.to_list(arch_logits)) == arch_model.hp.n_vocab,
                   arch_model.describe())
+
+        # ---- Gemma 1 -----------------------------------------------------
+        # `gemma` was listed in SUPPORTED_ARCHES but ran the plain llama
+        # forward pass: no sqrt(n_embd) embedding scale and SiLU instead of
+        # GELU. Both are now applied; verified against an independent float64
+        # reference (5.3e-07 on NumPy, 1.1e-15 on the pure backend).
+        gemma1 = Model.load(str(srv / "tiny-gemma.gguf"), progress=False)
+        check("gemma scales the embedding by sqrt(n_embd)",
+              abs(gemma1.hp.embed_scale - 64 ** 0.5) < 1e-6,
+              str(gemma1.hp.embed_scale))
+        check("gemma ties the output head to the token embedding",
+              gemma1.output is gemma1.tok_embd)
+        check("llama-class architectures do not scale the embedding",
+              Model.load(str(srv / "model.gguf"), progress=False).hp.embed_scale
+              == 1.0)
+        g1_last = None
+        for _t in range(1, 7):
+            g1_last = gemma1.forward(_t)
+        g1_values = T.to_list(g1_last)
+        expected_g1 = [-0.057178, 0.022701, 0.552373, 1.243609,
+                       -0.192921, 0.171072, 4.553725, -1.028753]
+        g1_diff = max(abs(float(a) - b) for a, b in zip(g1_values[:8], expected_g1))
+        check(f"tiny gemma logits are stable (diff {g1_diff:.2e})",
+              g1_diff < 1e-5, str([round(float(v), 6) for v in g1_values[:8]]))
+        if T.HAS_NUMPY:
+            g1_batch = Model.load(str(srv / "tiny-gemma.gguf"), progress=False)
+            g1_bdiff = max(abs(float(a) - float(b))
+                           for a, b in zip(g1_values,
+                                           T.to_list(g1_batch.forward_batch(
+                                               list(range(1, 7))))))
+            check(f"tiny gemma batch matches sequential (diff {g1_bdiff:.2e})",
+                  g1_bdiff < 1e-5, str(g1_bdiff))
 
         gemma3 = Model.load(str(srv / "tiny-gemma3.gguf"), progress=False)
         check("load tiny gemma3 reads architecture-specific metadata",
@@ -1242,6 +1326,63 @@ def main() -> None:
         res = generate(ctx_model, list(range(1, 5)), ctx_params, n_predict=4)
         check("a spent n_predict budget is reported as length",
               res.tokens == 4 and res.stop_reason == "length", str(res))
+        # a multi-token stop string must not reach the stream before it can be
+        # detected: the caller would print text that is then truncated away
+        import re as _re
+        ctx_model.reset()
+        seen = []
+        first = generate(ctx_model, [1, 2], ctx_params, n_predict=12,
+                         stream=seen.append)
+        check("streaming without stop strings still emits everything",
+              "".join(seen) == first.text, f"{''.join(seen)!r} {first.text!r}")
+        # A stop string that arrives inside a single token is detected before
+        # anything is streamed, so it cannot show the bug. Script the token
+        # sequence so the needle genuinely spans two stream callbacks.
+        class _ScriptedTok:
+            pieces = ["", "ab", "cd", "ef"]
+            bos_id = 0
+
+            def token_bytes(self, tid):
+                return self.pieces[tid].encode("utf-8")
+
+            def is_eog(self, tid):
+                return False
+
+        class _ScriptedModel:
+            def __init__(self, seq):
+                self.tok = _ScriptedTok()
+                self.seq, self.i = seq, 0
+                self.n_ctx, self.n_past = 100, 0
+
+            def _next(self):
+                tid = self.seq[min(self.i, len(self.seq) - 1)]
+                self.i += 1
+                out = [0.0] * len(self.tok.pieces)
+                out[tid] = 1.0
+                return out
+
+            def prefill(self, ids):
+                self.n_past = len(ids)
+                return self._next()
+
+            def forward(self, _tid):
+                self.n_past += 1
+                return self._next()
+
+        # emits "ab", "cd", "ef"; the stop string "bcd" straddles the first two
+        scripted = _ScriptedModel([1, 2, 3])
+        chunks = []
+        sres = generate(scripted, [0], SamplerParams(temperature=0.0, seed=1),
+                        n_predict=3, stream=chunks.append, stop_strings=["bcd"])
+        check("a stop string spanning two tokens is never streamed early",
+              "bcd" not in "".join(chunks), f"streamed={''.join(chunks)!r}")
+        check("the streamed text is exactly the returned text",
+              "".join(chunks) == sres.text,
+              f"streamed={''.join(chunks)!r} text={sres.text!r}")
+        check("the stop string is trimmed from the returned text",
+              sres.text == "a" and sres.stop_reason == "stop",
+              f"{sres.stop_reason} {sres.text!r}")
+
         ctx_model.reset()
         overflow = False
         try:

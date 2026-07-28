@@ -169,6 +169,9 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
 
     text = ""
     reason = "eog"
+    # a stop string is only detectable once its last character arrives, so
+    # hold back that much of the tail or the caller sees the beginning of it
+    hold = max((len(s) for s in stop_strings or [] if s), default=1) - 1
     while True:
         if model.n_past >= model.n_ctx:
             reason = "context"   # checked first: no room beats no budget
@@ -188,14 +191,17 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
                 text = text[:text.index(hit)]
                 reason = "stop"
                 break
-        if stream is not None and len(text) > emitted:
-            stream(text[emitted:])
-            emitted = len(text)
+        if stream is not None and len(text) - hold > emitted:
+            stream(text[emitted:len(text) - hold])
+            emitted = len(text) - hold
         if n_tokens >= budget:
             reason = "length"
             break
         logits = model.forward(tid)
-    text += dec.flush()
+    if reason == "stop":
+        dec.pending = b""   # whatever is left belongs to the stop string
+    else:
+        text += dec.flush()
     if stream is not None and len(text) > emitted:
         stream(text[emitted:])
     return GenerationResult(text=text, tokens=n_tokens, seconds=time.time() - t0,

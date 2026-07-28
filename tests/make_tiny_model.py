@@ -322,7 +322,8 @@ def main(path: str, dtype: str = "F32", arch: str = "llama",
             add_weight(p + "post_ffw_norm.weight", (n_embd,),
                        normish(n_embd, 0.625), "F32")
     add_weight("output_norm.weight", (n_embd,), normish(n_embd, 1.5), "F32")
-    if arch != "gemma3":
+    if arch not in ("gemma", "gemma3"):
+        # the Gemma family ties the output head to the token embedding
         add_weight("output.weight", (n_embd, n_vocab),
                    rand(n_vocab * n_embd), dtype)
 
