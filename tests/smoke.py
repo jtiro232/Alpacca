@@ -93,6 +93,26 @@ def main() -> None:
                 out += struct.pack("<ee", d, dmin) + scales + qh + ql
             return bytes(out)
 
+        def q2_k_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 256):
+                scales = bytes(((block * 11 + i * 23) & 0xFF) for i in range(16))
+                qs = bytes(((block * 29 + i * 7) & 0xFF) for i in range(64))
+                d = 0.00390625 + (block % 7) * 0.00048828125
+                dmin = 0.001953125 + (block % 5) * 0.000244140625
+                out += scales + qs + struct.pack("<ee", d, dmin)
+            return bytes(out)
+
+        def q3_k_bytes(n: int) -> bytes:
+            out = bytearray()
+            for block in range(n // 256):
+                hmask = bytes(((block * 17 + i * 13) & 0xFF) for i in range(32))
+                qs = bytes(((block * 29 + i * 7) & 0xFF) for i in range(64))
+                aux = bytes(((block * 5 + i * 19) & 0xFF) for i in range(12))
+                d = 0.001953125 + (block % 5) * 0.000244140625
+                out += hmask + qs + aux + struct.pack("<e", d)
+            return bytes(out)
+
         def q6_k_bytes(n: int) -> bytes:
             out = bytearray()
             for block in range(n // 256):
@@ -145,6 +165,10 @@ def main() -> None:
                 packed = q5_0_bytes(n)
             elif fmt == "Q5_1":
                 packed = q5_1_bytes(n)
+            elif fmt == "Q2_K":
+                packed = q2_k_bytes(n)
+            elif fmt == "Q3_K":
+                packed = q3_k_bytes(n)
             elif fmt == "Q4_K":
                 packed = q4_k_bytes(n)
             elif fmt == "Q5_K":
@@ -312,6 +336,8 @@ def main() -> None:
         check_quantized_matvec("Q4_1", 5, 64)
         check_quantized_matvec("Q5_0", 5, 64)
         check_quantized_matvec("Q5_1", 5, 64)
+        check_quantized_matvec("Q2_K", 3, 512)
+        check_quantized_matvec("Q3_K", 3, 512)
         check_quantized_matvec("Q4_K", 3, 512)
         check_quantized_matvec("Q5_K", 3, 512)
         check_quantized_matvec("Q6_K", 3, 512)
@@ -683,6 +709,25 @@ def main() -> None:
         check("finish_reason maps end-of-generation to stop",
               _finish_reason(GenerationResult("", 4, 0.1, stop_reason="eog"))
               == "stop")
+        # ---- quantized matvec kernel selection ---------------------------
+        from alpacca import qmatrix as _qm
+        check("the batched-matmul matvec path is off by default",
+              _qm._small_matvec_elems() == 0 and _qm._SMALL_MATVEC_ELEMS == 0,
+              str(_qm._SMALL_MATVEC_ELEMS))
+        _sme = os.environ.get("ALPACCA_SMALL_MATVEC_ELEMS")
+        try:
+            os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = "1048576"
+            check("the matvec crossover can be re-tuned from the environment",
+                  _qm._small_matvec_elems() == 1 << 20)
+            os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = "not-a-number"
+            check("a bad matvec crossover falls back to off",
+                  _qm._small_matvec_elems() == 0)
+        finally:
+            if _sme is None:
+                os.environ.pop("ALPACCA_SMALL_MATVEC_ELEMS", None)
+            else:
+                os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = _sme
+
         # ---- incremental detokenizing ------------------------------------
         # One undecodable byte used to poison the buffer for the rest of the
         # response: nothing was emitted again, which also stopped stop-strings
@@ -1666,17 +1711,45 @@ def main() -> None:
                 else:
                     os.environ["ALPACCA_F32"] = old_f32
 
+        # Q2_K and Q3_K used to have no quantized matvec, so a 1B model in
+        # either format silently expanded to 3.7 GiB of dense float32.
         q2 = Model.load(str(srv / "tiny-q2k.gguf"), progress=False)
         q2_desc = q2.describe()
-        check("load tiny Q2_K falls back to dense matrices",
-              q2.weight_storage["dense"] == 16 and
-              q2.weight_storage["fallback"] == {"Q2_K": 16} and
-              "Q2_K" not in q2.weight_storage["quantized"],
-              str(q2.weight_storage))
-        check("describe reports dense fallback Q2_K",
-              "weights dense" in q2_desc and
-              "dense fallback Q2_K" in q2_desc,
-              q2_desc)
+        if T.HAS_NUMPY:
+            check("load tiny Q2_K keeps matrix weights quantized",
+                  q2.weight_storage["quantized"] == {"Q2_K": 16} and
+                  not q2.weight_storage["fallback"] and
+                  q2.weight_storage["dense"] == 0,
+                  str(q2.weight_storage))
+            check("describe reports quantized Q2_K storage with its size",
+                  "weights quantized Q2_K (16 matrices," in q2_desc, q2_desc)
+            q2_f32_env = os.environ.get("ALPACCA_F32")
+            try:
+                os.environ["ALPACCA_F32"] = "1"
+                q2_dense = Model.load(str(srv / "tiny-q2k.gguf"), progress=False)
+            finally:
+                if q2_f32_env is None:
+                    os.environ.pop("ALPACCA_F32", None)
+                else:
+                    os.environ["ALPACCA_F32"] = q2_f32_env
+            q2_ratio = (q2_dense.weight_storage["dense_bytes"] /
+                        max(q2.weight_storage["quantized_bytes"], 1))
+            check(f"quantized Q2_K costs {q2_ratio:.1f}x less than dense float32",
+                  q2_ratio > 8.0, str(q2_ratio))
+            q2_err = max(abs(float(a) - float(b)) for a, b in
+                         zip(T.to_list(q2.prefill([1, 2, 3, 4])),
+                             T.to_list(q2_dense.prefill([1, 2, 3, 4]))))
+            check(f"Q2_K quantized matvec matches dequantize-then-dense "
+                  f"(diff {q2_err:.2e})", q2_err < 2e-3, str(q2_err))
+        else:
+            check("load tiny Q2_K falls back to dense without NumPy",
+                  q2.weight_storage["fallback"] == {"Q2_K": 16}, str(q2.weight_storage))
+            check("describe reports dense fallback Q2_K",
+                  "dense fallback Q2_K" in q2_desc, q2_desc)
+            check("Q2_K dense fallback still generates",
+                  len(T.to_list(q2.prefill([1, 2]))) == q2.hp.n_vocab)
+        check("Q2_K forward runs",
+              len(T.to_list(q2.prefill([1, 2, 3]))) == q2.hp.n_vocab)
 
         (srv / "params.json").write_text(
             '{"temperature": 0.7, "num_ctx": 256, "top_k": 30}')

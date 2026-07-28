@@ -161,6 +161,10 @@ class Hyperparams:
     final_logit_softcap: float = 0.0
     embed_scale: float = 1.0
     full_attention_period: int = 0
+    # which rule decided the sliding-window layout, so a mis-detection is
+    # visible rather than silently changing every layer's attention mask
+    swa_rule: str = ""
+    attention_scale_from_metadata: bool = False
 
 
 class Layer:
@@ -290,6 +294,7 @@ class Model:
 
             sliding_layers: tuple[bool, ...] = ()
             full_attention_period = 0
+            swa_rule = ""
             if arch == "gemma3":
                 pattern = meta("attention.sliding_window_pattern", None)
                 if isinstance(pattern, list):
@@ -298,6 +303,7 @@ class Model:
                             "gemma3.attention.sliding_window_pattern has "
                             f"{len(pattern)} entries, expected {n_layer}")
                     sliding_layers = tuple(bool(v) for v in pattern)
+                    swa_rule = "per-layer pattern"
                 elif pattern is not None:
                     # a scalar is a period, llama.cpp's set_swa_pattern:
                     #   is_swa[i] = n == 0 or (i % n < n - 1)
@@ -305,8 +311,12 @@ class Model:
                     # layer slides". A converter writes 1 for exactly the
                     # models that have no SWA, so do not second-guess it.
                     full_attention_period = int(pattern)
+                    swa_rule = "period from metadata"
                 else:
                     full_attention_period = int(meta("full_attention_interval", 6) or 6)
+                    swa_rule = ("period from full_attention_interval"
+                                if meta("full_attention_interval") is not None
+                                else "default period 6")
 
             hp = Hyperparams(
                 arch=arch,
@@ -332,6 +342,8 @@ class Model:
                 embed_scale=(float(meta("embedding_scale", math.sqrt(n_embd)))
                              if arch in _GEMMA_ARCHES else 1.0),
                 full_attention_period=full_attention_period,
+                swa_rule=swa_rule,
+                attention_scale_from_metadata=meta("attention.scale") is not None,
             )
 
             tokenizer = Tokenizer.from_gguf(gf.metadata)
@@ -750,8 +762,12 @@ class Model:
     def _rope_np_gemma3(self, vec, n_heads: int, pos: int, sliding: bool):
         cos = self._rope_cos_swa if sliding else self._rope_cos
         sin = self._rope_sin_swa if sliding else self._rope_sin
-        if cos is None or sin is None:
-            cos, sin = self._rope_cos, self._rope_sin
+        # a sliding layer only exists when sliding_window > 0, which forces
+        # rope_base_swa > 0, which builds this table - so falling back to the
+        # global table here would silently rotate sliding layers with the 1e6
+        # base and there would be no way to notice
+        assert cos is not None and sin is not None, (
+            "sliding-window RoPE table missing for a sliding layer")
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
@@ -766,8 +782,12 @@ class Model:
     def _rope_batch_np_gemma3(self, vecs, n_heads: int, positions, sliding: bool):
         cos = self._rope_cos_swa if sliding else self._rope_cos
         sin = self._rope_sin_swa if sliding else self._rope_sin
-        if cos is None or sin is None:
-            cos, sin = self._rope_cos, self._rope_sin
+        # a sliding layer only exists when sliding_window > 0, which forces
+        # rope_base_swa > 0, which builds this table - so falling back to the
+        # global table here would silently rotate sliding layers with the 1e6
+        # base and there would be no way to notice
+        assert cos is not None and sin is not None, (
+            "sliding-window RoPE table missing for a sliding layer")
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
@@ -1097,9 +1117,16 @@ class Model:
         # than letting the model look like it has a quarter of its real window
         ctx = (f"ctx {self.n_ctx}" if self.n_ctx >= hp.n_ctx_train
                else f"ctx {self.n_ctx} of {hp.n_ctx_train}")
+        attn = ""
+        if hp.arch == "gemma3" and hp.sliding_window > 0:
+            layout = (f"pattern {sum(hp.sliding_layers)}/{hp.n_layer}"
+                      if hp.sliding_layers else f"every {hp.full_attention_period}")
+            attn = (f" | swa {hp.sliding_window} ({layout}, {hp.swa_rule}) | "
+                    f"attn scale {hp.attention_scale:.4g}"
+                    f"{' (metadata)' if hp.attention_scale_from_metadata else ''}")
         return (f"{hp.arch} | {hp.n_layer} layers | embd {hp.n_embd} | "
                 f"heads {hp.n_head}/{hp.n_kv} | ff {hp.n_ff} | vocab {hp.n_vocab} | "
-                f"~{params / 1e6:.0f}M params | {ctx} | "
+                f"~{params / 1e6:.0f}M params | {ctx}{attn} | "
                 f"backend {T.backend_name()} | {storage}")
 
     @staticmethod

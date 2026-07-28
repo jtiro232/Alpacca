@@ -320,6 +320,8 @@ QUANT_GEOMETRY = {
     "Q4_1": (QK, 20, 32, True),
     "Q5_0": (QK, 22, 32, False),
     "Q5_1": (QK, 24, 32, True),
+    "Q2_K": (QK_K, 84, 16, True),
+    "Q3_K": (QK_K, 110, 16, False),
     "Q4_K": (QK_K, 144, 32, True),
     "Q5_K": (QK_K, 176, 32, True),
     "Q6_K": (QK_K, 210, 16, False),
@@ -466,12 +468,65 @@ def _np_unpack_q6_k(b):
     return q, d * sc, None
 
 
+def _np_unpack_q2_k(b):
+    # 16 uint8 scales, 64 bytes of 2-bit codes, then d and dmin as f16.
+    # Each scale byte packs the sub-block's scale in its low nibble and its
+    # offset in the high one: value = d*(sc & 0xF)*code - dmin*(sc >> 4).
+    scales = b[:, 0:16]
+    qs = b[:, 16:80]
+    d = _np_f16_col(b, 80)
+    dmin = _np_f16_col(b, 82)
+    q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
+    for half in range(2):                     # two 128-element halves
+        chunk = qs[:, half * 32:(half + 1) * 32]
+        for j in range(4):                    # four 2-bit lanes per byte
+            sub = 8 * half + 2 * j
+            code = (chunk >> (2 * j)) & 3
+            q[:, sub * 16:(sub + 1) * 16] = code[:, :16].view(_np.int8)
+            q[:, (sub + 1) * 16:(sub + 2) * 16] = code[:, 16:].view(_np.int8)
+    d_eff = d * (scales & 0x0F).astype(_np.float32)
+    m_eff = -(dmin * (scales >> 4).astype(_np.float32))
+    return q, d_eff, m_eff
+
+
+def _np_unpack_q3_k(b):
+    # 32 bytes of high bits, 64 bytes of 2-bit codes, 12 bytes of packed
+    # 6-bit scales, then d. The high-bit mask is INVERTED: a set bit means
+    # "do not subtract 4", so the code lands in [-4, 3].
+    hmask = b[:, 0:32]
+    qs = b[:, 32:96]
+    aux = b[:, 96:108].view(_np.uint32).reshape(b.shape[0], 3)
+    d_all = _np_f16_col(b, 108)
+    kmask1, kmask2 = _np.uint32(0x03030303), _np.uint32(0x0F0F0F0F)
+    tmp = aux[:, 2]
+    packed = _np.empty((b.shape[0], 4), dtype=_np.uint32)
+    packed[:, 0] = (aux[:, 0] & kmask2) | (((tmp >> 0) & kmask1) << 4)
+    packed[:, 1] = (aux[:, 1] & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    packed[:, 2] = ((aux[:, 0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+    packed[:, 3] = ((aux[:, 1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+    scales = packed.view(_np.int8).astype(_np.float32)   # (nb, 16)
+    q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
+    for half in range(2):
+        chunk = qs[:, half * 32:(half + 1) * 32]
+        for j in range(4):
+            sub = 8 * half + 2 * j
+            bit = _np.uint8(1 << (4 * half + j))
+            code = ((chunk >> (2 * j)) & 3).astype(_np.int8)
+            lo = code[:, :16] - _np.where(hmask[:, :16] & bit, 0, 4).astype(_np.int8)
+            hi = code[:, 16:] - _np.where(hmask[:, 16:] & bit, 0, 4).astype(_np.int8)
+            q[:, sub * 16:(sub + 1) * 16] = lo
+            q[:, (sub + 1) * 16:(sub + 2) * 16] = hi
+    return q, d_all * (scales - 32.0), None
+
+
 _NP_UNPACKERS = {
     "Q8_0": _np_unpack_q8_0,
     "Q4_0": _np_unpack_q4_0,
     "Q4_1": _np_unpack_q4_1,
     "Q5_0": _np_unpack_q5_0,
     "Q5_1": _np_unpack_q5_1,
+    "Q2_K": _np_unpack_q2_k,
+    "Q3_K": _np_unpack_q3_k,
     "Q4_K": _np_unpack_q4_k,
     "Q5_K": _np_unpack_q5_k,
     "Q6_K": _np_unpack_q6_k,

@@ -49,10 +49,22 @@ HAS_NUMPY = _np is not None
 
 QUANTIZED_MATVEC_DTYPES = frozenset(QUANT_GEOMETRY)
 
-# below this many elements the batched-matmul kernel beats the einsum kernel
-# (crossover measured around 1M elements on a 4-core AVX2 box; re-measure
-# before changing)
-_SMALL_MATVEC_ELEMS = 1 << 20
+# Below this many elements the batched-matmul kernel is meant to beat the
+# einsum one. Measured on two different boxes it never does: einsum wins at
+# every shape a llama- or Gemma-class model uses, by 1.07x to 4.3x. With the
+# old 1M threshold the only shape that took the batched path was Gemma 3's
+# attn_k/v (294912 elements), and that cost 1.2 ms per token across its 52
+# matvecs. Default it off, and keep the knob so it can be re-measured rather
+# than re-guessed on hardware with a different BLAS.
+def _small_matvec_elems() -> int:
+    raw = os.environ.get("ALPACCA_SMALL_MATVEC_ELEMS", "")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+_SMALL_MATVEC_ELEMS = _small_matvec_elems()
 
 _HOT_WEIGHT_ENV = "ALPACCA_HOT_WEIGHT_MB"
 _HOT_CACHE_LIMIT_BYTES = None
