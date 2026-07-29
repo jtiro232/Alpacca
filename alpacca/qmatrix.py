@@ -66,6 +66,28 @@ def _small_matvec_elems() -> int:
 
 _SMALL_MATVEC_ELEMS = _small_matvec_elems()
 
+
+# Batch size at which the tiled dequantize-then-GEMM path overtakes the fused
+# kernels. The tiled path costs O(weights) to dequantize before it can call
+# BLAS, so it charges a full-model dequantize even for a one-row batch; the
+# fused kernels stream the codes instead and pay only for the work asked for.
+# Measured on a 14336x4096 Q4_K matrix, milliseconds:
+#
+#     batch     1     8    16    32    64    96   128   192   256
+#     fused   1.5  11.3  19.4  23.5  41.6  52.6  76.4 113.1 147.6
+#     tiled  42.7  54.9  54.5  57.4  63.5  71.2  82.7  89.4 131.7
+#
+# They cross between 128 and 192. The default stops at 96, the last size where
+# the fused path still wins clearly (1.35x), so a machine with faster BLAS
+# than this one cannot be pushed into a regression. Re-measure, do not
+# re-guess: it is a knob.
+def _fused_matmul_max_batch() -> int:
+    raw = os.environ.get("ALPACCA_FUSED_MATMUL_MAX_BATCH", "")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 96
+
 _HOT_WEIGHT_ENV = "ALPACCA_HOT_WEIGHT_MB"
 _HOT_CACHE_LIMIT_BYTES = None
 _HOT_CACHE_USED_BYTES = 0
@@ -205,6 +227,12 @@ class QuantMatrix:
             dense = self._dense_hot_cache()
             if dense is not None:
                 return X @ dense.T
+        # Below the crossover, stream the codes once with the fused kernel.
+        # The tiled path underneath costs O(weights) no matter how small the
+        # batch is, so a short prefill used to cost a full-model dequantize.
+        if (not self._small and X.shape[0] <= _fused_matmul_max_batch()
+                and self._q3.flags["C_CONTIGUOUS"] and _kernels.available()):
+            return _kernels.matmul_codes(self._q3, self._d, self._m, X)
         out = _np.empty((X.shape[0], self.rows), dtype=_np.float32)
         x_sub_sums = None
         if self._m is not None:

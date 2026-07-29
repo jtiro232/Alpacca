@@ -213,6 +213,42 @@ remaining quant formats load as dense float32 (measured: NumPy's
 float16-to-float32 conversion is far slower than the BLAS GEMV it would
 feed, so wrapping F16 would only slow decode down).
 
+#### Where the time goes on a large model
+
+Single-stream decode is memory-bandwidth-bound, and on an 8B model alpacca
+is already at the wall. On a Ryzen 5 7640HS (6 cores, DDR5) a BLAS float32
+GEMV, a plain Numba float32 loop, and the fused quantized kernel all reach
+~59 GB/s - the same number, because that is what the memory delivers.
+Llama-3.1-8B-Instruct Q4_K_M holds 9.35 GiB of codes and scales, so decode
+lands at 200 ms/token (5.0 tok/s) at 50 GB/s, or 85% of that ceiling.
+Kernel work cannot buy much more; only fewer bytes per weight could, and
+storing the codes packed at 4 bits was measured *slower* on this toolchain
+(three layouts tried, including int8-quantized activations - each one goes
+ALU-bound around 30 GB/s, below the memory ceiling it was trying to save).
+
+Batched work was a different story. `matmul_t` used to dequantize the whole
+matrix to float32 before handing it to BLAS, a cost proportional to the
+*weights* rather than to the batch, so prefilling a single new token cost a
+full-model dequantize - 5.0 s on that 8B model, 25x a whole decode step, and
+paid again on every chat turn. Two fused kernels now stream the codes
+directly for batches up to `ALPACCA_FUSED_MATMUL_MAX_BATCH` (96 by default),
+one laid out for narrow batches and one for wide ones; past that the tiled
+BLAS path still wins and is still used. Prefill of N new tokens, 8B Q4_K_M,
+model already loaded:
+
+| new tokens | 1 | 4 | 8 | 16 | 32 | 64 | 96 | 128+ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 5.02 s | 6.96 s | 7.14 s | 7.26 s | 8.06 s | 9.36 s | 10.68 s | unchanged |
+| after | 0.30 s | 0.56 s | 1.27 s | 2.72 s | 3.55 s | 5.72 s | 8.46 s | unchanged |
+| speedup | 16.6x | 12.5x | 5.6x | 2.7x | 2.3x | 1.6x | 1.3x | 1.0x |
+
+This is time-to-first-token for a chat turn, which prefills only the tokens
+prefix reuse did not already cover. Decode speed and long-prompt prefill
+(>=128 tokens, which stays on the BLAS path) are deliberately unchanged -
+this work removed a fixed overhead, it did not raise the bandwidth ceiling.
+The kernels are architecture-agnostic: they operate on quant codes, so every
+supported model benefits without a per-architecture path.
+
 Measured on a 4-core Intel Xeon 2.80 GHz Linux container, Python 3.11,
 NumPy 2.4.6 (OpenBLAS), with a stories15M-shaped synthetic model from
 `tests/make_bench_model.py` (same architecture dimensions as the real
@@ -388,6 +424,11 @@ and the roadmap orders the work that serves it.
 
 **Landed recently**
 
+- Fused quantized *matmul* kernels, so a batched forward pass costs what the
+  batch asks for instead of a full-model dequantize. Time-to-first-token on
+  Llama-3.1-8B Q4_K_M drops 16.6x for a 1-token prefill and 2.3-2.7x for the
+  16-32 token turns a chat actually produces (see "Where the time goes on a
+  large model"). Architecture-agnostic: it works on quant codes.
 - Repo-owned terminal app menu (`alpacca menu`, or no-arg `alpacca` in an
   interactive terminal), with model switching, history navigation, deletion
   controls, saved-chat statistics, and Esc-to-menu chat return.

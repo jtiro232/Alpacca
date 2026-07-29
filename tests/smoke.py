@@ -626,6 +626,63 @@ def main() -> None:
             check("alpacca kernels stay inactive without the pinned numba",
                   not AK.available(), AK.status())
 
+        # ---- fused batched matmul vs the tiled dequantize+GEMM path -------
+        # matmul_t used to dequantize the whole matrix on every call, so a
+        # one-row batch cost as much as a 256-row one. The fused kernel below
+        # the crossover must be numerically indistinguishable from the tiled
+        # path it replaces, and from matvec for a single row.
+        if T.HAS_NUMPY:
+            import numpy as np
+            from alpacca.qmatrix import QuantMatrix, _fused_matmul_max_batch
+            from alpacca.quants import QUANT_GEOMETRY
+            rng = np.random.default_rng(7)
+            worst = 0.0
+            shapes_done = 0
+            for _dt in sorted(QUANT_GEOMETRY):
+                blk = QUANT_GEOMETRY[_dt][0]
+                _rows, _cols = 9, blk * 2
+                nb = _rows * (_cols // blk) * QUANT_GEOMETRY[_dt][1]
+                raw = bytes(rng.integers(0, 256, size=nb, dtype=np.uint8))
+                qm = QuantMatrix(raw, _dt, _rows, _cols)
+                # spans the narrow kernel (<=8), the wide one, and a batch
+                # past NARROW_BATCH where the two must still agree
+                for B in (1, 2, 5, 9, 16, 40):
+                    X = rng.standard_normal((B, _cols)).astype(np.float32)
+                    got = qm.matmul_t(X)
+                    os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+                    try:
+                        ref = qm.matmul_t(X)
+                    finally:
+                        os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+                    scale = max(1e-6, float(np.abs(ref).max()))
+                    worst = max(worst, float(np.abs(got - ref).max()) / scale)
+                    if B == 1:
+                        mv = np.asarray(qm.matvec(X[0]), dtype=np.float32)
+                        worst = max(worst,
+                                    float(np.abs(got[0] - mv).max()) / scale)
+                    if AK.available():
+                        # call the kernel directly: without this the loop
+                        # above compares the tiled path with itself whenever
+                        # the JIT is absent, and would pass even if matmul_t
+                        # had quietly stopped using the kernel at all
+                        direct = AK.matmul_codes(qm._q3, qm._d, qm._m, X)
+                        worst = max(worst,
+                                    float(np.abs(direct - ref).max()) / scale)
+                shapes_done += 1
+            check("fused matmul matches the tiled path and matvec on every quant",
+                  shapes_done == len(QUANT_GEOMETRY) and worst < 2e-5,
+                  f"{shapes_done} dtypes, worst rel {worst:.2e}, "
+                  f"kernel {'exercised' if AK.available() else 'absent'}")
+            check("the fused-matmul crossover is a positive tunable batch size",
+                  _fused_matmul_max_batch() > 0,
+                  str(_fused_matmul_max_batch()))
+            os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+            try:
+                check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
+                      _fused_matmul_max_batch() == 0)
+            finally:
+                os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+
         if T.HAS_NUMPY:
             import numpy as np
             from types import SimpleNamespace
