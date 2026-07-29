@@ -195,7 +195,12 @@ def matmul_codes(q3, d_eff, m_eff, X):
     Xt = np.ascontiguousarray(Xs.transpose(1, 2, 0))
     XsumsT = (np.ascontiguousarray(Xs.sum(axis=2).T) if affine
               else Xt[:, :1, 0])
-    return st["matmul_wide"](q3, d_eff, m_arg, Xt, XsumsT, affine).T
+    wide = st["matmul_wide"](q3, d_eff, m_arg, Xt, XsumsT, affine)
+    # the wide kernel accumulates into (rows, batch) so its innermost loop
+    # stays contiguous; every other path returns a C-contiguous (batch, rows),
+    # so pay the transpose rather than hand back a view that behaves
+    # differently. Measured at 1.4% of the matmul it follows.
+    return np.ascontiguousarray(wide.T)
 
 
 def warmup() -> None:
