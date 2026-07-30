@@ -565,6 +565,27 @@ def np_unpack_q4k_native(data, n: int):
     return packed, sc, mn, d_bits, dmin_bits
 
 
+def np_unpack_q5k_native(data, n: int):
+    """Q5_K blocks kept in their native fields, nothing widened.
+
+    Returns (qs u8 (nb, 128) split-nibble low-4 bits, qh u8 (nb, 32) fifth
+    bits, sc u8 (nb, 8), mn u8 (nb, 8), d_bits u16, dmin_bits u16):
+    element 64c+j of a block is (qs[c*32+j] & 0xF) | ((qh[j] >> 2c) & 1) << 4
+    and element 64c+32+j is (qs[c*32+j] >> 4) | ((qh[j] >> (2c+1)) & 1) << 4;
+    value = f16(d)*sc*code - f16(dmin)*mn. ~0.70 B/weight."""
+    if _np is None:
+        raise RuntimeError("np_unpack_q5k_native requires NumPy")
+    if n % QK_K:
+        raise ValueError(f"Q5_K needs a multiple of {QK_K} elements")
+    b = _np_blocks(data, n // QK_K, 176)
+    d_bits = b[:, 0:2].copy().view(_np.uint16).reshape(-1)
+    dmin_bits = b[:, 2:4].copy().view(_np.uint16).reshape(-1)
+    sc, mn = _np_unpack_k_scales_int(b[:, 4:16])
+    qh = _np.ascontiguousarray(b[:, 16:48])
+    qs = _np.ascontiguousarray(b[:, 48:176])
+    return qs, qh, sc, mn, d_bits, dmin_bits
+
+
 def np_unpack_q6k_native(data, n: int):
     """Q6_K blocks as int8 codes plus their native scale fields.
 

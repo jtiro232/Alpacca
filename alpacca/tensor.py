@@ -100,7 +100,8 @@ def matvec_group(Ws, x):
     if HAS_NUMPY:
         native = [W for W in Ws
                   if isinstance(W, QuantizedMatrix)
-                  and getattr(W, "_mode", "codes") in ("q4k_int", "q6k_int")
+                  and getattr(W, "_mode", "codes") in ("q4k_int", "q5k_int",
+                                                       "q6k_int")
                   and W._dense_cache is None]
         if len(native) >= 2 and _HOT_WEIGHT_ENV not in os.environ:
             from . import kernels as _k

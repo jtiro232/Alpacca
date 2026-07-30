@@ -120,7 +120,7 @@ class QuantMatrix:
     __slots__ = ("dtype", "rows", "cols", "block_elements", "block_bytes",
                  "blocks_per_row", "sub_len", "n_sub", "data",
                  "_q", "_q3", "_small", "_d", "_m", "_mode",
-                 "_qp", "_sci", "_mni", "_dh", "_dmh",
+                 "_qp", "_qh", "_sci", "_mni", "_dh", "_dmh",
                  "_dense_cache", "_dense_cache_bytes", "__weakref__")
 
     def __init__(self, data, dtype: str, rows: int, cols: int):
@@ -146,17 +146,19 @@ class QuantMatrix:
         self._dense_cache = None
         self._dense_cache_bytes = 0
         self._mode = "codes"
-        self._qp = self._sci = self._mni = self._dh = self._dmh = None
+        self._qp = self._qh = self._sci = self._mni = None
+        self._dh = self._dmh = None
         if HAS_NUMPY:
             self._small = rows * cols < _SMALL_MATVEC_ELEMS
             self.data = None  # unpacked copies own everything; mmap may close
-            if (not self._small and dtype in ("Q4_K", "Q6_K")
+            if (not self._small and dtype in ("Q4_K", "Q5_K", "Q6_K")
                     and _kernels.int_dot_enabled()):
                 # native block fields for the integer-dot kernels: the
                 # file's own 4-bit codes / 6-bit sub-scales / f16 supers,
                 # 0.58 (Q4_K) and 1.07 (Q6_K) bytes per weight instead of
                 # the 1.25 of int8 codes + f32 scales
                 from .quants import (np_unpack_q4k_native,
+                                     np_unpack_q5k_native,
                                      np_unpack_q6k_native)
                 bpr = self.blocks_per_row
                 if dtype == "Q4_K":
@@ -165,6 +167,20 @@ class QuantMatrix:
                     self._mode = "q4k_int"
                     self._qp = _np.ascontiguousarray(
                         qp.reshape(rows, cols // 2))
+                    self._sci = _np.ascontiguousarray(
+                        sc.reshape(rows, bpr, 8))
+                    self._mni = _np.ascontiguousarray(
+                        mn.reshape(rows, bpr, 8))
+                    self._dh = _np.ascontiguousarray(dh.reshape(rows, bpr))
+                    self._dmh = _np.ascontiguousarray(dmh.reshape(rows, bpr))
+                elif dtype == "Q5_K":
+                    qs5, qh5, sc, mn, dh, dmh = np_unpack_q5k_native(
+                        data, rows * cols)
+                    self._mode = "q5k_int"
+                    self._qp = _np.ascontiguousarray(
+                        qs5.reshape(rows, cols // 2))
+                    self._qh = _np.ascontiguousarray(
+                        qh5.reshape(rows, cols // 8))
                     self._sci = _np.ascontiguousarray(
                         sc.reshape(rows, bpr, 8))
                     self._mni = _np.ascontiguousarray(
@@ -180,7 +196,7 @@ class QuantMatrix:
                         sc6.reshape(rows, self.n_sub))
                     self._dh = _np.ascontiguousarray(dh.reshape(rows, bpr))
                 self._q = self._d = self._m = None
-                if self._mode == "q4k_int":
+                if self._mode in ("q4k_int", "q5k_int"):
                     self._q3 = None
                 return
             from .quants import np_unpack
@@ -221,6 +237,10 @@ class QuantMatrix:
             if self._mode == "q4k_int":
                 return (self._qp.nbytes + self._sci.nbytes + self._mni.nbytes
                         + self._dh.nbytes + self._dmh.nbytes)
+            if self._mode == "q5k_int":
+                return (self._qp.nbytes + self._qh.nbytes + self._sci.nbytes
+                        + self._mni.nbytes + self._dh.nbytes
+                        + self._dmh.nbytes)
             if self._mode == "q6k_int":
                 return self._q3.nbytes + self._sci.nbytes + self._dh.nbytes
             n = self._q.nbytes + self._d.nbytes
@@ -253,6 +273,10 @@ class QuantMatrix:
             # weights stream at ~0.58 B/weight instead of 1.25
             return _kernels.matvec_q4k_int(self._qp, self._sci, self._mni,
                                            self._dh, self._dmh, x, pre)
+        if self._mode == "q5k_int":
+            return _kernels.matvec_q5k_int(self._qp, self._qh, self._sci,
+                                           self._mni, self._dh, self._dmh,
+                                           x, pre)
         if self._mode == "q6k_int":
             return _kernels.matvec_q6k_int(self._q3, self._sci, self._dh, x,
                                            pre)
@@ -296,7 +320,7 @@ class QuantMatrix:
             dense = self._dense_hot_cache()
             if dense is not None:
                 return X @ dense.T
-        if self._mode in ("q4k_int", "q6k_int"):
+        if self._mode in ("q4k_int", "q5k_int", "q6k_int"):
             # the integer matvec streams weights at 2.4x the f32 kernel's
             # rate, so re-streaming them per batch row beats a full-model
             # dequantize up to a large batch; past that, tile + BLAS
@@ -322,6 +346,11 @@ class QuantMatrix:
                     tile = _kernels.dequant_q4k_tile(
                         self._qp[r0:r1], self._sci[r0:r1], self._mni[r0:r1],
                         self._dh[r0:r1], self._dmh[r0:r1], buf[:r1 - r0])
+                elif self._mode == "q5k_int":
+                    tile = _kernels.dequant_q5k_tile(
+                        self._qp[r0:r1], self._qh[r0:r1], self._sci[r0:r1],
+                        self._mni[r0:r1], self._dh[r0:r1], self._dmh[r0:r1],
+                        buf[:r1 - r0])
                 else:
                     tile = _kernels.dequant_q6k_tile(
                         self._q3[r0:r1], self._sci[r0:r1], self._dh[r0:r1],
@@ -363,6 +392,11 @@ class QuantMatrix:
             return _expand_q4k_f32(self._qp[r0:r1], self._sci[r0:r1],
                                    self._mni[r0:r1], self._dh[r0:r1],
                                    self._dmh[r0:r1], self.n_sub, self.sub_len)
+        if self._mode == "q5k_int":
+            return _expand_q5k_f32(self._qp[r0:r1], self._qh[r0:r1],
+                                   self._sci[r0:r1], self._mni[r0:r1],
+                                   self._dh[r0:r1], self._dmh[r0:r1],
+                                   self.n_sub, self.sub_len)
         if self._mode == "q6k_int":
             return _expand_q6k_f32(self._q3[r0:r1], self._sci[r0:r1],
                                    self._dh[r0:r1])
@@ -406,6 +440,11 @@ class QuantMatrix:
             return _expand_q4k_f32(self._qp[idx], self._sci[idx],
                                    self._mni[idx], self._dh[idx],
                                    self._dmh[idx], self.n_sub, self.sub_len)
+        if self._mode == "q5k_int":
+            return _expand_q5k_f32(self._qp[idx], self._qh[idx],
+                                   self._sci[idx], self._mni[idx],
+                                   self._dh[idx], self._dmh[idx],
+                                   self.n_sub, self.sub_len)
         if self._mode == "q6k_int":
             return _expand_q6k_f32(self._q3[idx], self._sci[idx],
                                    self._dh[idx])
@@ -457,6 +496,27 @@ def _expand_q4k_f32(qp, sci, mni, dh, dmh, n_sub, sub_len):
     codes = _np.empty((nr, qp3.shape[1], 64), dtype=_np.uint8)
     codes[:, :, :32] = qp3 & 0x0F
     codes[:, :, 32:] = qp3 >> 4
+    d_eff = (dh.view(_np.float16).astype(_np.float32)[:, :, None]
+             * sci.astype(_np.float32))
+    m_eff = (dmh.view(_np.float16).astype(_np.float32)[:, :, None]
+             * mni.astype(_np.float32))
+    v = codes.reshape(nr, n_sub, sub_len).astype(_np.float32)
+    v *= d_eff.reshape(nr, n_sub, 1)
+    v -= m_eff.reshape(nr, n_sub, 1)
+    return v.reshape(nr, n_sub * sub_len)
+
+
+def _expand_q5k_f32(qp, qh, sci, mni, dh, dmh, n_sub, sub_len):
+    nr = qp.shape[0]
+    qp3 = qp.reshape(nr, -1, 32)                 # 32-byte chunks of 64 elems
+    nch = qp3.shape[1]
+    qh3 = qh.reshape(nr, -1, 32)                 # 32 fifth-bit bytes / block
+    codes = _np.empty((nr, nch, 64), dtype=_np.uint8)
+    for c4 in range(4):                          # chunk index within a block
+        lo = ((qh3 >> (2 * c4)) & 1) << 4
+        hi = ((qh3 >> (2 * c4 + 1)) & 1) << 4
+        codes[:, c4::4, :32] = (qp3[:, c4::4] & 0x0F) | lo
+        codes[:, c4::4, 32:] = (qp3[:, c4::4] >> 4) | hi
     d_eff = (dh.view(_np.float16).astype(_np.float32)[:, :, None]
              * sci.astype(_np.float32))
     m_eff = (dmh.view(_np.float16).astype(_np.float32)[:, :, None]

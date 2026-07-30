@@ -352,6 +352,29 @@ part of the wall.
   path is now the top actionable decode item - it speeds Q4_K_S files,
   Q5_K_M downloads (the #2 HF quant), and Gemma-class fallbacks.
 
+
+## Round 6 (2026-07-30): Q5_K native path + bit-exact JIT rope - KEPT
+
+- Q5_K native int kernel: Q4_K's j-outer structure + one qh byte per j
+  shared by all 8 streams; codes [0,31] unsigned, premul exact
+  (63*31 < 2^15). Micro 69.4 Gw/s at 0.703 B/w (wall 84.6) vs 45.7 for
+  the f32 path it replaces = 1.52x on Q5_K matrices, 44% less RAM.
+  Full integration: storage mode q5k_int, dequant tile kernel, row
+  gathers, integer-sim exactness + tile/rows bit-exact suite checks.
+- JIT rope (norm + neox): strict-FP elementwise kernel, BIT-IDENTICAL
+  to the NumPy slicing path (suite-pinned with array_equal), gated on
+  _use_kernel_attention like attention. ~-1 ms/token.
+- Shared activation quantization (matvec_group) from round 5 kept.
+
+End-to-end, same day, warm JIT, quiet machine:
+  Q4_K_M: 101.2 ms/token = 9.88 tok/s  (round start: 102.4)
+  Q4_K_S:  92.8 ms/token = 10.77 tok/s (round start: 101.2) - 90% of
+  Ollama's 11.91 on Q4_K_M. Weight RAM 4.59 GiB (Q4_K_S).
+Suites 411 / 313 / 446; greedy 48/48 unchanged.
+NOT attempted this round (documented): Q4_K scale-prepass via thread
+scratch (~1.5 ms bound), rmsnorm fusion (reduction-order drift vs
+pinned tolerances).
+
 ### 6.4 f16 KV cache: DEFERRED with rationale
 
 At the benchmark's context (<=512) attention costs 1.17 ms/token; halving

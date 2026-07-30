@@ -711,9 +711,10 @@ def main() -> None:
             import numpy as np
             from alpacca.qmatrix import QuantMatrix
             rng = np.random.default_rng(11)
-            for _dt, _rows, _cols in (("Q4_K", 9, 512), ("Q6_K", 9, 512)):
-                nb = _rows * _cols
-                raw = q4_k_bytes(nb) if _dt == "Q4_K" else q6_k_bytes(nb)
+            for _dt, _rows, _cols in (("Q4_K", 9, 512), ("Q5_K", 9, 512),
+                                      ("Q6_K", 9, 512)):
+                raw = {"Q4_K": q4_k_bytes, "Q5_K": q5_k_bytes,
+                       "Q6_K": q6_k_bytes}[_dt](_rows * _cols)
                 qm = QuantMatrix(raw, _dt, _rows, _cols)
                 check(f"{_dt} matrices adopt the native int-dot storage",
                       qm._mode == f"{_dt.lower()[:2]}k_int", qm._mode)
@@ -733,10 +734,15 @@ def main() -> None:
                 xq, ascale, bsums = AK.quantize_acts(x)
                 nblk = _cols // 256
                 q3 = qm._q3 if _dt == "Q6_K" else None
-                if _dt == "Q4_K":
+                if _dt in ("Q4_K", "Q5_K"):
                     qp = qm._qp.reshape(_rows, nblk, 4, 32)
                     cl = (qp & 0x0F).astype(np.int64)
                     ch = (qp >> 4).astype(np.int64)
+                    if _dt == "Q5_K":
+                        qh5 = qm._qh.reshape(_rows, nblk, 1, 32)
+                        for _c in range(4):
+                            cl[:, :, _c] |= ((qh5[:, :, 0] >> (2 * _c)) & 1).astype(np.int64) << 4
+                            ch[:, :, _c] |= ((qh5[:, :, 0] >> (2 * _c + 1)) & 1).astype(np.int64) << 4
                     co = np.empty((_rows, nblk, 4, 64), np.int64)
                     co[..., :32] = cl
                     co[..., 32:] = ch
@@ -859,6 +865,33 @@ def main() -> None:
                 check(f"fused decode attention matches the matmul math "
                       f"(diff {worst_att:.2e})", worst_att < 2e-5,
                       f"worst {worst_att:.2e}")
+                # the JIT rope must be BIT-identical to the NumPy slicing
+                # path (strict FP, no reductions): the pinned logit tests
+                # depend on it
+                rope_ok = True
+                for style in ("norm", "neox"):
+                    for n_heads_r, hd_r, n_rot_r in ((4, 8, 8), (2, 16, 8)):
+                        vr = arng.standard_normal(
+                            n_heads_r * hd_r).astype(np.float32)
+                        half_r = n_rot_r // 2
+                        cr = arng.standard_normal(half_r).astype(np.float32)
+                        sr = arng.standard_normal(half_r).astype(np.float32)
+                        got_r = AK.rope_decode(vr, cr, sr, n_heads_r, hd_r,
+                                               n_rot_r, style)
+                        v2 = vr.reshape(n_heads_r, hd_r).copy()
+                        if style == "norm":
+                            x0 = v2[:, 0:n_rot_r:2].copy()
+                            x1 = v2[:, 1:n_rot_r:2].copy()
+                            v2[:, 0:n_rot_r:2] = x0 * cr - x1 * sr
+                            v2[:, 1:n_rot_r:2] = x0 * sr + x1 * cr
+                        else:
+                            x0 = v2[:, :half_r].copy()
+                            x1 = v2[:, half_r:n_rot_r].copy()
+                            v2[:, :half_r] = x0 * cr - x1 * sr
+                            v2[:, half_r:n_rot_r] = x0 * sr + x1 * cr
+                        rope_ok = rope_ok and np.array_equal(
+                            got_r, v2.reshape(-1))
+                check("JIT rope is bit-identical to the NumPy path", rope_ok)
 
         # ---- top-k selection ---------------------------------------------
         # This had no direct coverage at all, which is how a first version

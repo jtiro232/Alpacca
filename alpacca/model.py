@@ -733,6 +733,15 @@ class Model:
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
+        if self._use_kernel_attention:
+            # bit-identical JIT rotation (strict FP, no reductions); the
+            # NumPy slicing below allocates four temporaries per call and
+            # costs ~1.4 ms/token across 64 calls
+            from . import kernels
+            return kernels.rope_decode(
+                np.ascontiguousarray(vec, dtype=np.float32),
+                self._rope_cos[pos], self._rope_sin[pos],
+                n_heads, hd, n_rot, hp.rope_style)
         v = vec.reshape(n_heads, hd).copy()
         c, s = self._rope_cos[pos], self._rope_sin[pos]
         if hp.rope_style == "norm":
@@ -959,6 +968,11 @@ class Model:
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
+        if self._use_kernel_attention:
+            from . import kernels
+            return kernels.rope_decode(
+                np.ascontiguousarray(vec, dtype=np.float32),
+                cos[pos], sin[pos], n_heads, hd, n_rot, "neox")
         v = vec.reshape(n_heads, hd).copy()
         c, s = cos[pos], sin[pos]
         x0 = v[:, :half].copy()

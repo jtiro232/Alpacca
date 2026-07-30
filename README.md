@@ -224,10 +224,14 @@ codes, 6-bit integer sub-scales, and float16 super-scales, 0.578 bytes per
 weight for Q4_K and 1.066 for Q6_K - and the decode kernel dots them
 against int8-quantized activations (per-256-block absmax/127 scale, our
 own Q8-style scheme) using AVX-512 VNNI integer instructions that LLVM
-emits from these Python loops. Llama-3.1-8B-Instruct Q4_K_M decodes at
-**101.8 ms/token (9.83 tok/s) in 5.0 GiB of weight RAM**, against 5.2
-tok/s and 9.35 GiB for the previous int8-codes + float32-scales storage,
-and 11.9 tok/s for Ollama/llama.cpp on the same machine. An earlier
+emits from these Python loops. Llama-3.1-8B-Instruct decodes at
+**9.9 tok/s (Q4_K_M, 5.0 GiB weight RAM) and 10.8 tok/s (Q4_K_S,
+4.6 GiB)** against 5.2 tok/s and 9.35 GiB before this work, and 11.9
+tok/s for Ollama/llama.cpp on the same machine - 90% of parity, with
+the remainder bounded by measured hardware ceilings (see the notes for
+future engineers below). Q5_K matrices get the same native integer
+treatment (0.70 B/weight, 1.5x their old path), which is what makes
+Q4_K_S files - whose attention-V is stored Q5_K - the faster pick. An earlier
 attempt at 4-bit packed storage measured *slower*; the culprit was found
 this pass - Numba promotes scalar integer arithmetic to int64, which had
 been hiding every 8/16-bit SIMD pattern from LLVM - and the fix (int32
@@ -254,6 +258,59 @@ DRAM wall), fusing attn_q+attn_k and gate+up launches (kept for structure,
 but 226 -> 162 launches was worth 0.0 ms here), and thread counts above
 the physical-core count (SMT contention costs 9-16%; kernels now default
 to physical cores, override with ALPACCA_THREADS).
+
+#### Notes for future engineers (human or AI) on the kernels
+
+Read `prompts/03-RESULTS.md` first: it is the experiment log with every
+number, and several expensive lessons are recorded there so they are not
+repeated. The short version:
+
+- **Numba promotes scalar integer arithmetic to int64.** Every integer
+  kernel here depends on the re-cast idiom `acc = np.int32(acc + ...)`
+  to keep the IR in i32; without it LLVM sees i64 lanes and emits no
+  8/16-bit SIMD at all. This single fact once hid AVX-512 VNNI from a
+  whole engineering pass.
+- **The winning kernel shape** is: j-loop outermost over a 32-byte
+  stride, all streams of a 256-weight block unrolled inline, 6-bit
+  sub-scales premultiplied into int16 codes in-register (products stay
+  under 2^15 - check the bound for any new format), ONE vector reduce
+  per block. Per-sub-block reduces cost ~2x; manual multi-accumulator
+  "optimizations" have regressed 2-7x every time they were tried.
+- **Never put scalar per-block work inside the hot loop** (in-kernel
+  6-bit scale unpack collapsed a 110 Gw/s kernel to 12.7), and **never
+  let a constant trip count reach the vectorizer** (it const-unrolls and
+  the VNNI pattern dies; derive trip counts from runtime shapes).
+- **Offsets fold into integer min-terms**: sum(sc*(code-K)) =
+  sum(sc*code) - K*sc*bsum. Subtracting K per element broke
+  vectorization for Q6_K; the fold rescued it.
+- **Never call threaded BLAS from the decode loop.** OpenBLAS fans out
+  its own pool past a size threshold and thrashes the numba omp pool
+  (measured 8-20x). Decode-side ops are JIT kernels gated on
+  `Model._use_kernel_attention` (true only for models that run the
+  quantized kernels - dense models stay single-pool on BLAS, and moving
+  only part of their work to numba recreates the thrash).
+- **Closed doors, with the measurements that closed them** (do not
+  reopen without new evidence): Q6_K 6-bit packing is ALU-bound at
+  exactly its bandwidth saving (52 Gw/s vs the 72 needed); speculative
+  decoding is capped at ~1.10x because batched integer matmuls cost
+  linearly - the single-token kernel already uses ~all vpdpwssd
+  throughput; LLVM does not auto-emit vpdpbusd from any loop shape
+  tried, TESTED THROUGH LLVM 22 (numba 0.66), and LLVM 22 also stops
+  folding vpmaddwd+add into vpdpwssd for our premultiplied shape, so a
+  numba pin bump would REGRESS decode - re-test before ever bumping.
+  What reopens all three at once: a toolchain that emits vpdpbusd
+  (4 int8 MACs/lane) from Python-authored loops.
+- **Measurement discipline**: warm the JIT before timing, benchmark on
+  a quiet machine (background load once produced a 3 tok/s reading that
+  was pure noise), pair alpacca and Ollama numbers same-day, and treat
+  multi-minute prefill windows as +-15%. Sustained decode runs this
+  hardware at its thermal ceiling with clocks intact - verify clocks
+  and DRAM bandwidth before blaming code.
+- **Every numerics change needs a differential test against the old
+  path loaded from git** (see the sampler/tokenizer harnesses in the
+  results log: zero-mismatch over 19k trials / 352 real-vocab encodes),
+  and every new kernel needs an integer-simulation exactness check in
+  `tests/smoke.py` that was SHOWN to fail under a mutated kernel.
 
 Two bigger avenues were measured shut (details and numbers in
 prompts/03-RESULTS.md): packing Q6_K to its native 0.82 bytes/weight is
