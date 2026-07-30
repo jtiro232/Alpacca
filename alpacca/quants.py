@@ -401,19 +401,25 @@ def _np_unpack_q5_1(b):
     return q, d, m
 
 
-def _np_unpack_k_scales(scales):
-    """6-bit packed scale/min pairs of Q4_K/Q5_K -> float32 (nb, 8) each."""
+def _np_unpack_k_scales_int(scales):
+    """6-bit packed scale/min pairs of Q4_K/Q5_K -> uint8 (nb, 8) each."""
     nb = scales.shape[0]
-    sc = _np.empty((nb, 8), dtype=_np.float32)
-    mn = _np.empty((nb, 8), dtype=_np.float32)
+    sc = _np.empty((nb, 8), dtype=_np.uint8)
+    mn = _np.empty((nb, 8), dtype=_np.uint8)
     for j in range(8):
         if j < 4:
-            sc[:, j] = (scales[:, j] & 63).astype(_np.float32)
-            mn[:, j] = (scales[:, j + 4] & 63).astype(_np.float32)
+            sc[:, j] = scales[:, j] & 63
+            mn[:, j] = scales[:, j + 4] & 63
         else:
-            sc[:, j] = ((scales[:, j + 4] & 0x0F) | ((scales[:, j - 4] >> 6) << 4)).astype(_np.float32)
-            mn[:, j] = ((scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)).astype(_np.float32)
+            sc[:, j] = (scales[:, j + 4] & 0x0F) | ((scales[:, j - 4] >> 6) << 4)
+            mn[:, j] = (scales[:, j + 4] >> 4) | ((scales[:, j] >> 6) << 4)
     return sc, mn
+
+
+def _np_unpack_k_scales(scales):
+    """6-bit packed scale/min pairs of Q4_K/Q5_K -> float32 (nb, 8) each."""
+    sc, mn = _np_unpack_k_scales_int(scales)
+    return sc.astype(_np.float32), mn.astype(_np.float32)
 
 
 def _np_unpack_q4_k(b):
@@ -446,11 +452,10 @@ def _np_unpack_q5_k(b):
     return q, d * sc, -(dmin * mn)
 
 
-def _np_unpack_q6_k(b):
+def _np_q6_k_codes(b):
+    """Q6_K blocks -> int8 codes (nb, 256) already centered to [-32, 31]."""
     ql = b[:, 0:128]
     qh = b[:, 128:192]
-    sc = b[:, 192:208].view(_np.int8).astype(_np.float32)  # (nb, 16)
-    d = _np_f16_col(b, 208)
     q = _np.empty((b.shape[0], QK_K), dtype=_np.int8)
     for half in range(2):  # two 128-element halves
         qlh = ql[:, half * 64:(half + 1) * 64]
@@ -465,7 +470,13 @@ def _np_unpack_q6_k(b):
         q[:, base + 96:base + 128] = (
             ((qlh[:, 32:] >> 4) | (((qhh >> 6) & 3) << 4)).view(_np.int8))
     q -= 32
-    return q, d * sc, None
+    return q
+
+
+def _np_unpack_q6_k(b):
+    sc = b[:, 192:208].view(_np.int8).astype(_np.float32)  # (nb, 16)
+    d = _np_f16_col(b, 208)
+    return _np_q6_k_codes(b), d * sc, None
 
 
 def _np_unpack_q2_k(b):
@@ -531,6 +542,44 @@ _NP_UNPACKERS = {
     "Q5_K": _np_unpack_q5_k,
     "Q6_K": _np_unpack_q6_k,
 }
+
+
+def np_unpack_q4k_native(data, n: int):
+    """Q4_K blocks kept in their native fields, nothing widened.
+
+    Returns (packed u8 (nb, 128), sc u8 (nb, 8), mn u8 (nb, 8),
+    d_bits u16 (nb,), dmin_bits u16 (nb,)): the split-nibble qs bytes as
+    stored, the 6-bit sub-block scales/mins as integers, and the per-block
+    super-scales as raw f16 bits. value = f16(d)*sc*code - f16(dmin)*mn,
+    where byte j of 32-byte chunk c holds element 64c+j in its low nibble
+    and element 64c+32+j in its high one. ~0.58 B/weight."""
+    if _np is None:
+        raise RuntimeError("np_unpack_q4k_native requires NumPy")
+    if n % QK_K:
+        raise ValueError(f"Q4_K needs a multiple of {QK_K} elements")
+    b = _np_blocks(data, n // QK_K, 144)
+    d_bits = b[:, 0:2].copy().view(_np.uint16).reshape(-1)
+    dmin_bits = b[:, 2:4].copy().view(_np.uint16).reshape(-1)
+    sc, mn = _np_unpack_k_scales_int(b[:, 4:16])
+    packed = _np.ascontiguousarray(b[:, 16:144])
+    return packed, sc, mn, d_bits, dmin_bits
+
+
+def np_unpack_q6k_native(data, n: int):
+    """Q6_K blocks as int8 codes plus their native scale fields.
+
+    Returns (codes i8 (nb, 256) centered to [-32, 31], sc i8 (nb, 16),
+    d_bits u16 (nb,)): value = f16(d)*sc*code, no offset term.
+    ~1.07 B/weight (the 6-bit code packing stays future work)."""
+    if _np is None:
+        raise RuntimeError("np_unpack_q6k_native requires NumPy")
+    if n % QK_K:
+        raise ValueError(f"Q6_K needs a multiple of {QK_K} elements")
+    b = _np_blocks(data, n // QK_K, 210)
+    codes = _np_q6_k_codes(b)
+    sc = b[:, 192:208].copy().view(_np.int8)
+    d_bits = b[:, 208:210].copy().view(_np.uint16).reshape(-1)
+    return codes, sc, d_bits
 
 
 def np_unpack(data, n: int, dtype: str):

@@ -331,16 +331,23 @@ def main() -> None:
                       nbytes * 3 <= dense_bytes + 4096,
                       f"nbytes={nbytes}")
 
-        check_quantized_matvec("Q8_0", 5, 64)
-        check_quantized_matvec("Q4_0", 5, 64)
-        check_quantized_matvec("Q4_1", 5, 64)
-        check_quantized_matvec("Q5_0", 5, 64)
-        check_quantized_matvec("Q5_1", 5, 64)
-        check_quantized_matvec("Q2_K", 3, 512)
-        check_quantized_matvec("Q3_K", 3, 512)
-        check_quantized_matvec("Q4_K", 3, 512)
-        check_quantized_matvec("Q5_K", 3, 512)
-        check_quantized_matvec("Q6_K", 3, 512)
+        # this whole region verifies the EXACT f32-activation storage and
+        # kernels; the integer-dot path is approximate by design and has its
+        # own checks (with an integer-simulation oracle) further down
+        os.environ["ALPACCA_INT_DOT"] = "0"
+        try:
+            check_quantized_matvec("Q8_0", 5, 64)
+            check_quantized_matvec("Q4_0", 5, 64)
+            check_quantized_matvec("Q4_1", 5, 64)
+            check_quantized_matvec("Q5_0", 5, 64)
+            check_quantized_matvec("Q5_1", 5, 64)
+            check_quantized_matvec("Q2_K", 3, 512)
+            check_quantized_matvec("Q3_K", 3, 512)
+            check_quantized_matvec("Q4_K", 3, 512)
+            check_quantized_matvec("Q5_K", 3, 512)
+            check_quantized_matvec("Q6_K", 3, 512)
+        finally:
+            os.environ.pop("ALPACCA_INT_DOT", None)
         if T.HAS_NUMPY:
             import numpy as np
             # large matrix exercises the einsum matvec kernel (small ones
@@ -364,7 +371,11 @@ def main() -> None:
                 bn = brows * bcols
                 bpacked = (q4_k_bytes(bn) if big_fmt == "Q4_K"
                            else q6_k_bytes(bn))
-                bq = T.quantized_matrix(bpacked, big_fmt, brows, bcols)
+                os.environ["ALPACCA_INT_DOT"] = "0"  # exact-path coverage
+                try:
+                    bq = T.quantized_matrix(bpacked, big_fmt, brows, bcols)
+                finally:
+                    os.environ.pop("ALPACCA_INT_DOT", None)
                 bdense = T.matrix(quants.dequantize(bpacked, bn, big_fmt),
                                   brows, bcols)
                 xb2 = T.vector([((i * 19) % 67) / 23.0 - 1.4
@@ -643,7 +654,14 @@ def main() -> None:
                 _rows, _cols = 9, blk * 2
                 nb = _rows * (_cols // blk) * QUANT_GEOMETRY[_dt][1]
                 raw = bytes(rng.integers(0, 256, size=nb, dtype=np.uint8))
-                qm = QuantMatrix(raw, _dt, _rows, _cols)
+                # pin the f32-activation storage: this block verifies the
+                # exact fused kernels, the integer-dot path has its own
+                # checks (with its own quantified tolerance) below
+                os.environ["ALPACCA_INT_DOT"] = "0"
+                try:
+                    qm = QuantMatrix(raw, _dt, _rows, _cols)
+                finally:
+                    os.environ.pop("ALPACCA_INT_DOT", None)
                 # spans the narrow kernel (<=8), the wide one, and a batch
                 # past NARROW_BATCH where the two must still agree
                 for B in (1, 2, 5, 9, 16, 40):
@@ -676,6 +694,100 @@ def main() -> None:
             check("the fused-matmul crossover is a positive tunable batch size",
                   _fused_matmul_max_batch() > 0,
                   str(_fused_matmul_max_batch()))
+            os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+            try:
+                check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
+                      _fused_matmul_max_batch() == 0)
+            finally:
+                os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+
+        # ---- integer-dot decode path (Q4_K/Q6_K native storage) -----------
+        # Weights stay in the file's own fields (4-bit codes, 6-bit integer
+        # sub-scales, f16 supers); activations are quantized to int8 per
+        # 256 block. The kernel must be EXACT against a NumPy simulation of
+        # that integer algebra - only the activation quantization itself is
+        # approximate, and that error is bounded and measured separately.
+        if T.HAS_NUMPY and AK.available():
+            import numpy as np
+            from alpacca.qmatrix import QuantMatrix
+            rng = np.random.default_rng(11)
+            for _dt, _rows, _cols in (("Q4_K", 9, 512), ("Q6_K", 9, 512)):
+                nb = _rows * _cols
+                raw = q4_k_bytes(nb) if _dt == "Q4_K" else q6_k_bytes(nb)
+                qm = QuantMatrix(raw, _dt, _rows, _cols)
+                check(f"{_dt} matrices adopt the native int-dot storage",
+                      qm._mode == f"{_dt.lower()[:2]}k_int", qm._mode)
+                os.environ["ALPACCA_INT_DOT"] = "0"
+                try:
+                    qm_f32 = QuantMatrix(raw, _dt, _rows, _cols)
+                finally:
+                    os.environ.pop("ALPACCA_INT_DOT", None)
+                dense = qm_f32._dense_from_storage()
+                tile = qm._tile_f32(0, _rows)
+                check(f"{_dt} native tile expansion is bit-exact vs dense",
+                      np.array_equal(tile, dense),
+                      f"maxdiff {np.abs(tile - dense).max():.2e}")
+                x = (rng.standard_normal(_cols) * 1.5).astype(np.float32)
+                got = np.asarray(qm.matvec(x), dtype=np.float64)
+                # exact integer simulation of what the kernel must compute
+                xq, ascale, bsums = AK.quantize_acts(x)
+                nblk = _cols // 256
+                q3 = qm._q3 if _dt == "Q6_K" else None
+                if _dt == "Q4_K":
+                    qp = qm._qp.reshape(_rows, nblk, 4, 32)
+                    cl = (qp & 0x0F).astype(np.int64)
+                    ch = (qp >> 4).astype(np.int64)
+                    co = np.empty((_rows, nblk, 4, 64), np.int64)
+                    co[..., :32] = cl
+                    co[..., 32:] = ch
+                    co = co.reshape(_rows, _cols // 32, 32)
+                    isum = (co * xq.reshape(1, -1, 32).astype(np.int64)).sum(-1)
+                    blk = (qm._sci.astype(np.int64)
+                           * isum.reshape(_rows, nblk, 8)).sum(-1)
+                    mini = (qm._mni.astype(np.int64)
+                            * bsums.reshape(1, nblk, 8).astype(np.int64)).sum(-1)
+                    dh = qm._dh.view(np.float16).astype(np.float64)
+                    dmh = qm._dmh.view(np.float16).astype(np.float64)
+                    sim = (ascale.astype(np.float64)
+                           * (dh * blk - dmh * mini)).sum(-1)
+                else:
+                    isum = (q3.astype(np.int64)
+                            * xq.reshape(1, -1, 16).astype(np.int64)).sum(-1)
+                    blk = (qm._sci.astype(np.int64) * isum).reshape(
+                        _rows, nblk, 16).sum(-1)
+                    dh = qm._dh.view(np.float16).astype(np.float64)
+                    sim = (ascale.astype(np.float64) * dh * blk).sum(-1)
+                srms = max(float(np.sqrt((sim ** 2).mean())), 1e-9)
+                kerr = float(np.abs(got - sim).max()) / srms
+                check(f"{_dt} int-dot kernel matches its integer simulation",
+                      kerr < 1e-5, f"kernel-vs-sim rel {kerr:.2e}")
+                fref = np.asarray(qm_f32.matvec(x), dtype=np.float64)
+                frms = max(float(np.sqrt((fref ** 2).mean())), 1e-9)
+                aerr = float(np.abs(got - fref).max()) / frms
+                check(f"{_dt} activation-quantization error stays bounded",
+                      aerr < 2e-2, f"int-vs-f32 rel {aerr:.2e}")
+                for B in (1, 3, 12):
+                    X = rng.standard_normal((B, _cols)).astype(np.float32)
+                    bt = np.asarray(qm.matmul_t(X))
+                    st = np.stack([np.asarray(qm.matvec(row)) for row in X])
+                    check(f"{_dt} int matmul_t batch {B} == stacked matvecs",
+                          np.allclose(bt, st, rtol=0, atol=0),
+                          f"maxdiff {np.abs(bt - st).max():.2e}")
+                os.environ["ALPACCA_INT_MATMUL_MAX_BATCH"] = "0"
+                try:
+                    X = rng.standard_normal((3, _cols)).astype(np.float32)
+                    tiled = np.asarray(qm.matmul_t(X))
+                    ref = X @ dense.T
+                    terr = float(np.abs(tiled - ref).max() /
+                                 max(np.abs(ref).max(), 1e-6))
+                    check(f"{_dt} native tiled matmul matches dense BLAS",
+                          terr < 2e-5, f"rel {terr:.2e}")
+                finally:
+                    os.environ.pop("ALPACCA_INT_MATMUL_MAX_BATCH", None)
+                ri = qm.rows_at([0, _rows - 1])
+                check(f"{_dt} native row access is bit-exact",
+                      np.array_equal(qm.row(2), dense[2]) and
+                      np.array_equal(ri, dense[[0, _rows - 1]]))
             os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
             try:
                 check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",

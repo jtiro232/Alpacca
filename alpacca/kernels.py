@@ -35,6 +35,40 @@ NARROW_BATCH = 8
 _state: dict | None = None  # lazy: {"matvec": compiled fn} or {} if inactive
 
 
+def _physical_cores() -> int:
+    """Physical core count, or 0 when it cannot be determined.
+
+    Decode is memory-bandwidth-bound and SMT siblings contend for the same
+    load ports: measured on a 6C/12T Ryzen, 6 threads decode 9-16% faster
+    than 12. Linux exposes the topology in sysfs; elsewhere we return 0 and
+    leave numba's default (all logical CPUs) alone rather than guess.
+    """
+    try:
+        cores = set()
+        base = "/sys/devices/system/cpu"
+        for name in os.listdir(base):
+            if not name.startswith("cpu") or not name[3:].isdigit():
+                continue
+            try:
+                with open(f"{base}/{name}/topology/core_id") as f:
+                    core = f.read().strip()
+                with open(f"{base}/{name}/topology/physical_package_id") as f:
+                    pkg = f.read().strip()
+            except OSError:
+                continue
+            cores.add((pkg, core))
+        return len(cores)
+    except Exception:
+        return 0
+
+
+def int_dot_enabled() -> bool:
+    """True when the integer-dot decode path is on (default when kernels
+    are active; ALPACCA_INT_DOT=0 reverts to the f32-activation kernels)."""
+    return (os.environ.get("ALPACCA_INT_DOT", "").strip().lower()
+            not in ("0", "off", "no")) and available()
+
+
 def _init() -> dict:
     global _state
     if _state is not None:
@@ -55,6 +89,22 @@ def _init() -> dict:
               f"kernels disabled (ALPACCA_KERNELS=force to override)",
               file=sys.stderr)
         return _state
+
+    # Thread count: prefer physical cores for the bandwidth-bound decode
+    # loop unless the user chose explicitly (either knob wins over us).
+    threads_env = os.environ.get("ALPACCA_THREADS", "").strip()
+    if threads_env:
+        try:
+            numba.set_num_threads(max(1, int(threads_env)))
+        except (ValueError, RuntimeError):
+            pass
+    elif "NUMBA_NUM_THREADS" not in os.environ:
+        phys = _physical_cores()
+        if 0 < phys < numba.get_num_threads():
+            try:
+                numba.set_num_threads(phys)
+            except RuntimeError:
+                pass
 
     @njit(parallel=True, fastmath=True, cache=True)
     def _matvec_codes(q3, d, m, xs, xsums, affine):
@@ -137,8 +187,140 @@ def _init() -> dict:
                 out[r, b] = acc[b]
         return out
 
+    # ---- integer-dot decode kernels --------------------------------------
+    #
+    # Numba's scalar integer arithmetic promotes to int64, which compiles a
+    # dot product to 8-lane vpmuldq/vpaddq and hides every 8/16-bit SIMD
+    # pattern from LLVM. Re-casting the accumulator each step
+    # (`acc = np.int32(acc + i32 * i32)`) keeps the IR in i32, and LLVM 20
+    # then forms vpmaddwd and folds it into AVX-512 VNNI's vpdpwssd - 32
+    # int16 MACs per instruction, measured 220 Gw/s flat vs the 105 Gw/s
+    # f32 FMA ceiling on the same machine. Every kernel below relies on it.
+    #
+    # Weight-side values are the file's own: 6-bit sub-block scales as
+    # integers and the per-256-block d/dmin as raw f16 bits (decoded through
+    # a 65536-entry f32 table, L2-resident). Activations are quantized to
+    # int8 per 256-element block (scale = absmax/127), so a sub-block dot is
+    # sum(sc * code * xq) with sc*code <= 63*15 in int16, exact in vpdpwssd's
+    # pairwise-int32 accumulation; float32 touches each 256-block twice.
+
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _quantize_acts(x):
+        # per-256-block int8 quantization + per-32 sums of the quantized
+        # values (the Q4_K min term needs them; exact by construction)
+        cols = x.shape[0]
+        nblk = cols // 256
+        xq = np.empty(cols, np.int8)
+        ascale = np.empty(nblk, np.float32)
+        bsums = np.empty(nblk * 8, np.int32)
+        for b in prange(nblk):
+            base = b * 256
+            amax = np.float32(0.0)
+            for j in range(256):
+                a = np.abs(x[base + j])
+                if a > amax:
+                    amax = a
+            if amax > np.float32(0.0):
+                scale = amax / np.float32(127.0)
+                inv = np.float32(127.0) / amax
+            else:
+                scale = np.float32(1.0)
+                inv = np.float32(0.0)
+            ascale[b] = scale
+            for s in range(8):
+                off = base + s * 32
+                bsum = np.int32(0)
+                for j in range(32):
+                    t = x[off + j] * inv
+                    v = np.int32(t + (np.float32(0.5) if t >= np.float32(0.0)
+                                      else np.float32(-0.5)))
+                    xq[off + j] = np.int8(v)
+                    bsum = np.int32(bsum + v)
+                bsums[b * 8 + s] = bsum
+        return xq, ascale, bsums
+
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _matvec_q4k_int(qp, sc, mn, dh, dmh, lut, xq, ascale, bsums):
+        # qp: (rows, cols//2) u8, the file's own split-nibble qs layout -
+        # byte j of 32-byte chunk c holds elements 64c+j (low nibble) and
+        # 64c+32+j (high). The j-loop walks all four chunks of a 256-block
+        # at once with the 6-bit scales premultiplied into the int16 codes
+        # (sc*code <= 945 < 2^15), so the whole block accumulates into one
+        # vector register and reduces to scalar once per 256 weights.
+        rows = qp.shape[0]
+        nblk = ascale.shape[0]
+        out = np.empty(rows, np.float32)
+        for r in prange(rows):
+            acc = np.float32(0.0)
+            for b in range(nblk):
+                p0 = b * 128
+                x0 = b * 256
+                s0 = np.int16(sc[r, b, 0])
+                s1 = np.int16(sc[r, b, 1])
+                s2 = np.int16(sc[r, b, 2])
+                s3 = np.int16(sc[r, b, 3])
+                s4 = np.int16(sc[r, b, 4])
+                s5 = np.int16(sc[r, b, 5])
+                s6 = np.int16(sc[r, b, 6])
+                s7 = np.int16(sc[r, b, 7])
+                blk_i = np.int32(0)
+                for j in range(32):
+                    v0 = qp[r, p0 + j]
+                    v1 = qp[r, p0 + 32 + j]
+                    v2 = qp[r, p0 + 64 + j]
+                    v3 = qp[r, p0 + 96 + j]
+                    blk_i = np.int32(
+                        blk_i
+                        + np.int32(np.int16(s0 * np.int16(v0 & np.uint8(15)))) * np.int32(xq[x0 + j])
+                        + np.int32(np.int16(s1 * np.int16(v0 >> np.uint8(4)))) * np.int32(xq[x0 + 32 + j])
+                        + np.int32(np.int16(s2 * np.int16(v1 & np.uint8(15)))) * np.int32(xq[x0 + 64 + j])
+                        + np.int32(np.int16(s3 * np.int16(v1 >> np.uint8(4)))) * np.int32(xq[x0 + 96 + j])
+                        + np.int32(np.int16(s4 * np.int16(v2 & np.uint8(15)))) * np.int32(xq[x0 + 128 + j])
+                        + np.int32(np.int16(s5 * np.int16(v2 >> np.uint8(4)))) * np.int32(xq[x0 + 160 + j])
+                        + np.int32(np.int16(s6 * np.int16(v3 & np.uint8(15)))) * np.int32(xq[x0 + 192 + j])
+                        + np.int32(np.int16(s7 * np.int16(v3 >> np.uint8(4)))) * np.int32(xq[x0 + 224 + j]))
+                min_i = np.int32(0)
+                for t in range(8):
+                    min_i = np.int32(min_i + np.int32(mn[r, b, t])
+                                     * bsums[b * 8 + t])
+                acc += ascale[b] * (lut[dh[r, b]] * np.float32(blk_i)
+                                    - lut[dmh[r, b]] * np.float32(min_i))
+            out[r] = acc
+        return out
+
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _matvec_q6k_int(q3, sc, dh, lut, xq, ascale):
+        # q3: (rows, n_sub, 16) int8 codes already centered to [-32, 31], so
+        # there is no min term; sc is the per-16 int8 scale and d the
+        # per-256-block f16. sc * isum stays integer until once per block.
+        rows, nsub, sub_len = q3.shape
+        nblk = ascale.shape[0]
+        out = np.empty(rows, np.float32)
+        for r in prange(rows):
+            acc = np.float32(0.0)
+            for b in range(nblk):
+                blk_i = np.int32(0)
+                for s in range(16):
+                    su = b * 16 + s
+                    qb = q3[r, su]
+                    x0 = su * sub_len
+                    isum = np.int32(0)
+                    for j in range(sub_len):
+                        isum = np.int32(isum + np.int32(qb[j])
+                                        * np.int32(xq[x0 + j]))
+                    blk_i = np.int32(blk_i + np.int32(sc[r, su]) * isum)
+                acc += ascale[b] * lut[dh[r, b]] * np.float32(blk_i)
+            out[r] = acc
+        return out
+
+    lut = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
+
     _state = {"np": np, "matvec": _matvec_codes, "matmul": _matmul_codes,
               "matmul_wide": _matmul_codes_wide,
+              "quantize_acts": _quantize_acts,
+              "matvec_q4k_int": _matvec_q4k_int,
+              "matvec_q6k_int": _matvec_q6k_int,
+              "f16_lut": lut,
               "numba_version": numba.__version__}
     return _state
 
@@ -203,6 +385,36 @@ def matmul_codes(q3, d_eff, m_eff, X):
     return np.ascontiguousarray(wide.T)
 
 
+def quantize_acts(x):
+    """Quantize a float32 activation vector for the integer-dot kernels.
+
+    Returns (xq int8 (cols,), ascale f32 (cols//256,), bsums i32 (cols//32,))
+    with a per-256-block scale of absmax/127 and per-32 sums of the
+    quantized values. `cols` must be a multiple of 256.
+    """
+    st = _init()
+    np = st["np"]
+    return st["quantize_acts"](np.ascontiguousarray(x, dtype=np.float32))
+
+
+def matvec_q4k_int(qp, sc, mn, dh, dmh, x):
+    """Fused Q4_K matvec over the native block fields with an int8-activation
+    integer dot. qp u8 (rows, cols//2) split-nibble codes; sc/mn u8
+    (rows, nblk, 8); dh/dmh u16 f16-bits (rows, nblk); x f32 (cols,)."""
+    st = _init()
+    xq, ascale, bsums = quantize_acts(x)
+    return st["matvec_q4k_int"](qp, sc, mn, dh, dmh, st["f16_lut"],
+                                xq, ascale, bsums)
+
+
+def matvec_q6k_int(q3, sc, dh, x):
+    """Fused Q6_K matvec: int8 codes (rows, n_sub, 16), int8 per-16 scales
+    (rows, n_sub), per-256-block f16-bit scales dh (rows, nblk)."""
+    st = _init()
+    xq, ascale, _bsums = quantize_acts(x)
+    return st["matvec_q6k_int"](q3, sc, dh, st["f16_lut"], xq, ascale)
+
+
 def warmup() -> None:
     """Trigger JIT compilation once (cached on disk afterwards)."""
     st = _init()
@@ -217,3 +429,12 @@ def warmup() -> None:
         X = np.zeros((b, 32), dtype=np.float32)
         matmul_codes(q, d, None, X)
         matmul_codes(q, d, d, X)
+    x256 = np.zeros(256, dtype=np.float32)
+    matvec_q4k_int(np.zeros((2, 128), dtype=np.uint8),
+                   np.zeros((2, 1, 8), dtype=np.uint8),
+                   np.zeros((2, 1, 8), dtype=np.uint8),
+                   np.zeros((2, 1), dtype=np.uint16),
+                   np.zeros((2, 1), dtype=np.uint16), x256)
+    matvec_q6k_int(np.zeros((2, 16, 16), dtype=np.int8),
+                   np.zeros((2, 16), dtype=np.int8),
+                   np.zeros((2, 1), dtype=np.uint16), x256)

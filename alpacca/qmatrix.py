@@ -88,6 +88,20 @@ def _fused_matmul_max_batch() -> int:
     except ValueError:
         return 96
 
+
+# Native-mode (integer-dot) batched matmul: below this batch, loop the
+# integer matvec (weights re-stream per row, but at 2.4x the f32 rate);
+# above it, dequantize tiles and call BLAS. The f32 tiled path costs a
+# full-model dequantize regardless of batch, so the crossover sits where
+# batch * matvec_ms ~= tiled_ms. Measured on the 14336x4096 Q4_K shape:
+# int matvec 0.53 ms, tiled ~43 ms -> ~80; default below it for safety.
+def _int_matmul_max_batch() -> int:
+    raw = os.environ.get("ALPACCA_INT_MATMUL_MAX_BATCH", "")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 64
+
 _HOT_WEIGHT_ENV = "ALPACCA_HOT_WEIGHT_MB"
 _HOT_CACHE_LIMIT_BYTES = None
 _HOT_CACHE_USED_BYTES = 0
@@ -105,7 +119,8 @@ class QuantMatrix:
 
     __slots__ = ("dtype", "rows", "cols", "block_elements", "block_bytes",
                  "blocks_per_row", "sub_len", "n_sub", "data",
-                 "_q", "_q3", "_small", "_d", "_m",
+                 "_q", "_q3", "_small", "_d", "_m", "_mode",
+                 "_qp", "_sci", "_mni", "_dh", "_dmh",
                  "_dense_cache", "_dense_cache_bytes", "__weakref__")
 
     def __init__(self, data, dtype: str, rows: int, cols: int):
@@ -130,12 +145,47 @@ class QuantMatrix:
                 f"{dtype} matrix has {len(data)} bytes, expected {expected}")
         self._dense_cache = None
         self._dense_cache_bytes = 0
+        self._mode = "codes"
+        self._qp = self._sci = self._mni = self._dh = self._dmh = None
         if HAS_NUMPY:
+            self._small = rows * cols < _SMALL_MATVEC_ELEMS
+            self.data = None  # unpacked copies own everything; mmap may close
+            if (not self._small and dtype in ("Q4_K", "Q6_K")
+                    and _kernels.int_dot_enabled()):
+                # native block fields for the integer-dot kernels: the
+                # file's own 4-bit codes / 6-bit sub-scales / f16 supers,
+                # 0.58 (Q4_K) and 1.07 (Q6_K) bytes per weight instead of
+                # the 1.25 of int8 codes + f32 scales
+                from .quants import (np_unpack_q4k_native,
+                                     np_unpack_q6k_native)
+                bpr = self.blocks_per_row
+                if dtype == "Q4_K":
+                    qp, sc, mn, dh, dmh = np_unpack_q4k_native(
+                        data, rows * cols)
+                    self._mode = "q4k_int"
+                    self._qp = _np.ascontiguousarray(
+                        qp.reshape(rows, cols // 2))
+                    self._sci = _np.ascontiguousarray(
+                        sc.reshape(rows, bpr, 8))
+                    self._mni = _np.ascontiguousarray(
+                        mn.reshape(rows, bpr, 8))
+                    self._dh = _np.ascontiguousarray(dh.reshape(rows, bpr))
+                    self._dmh = _np.ascontiguousarray(dmh.reshape(rows, bpr))
+                else:
+                    q6, sc6, dh = np_unpack_q6k_native(data, rows * cols)
+                    self._mode = "q6k_int"
+                    self._q3 = _np.ascontiguousarray(
+                        q6.reshape(rows, self.n_sub, sub_len))
+                    self._sci = _np.ascontiguousarray(
+                        sc6.reshape(rows, self.n_sub))
+                    self._dh = _np.ascontiguousarray(dh.reshape(rows, bpr))
+                self._q = self._d = self._m = None
+                if self._mode == "q4k_int":
+                    self._q3 = None
+                return
             from .quants import np_unpack
             q, d_eff, m_eff = np_unpack(data, rows * cols, dtype)
-            self.data = None  # unpacked copies own everything; mmap may close
             q3 = q.reshape(rows, self.n_sub, sub_len)
-            self._small = rows * cols < _SMALL_MATVEC_ELEMS
             if self._small:
                 # store small matrices in the batched-matmul kernel layout so
                 # the per-token astype reads contiguously; _q3 stays the
@@ -168,6 +218,11 @@ class QuantMatrix:
     def storage_nbytes(self) -> int:
         """Bytes held by the quantized representation (excl. hot cache)."""
         if HAS_NUMPY:
+            if self._mode == "q4k_int":
+                return (self._qp.nbytes + self._sci.nbytes + self._mni.nbytes
+                        + self._dh.nbytes + self._dmh.nbytes)
+            if self._mode == "q6k_int":
+                return self._q3.nbytes + self._sci.nbytes + self._dh.nbytes
             n = self._q.nbytes + self._d.nbytes
             if self._m is not None:
                 n += self._m.nbytes
@@ -187,6 +242,14 @@ class QuantMatrix:
             dense = self._dense_hot_cache()
             if dense is not None:
                 return dense @ _np.asarray(x, dtype=_np.float32)
+        if self._mode == "q4k_int":
+            # integer-dot kernel on the native block fields: activations are
+            # quantized to int8 per 256 block (see kernels.quantize_acts),
+            # weights stream at ~0.58 B/weight instead of 1.25
+            return _kernels.matvec_q4k_int(self._qp, self._sci, self._mni,
+                                           self._dh, self._dmh, x)
+        if self._mode == "q6k_int":
+            return _kernels.matvec_q6k_int(self._q3, self._sci, self._dh, x)
         if not self._small and _kernels.available():
             # our fused Python-source kernel, JIT-compiled by pinned numba:
             # reads the int8 codes once, ~10x the einsum path (measured)
@@ -227,6 +290,21 @@ class QuantMatrix:
             dense = self._dense_hot_cache()
             if dense is not None:
                 return X @ dense.T
+        if self._mode in ("q4k_int", "q6k_int"):
+            # the integer matvec streams weights at 2.4x the f32 kernel's
+            # rate, so re-streaming them per batch row beats a full-model
+            # dequantize up to a large batch; past that, tile + BLAS
+            if X.shape[0] <= _int_matmul_max_batch():
+                out = _np.empty((X.shape[0], self.rows), dtype=_np.float32)
+                for i in range(X.shape[0]):
+                    out[i] = self.matvec(X[i])
+                return out
+            out = _np.empty((X.shape[0], self.rows), dtype=_np.float32)
+            tile_rows = max(16, (4 << 20) // max(self.cols * 4, 1))
+            for r0 in range(0, self.rows, tile_rows):
+                r1 = min(self.rows, r0 + tile_rows)
+                out[:, r0:r1] = X @ self._tile_f32(r0, r1).T
+            return out
         # Below the crossover, stream the codes once with the fused kernel.
         # The tiled path underneath costs O(weights) no matter how small the
         # batch is, so a short prefill used to cost a full-model dequantize.
@@ -250,6 +328,36 @@ class QuantMatrix:
                 out[:, r0:r1] += x_sub_sums @ self._m[r0:r1].T
         return out
 
+    # ---- native-mode f32 expansion (batched matmul tiles, row access) ------
+
+    def _tile_f32(self, r0: int, r1: int):
+        """Dequantize rows [r0, r1) of a native-mode matrix to float32.
+
+        Same math as the per-token kernels' f32 side: d_eff = f16(d) * sc,
+        m_eff = -f16(dmin) * mn, value = d_eff * code + m_eff.
+        """
+        nr = r1 - r0
+        if self._mode == "q4k_int":
+            qp = self._qp[r0:r1].reshape(nr, -1, 32)
+            codes = _np.empty((nr, qp.shape[1], 64), dtype=_np.uint8)
+            codes[:, :, :32] = qp & 0x0F
+            codes[:, :, 32:] = qp >> 4
+            d_eff = (self._dh[r0:r1].view(_np.float16).astype(_np.float32)
+                     [:, :, None] * self._sci[r0:r1].astype(_np.float32))
+            m_eff = (self._dmh[r0:r1].view(_np.float16).astype(_np.float32)
+                     [:, :, None] * self._mni[r0:r1].astype(_np.float32))
+            v = codes.reshape(nr, self.n_sub, self.sub_len).astype(_np.float32)
+            v *= d_eff.reshape(nr, self.n_sub, 1)
+            v -= m_eff.reshape(nr, self.n_sub, 1)
+            return v.reshape(nr, self.cols)
+        if self._mode == "q6k_int":
+            d_eff = (self._dh[r0:r1].view(_np.float16).astype(_np.float32)
+                     .repeat(16, axis=1) * self._sci[r0:r1].astype(_np.float32))
+            v = self._q3[r0:r1].astype(_np.float32)
+            v *= d_eff[:, :, None]
+            return v.reshape(nr, self.cols)
+        raise RuntimeError(f"_tile_f32 called in mode {self._mode}")
+
     # ---- row access (embedding lookups) ------------------------------------
 
     def row(self, i: int):
@@ -263,6 +371,8 @@ class QuantMatrix:
             _sync_hot_cache_budget(_hot_cache_limit_bytes())
             if self._dense_cache is not None:
                 return self._dense_cache[i].copy()
+        if self._mode != "codes":
+            return self._tile_f32(i, i + 1).reshape(-1)
         v = self._q3[i].astype(_np.float32)
         v *= self._d[i, :, None]
         if self._m is not None:
@@ -279,6 +389,11 @@ class QuantMatrix:
             _sync_hot_cache_budget(_hot_cache_limit_bytes())
             if self._dense_cache is not None:
                 return self._dense_cache[idx].copy()
+        if self._mode != "codes":
+            out = _np.empty((idx.size, self.cols), dtype=_np.float32)
+            for n, i in enumerate(idx):
+                out[n] = self._tile_f32(int(i), int(i) + 1)[0]
+            return out
         v = self._q3[idx].astype(_np.float32)
         v *= self._d[idx][:, :, None]
         if self._m is not None:
@@ -288,6 +403,8 @@ class QuantMatrix:
     # ---- optional dense f32 cache (ALPACCA_HOT_WEIGHT_MB) -------------------
 
     def _dense_from_storage(self):
+        if self._mode != "codes":
+            return self._tile_f32(0, self.rows)
         v = self._q3.astype(_np.float32)
         v *= self._d[:, :, None]
         if self._m is not None:
