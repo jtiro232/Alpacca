@@ -773,6 +773,11 @@ def main() -> None:
                     check(f"{_dt} int matmul_t batch {B} == stacked matvecs",
                           np.allclose(bt, st, rtol=0, atol=0),
                           f"maxdiff {np.abs(bt - st).max():.2e}")
+                grp = T.matvec_group([qm, qm], x)
+                solo = np.asarray(qm.matvec(x))
+                check(f"{_dt} shared-quantization matvec_group is bit-exact",
+                      np.array_equal(np.asarray(grp[0]), solo) and
+                      np.array_equal(np.asarray(grp[1]), solo))
                 os.environ["ALPACCA_INT_MATMUL_MAX_BATCH"] = "0"
                 try:
                     X = rng.standard_normal((3, _cols)).astype(np.float32)

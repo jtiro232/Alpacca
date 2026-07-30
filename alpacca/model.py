@@ -900,13 +900,11 @@ class Model:
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
             if ly.wqk is not None:
-                qk = T.matvec(ly.wqk, h)
+                qk, v = T.matvec_group([ly.wqk, ly.wv], h)
                 q = qk[:qd]
                 k = qk[qd:]
             else:
-                q = T.matvec(ly.wq, h)
-                k = T.matvec(ly.wk, h)
-            v = T.matvec(ly.wv, h)
+                q, k, v = T.matvec_group([ly.wq, ly.wk, ly.wv], h)
             if ly.bq is not None:
                 q = q + ly.bq
             if ly.bk is not None:
@@ -1115,13 +1113,11 @@ class Model:
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
             if ly.wqk is not None:
-                qk = T.matvec(ly.wqk, h)
+                qk, v = T.matvec_group([ly.wqk, ly.wv], h)
                 q = qk[:qd]
                 k = qk[qd:]
             else:
-                q = T.matvec(ly.wq, h)
-                k = T.matvec(ly.wk, h)
-            v = T.matvec(ly.wv, h)
+                q, k, v = T.matvec_group([ly.wq, ly.wk, ly.wv], h)
             if ly.bq is not None:
                 q = q + ly.bq
             if ly.bk is not None:

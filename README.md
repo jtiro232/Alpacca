@@ -255,6 +255,16 @@ but 226 -> 162 launches was worth 0.0 ms here), and thread counts above
 the physical-core count (SMT contention costs 9-16%; kernels now default
 to physical cores, override with ALPACCA_THREADS).
 
+Two bigger avenues were measured shut (details and numbers in
+prompts/03-RESULTS.md): packing Q6_K to its native 0.82 bytes/weight is
+a wash - the 6-bit unpack costs exactly the ALU that the bandwidth
+saving buys back - and speculative decoding is capped at ~1.10x here
+regardless of draft acceptance, because batched integer matmuls cost
+linearly in batch size: the single-token kernel already uses ~all of
+the machine's vpdpwssd throughput, so there is no headroom to verify
+drafts in. Both would reopen if LLVM's auto-vectorizer learns to emit
+vpdpbusd (4 int8 MACs per lane instead of vpdpwssd's 2).
+
 Batched work was a different story. `matmul_t` used to dequantize the whole
 matrix to float32 before handing it to BLAS, a cost proportional to the
 *weights* rather than to the batch, so prefilling a single new token cost a

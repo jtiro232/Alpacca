@@ -285,6 +285,57 @@ Known limitation, documented: the kernels-ABSENT numpy reference path
 keeps its historical BLAS-threaded attention (proportionally minor at
 its 1.4 tok/s baseline).
 
+## Speed round 4 (2026-07-30): pushing toward Ollama parity - mostly
+## measured negatives, and they are DEFINITIVE
+
+Goal: close 9.8 -> 11.9. Result: one small keep, three closed avenues.
+
+KEPT: shared activation quantization (T.matvec_group) - wqk/wv (and
+unfused q/k/v) read the same normed vector, quantize it once. Bit-exact
+(suite-pinned), ~1-2 ms/token. Decode 102.4 ms.
+
+NEGATIVE 1 - Q6_K 6-bit packing (0.820 B/w, wall 72.5 Gw/s): naive
+in-loop unpack+(-32) went scalar (30-31 Gw/s, no VNNI emitted). Folding
+the -32 into an integer min-term (sc*(e-32) = sc*e - 32*sc*bsum16, the
+Q4_K min algebra) rescued vectorization: 52.1 Gw/s with vpdpwssd - but
+that EQUALS the unpacked kernel's 52.2 (1.13 vs 1.12 ms). The 6-bit
+unpack ALU exactly cancels the bandwidth saving at this machine's
+ratio: the same wash SS7 measured for f32, reproduced in the VNNI
+regime. Only remaining value is ~370 MB RAM; not worth a storage mode.
+
+NEGATIVE 2 - batched integer matmul -> speculative decoding: batch cost
+is LINEAR. Stream-weights-once kernel: B=2 1.90x, B=4 3.64x, B=8 7.01x
+(per-lane discount <= 9%); the shared-unpack restructure (batch inside
+j, 4 acc chains) was 2x WORSE (6.16x at B=4 - SS5.2 strikes again).
+Cause: the single-token kernel already uses ~91-100% of the machine's
+integer ALU, so there is no headroom to hide drafting in. Speculative
+decoding is capped at ~1.10x REGARDLESS of acceptance rate. This
+definitively answers SS7's revisit-condition: batching cannot stop
+costing linearly on this hardware with vpdpwssd (2 MAC/lane/instr).
+A future LLVM that auto-emits vpdpbusd (4 MAC/lane; x86 partial-reduce
+lowering is landing in LLVM 21+) would double the ALU ceiling and
+reopen BOTH this and Q6_K packing.
+
+NEGATIVE 3 - Q4_K native 12-byte packed scales (0.5625 B/w, wall 105.8
+Gw/s): naive in-kernel 6-bit sc/mn extraction (24 scalar byte ops per
+block) collapsed the whole loop to 12.7 Gw/s (8.7x slower). UNTESTED
+variant: per-row scale-prepass into thread scratch, then the clean
+j-outer loop - worth at most ~1.5 ms/token; future work.
+
+### Refined parity verdict
+
+Exact single-token decode ceiling here = 4.92 GB/token / 59.5 GB/s
+~ 11.4 tok/s; Ollama runs 11.9 by sitting on that wall with ~1 ms
+overhead. Alpacca: 102.4 ms = 9.77 tok/s. The remaining 20 ms
+decomposes as: Q6_K ALU ceiling ~9 ms (proven twice: needs 72 Gw/s,
+has 52), non-matvec ~6 ms (attention 0.5 + rope 1.4 + norms 1.0 +
+quantize 1.3 + dispatch ~2), Q4_K scale packing ~1.5 ms (prepass
+untested), Q4_K wall shortfall ~3 ms (96% of streaming peak). Realistic
+alpacca max on this box ~10.2-10.5 exact; parity needs vpdpbusd-class
+codegen or faster DRAM. Also: sustained decode runs this chassis at
+Tjmax (95C, clocks hold 4.26 GHz) - cooling/power limits, not code, set
+part of the wall.
+
 ### 6.4 f16 KV cache: DEFERRED with rationale
 
 At the benchmark's context (<=512) attention costs 1.17 ms/token; halving

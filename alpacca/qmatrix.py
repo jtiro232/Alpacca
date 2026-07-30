@@ -234,8 +234,13 @@ class QuantMatrix:
     def __matmul__(self, x):
         return self.matvec(x)
 
-    def matvec(self, x):
-        """self (rows x cols) @ x (cols) -> (rows)."""
+    def matvec(self, x, pre=None):
+        """self (rows x cols) @ x (cols) -> (rows).
+
+        `pre` optionally carries kernels.quantize_acts(x) so several
+        native-mode matrices reading the same vector quantize it once;
+        non-native modes ignore it.
+        """
         if not HAS_NUMPY:
             return self._matvec_pure(x)
         if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
@@ -247,9 +252,10 @@ class QuantMatrix:
             # quantized to int8 per 256 block (see kernels.quantize_acts),
             # weights stream at ~0.58 B/weight instead of 1.25
             return _kernels.matvec_q4k_int(self._qp, self._sci, self._mni,
-                                           self._dh, self._dmh, x)
+                                           self._dh, self._dmh, x, pre)
         if self._mode == "q6k_int":
-            return _kernels.matvec_q6k_int(self._q3, self._sci, self._dh, x)
+            return _kernels.matvec_q6k_int(self._q3, self._sci, self._dh, x,
+                                           pre)
         if not self._small and _kernels.available():
             # our fused Python-source kernel, JIT-compiled by pinned numba:
             # reads the int8 codes once, ~10x the einsum path (measured)

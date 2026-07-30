@@ -515,21 +515,23 @@ def quantize_acts(x):
     return st["quantize_acts"](np.ascontiguousarray(x, dtype=np.float32))
 
 
-def matvec_q4k_int(qp, sc, mn, dh, dmh, x):
+def matvec_q4k_int(qp, sc, mn, dh, dmh, x, pre=None):
     """Fused Q4_K matvec over the native block fields with an int8-activation
     integer dot. qp u8 (rows, cols//2) split-nibble codes; sc/mn u8
-    (rows, nblk, 8); dh/dmh u16 f16-bits (rows, nblk); x f32 (cols,)."""
+    (rows, nblk, 8); dh/dmh u16 f16-bits (rows, nblk); x f32 (cols,).
+    `pre` is an optional quantize_acts(x) result so matrices sharing an
+    input (attn qk and v read the same normed vector) quantize it once."""
     st = _init()
-    xq, ascale, bsums = quantize_acts(x)
+    xq, ascale, bsums = pre if pre is not None else quantize_acts(x)
     return st["matvec_q4k_int"](qp, sc, mn, dh, dmh, st["f16_lut"],
                                 xq, ascale, bsums)
 
 
-def matvec_q6k_int(q3, sc, dh, x):
+def matvec_q6k_int(q3, sc, dh, x, pre=None):
     """Fused Q6_K matvec: int8 codes (rows, n_sub, 16), int8 per-16 scales
     (rows, n_sub), per-256-block f16-bit scales dh (rows, nblk)."""
     st = _init()
-    xq, ascale, _bsums = quantize_acts(x)
+    xq, ascale, _bsums = pre if pre is not None else quantize_acts(x)
     qf = q3.reshape(q3.shape[0], -1)  # contiguous flat view, no copy
     return st["matvec_q6k_int"](qf, sc, dh, st["f16_lut"], xq, ascale)
 

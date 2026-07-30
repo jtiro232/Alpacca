@@ -27,6 +27,7 @@ HAS_NUMPY = _np is not None
 
 from .qmatrix import (  # noqa: E402  (re-exported quantized-matrix surface)
     QUANTIZED_MATVEC_DTYPES,
+    _HOT_WEIGHT_ENV,
     QuantMatrix as QuantizedMatrix,
     _reset_hot_cache_state,
     can_quantized_matvec,
@@ -86,6 +87,27 @@ def matvec(W, x):
     if HAS_NUMPY:
         return W @ x
     return [sum(w * xv for w, xv in zip(row, x)) for row in W]
+
+
+def matvec_group(Ws, x):
+    """Matvec several matrices against the SAME input vector.
+
+    When two or more of them are native-mode quantized matrices, the int8
+    activation quantization runs once instead of once per matrix - the
+    result is bit-identical either way (quantize_acts is a deterministic
+    function of x). Falls back to plain matvecs everywhere else.
+    """
+    if HAS_NUMPY:
+        native = [W for W in Ws
+                  if isinstance(W, QuantizedMatrix)
+                  and getattr(W, "_mode", "codes") in ("q4k_int", "q6k_int")
+                  and W._dense_cache is None]
+        if len(native) >= 2 and _HOT_WEIGHT_ENV not in os.environ:
+            from . import kernels as _k
+            pre = _k.quantize_acts(x)
+            return [W.matvec(x, pre) if W in native else matvec(W, x)
+                    for W in Ws]
+    return [matvec(W, x) for W in Ws]
 
 
 def matmul_t(X, W):
