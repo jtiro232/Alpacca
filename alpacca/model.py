@@ -733,10 +733,13 @@ class Model:
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
-        if self._use_kernel_attention:
+        if self._use_kernel_attention and n_rot % 2 == 0 and n_rot <= hd:
             # bit-identical JIT rotation (strict FP, no reductions); the
             # NumPy slicing below allocates four temporaries per call and
-            # costs ~1.4 ms/token across 64 calls
+            # costs ~1.4 ms/token across 64 calls. Degenerate rope
+            # dimensions (odd, or wider than the head - unvalidated GGUF
+            # metadata) stay on the NumPy path, which fails loudly where
+            # the kernel would return uninitialized memory.
             from . import kernels
             return kernels.rope_decode(
                 np.ascontiguousarray(vec, dtype=np.float32),
@@ -968,7 +971,8 @@ class Model:
         hp = self.hp
         hd, n_rot = hp.head_dim, hp.n_rot
         half = n_rot // 2
-        if self._use_kernel_attention:
+        if self._use_kernel_attention and n_rot % 2 == 0 and n_rot <= hd:
+            # same degenerate-n_rot guard as _rope_np
             from . import kernels
             return kernels.rope_decode(
                 np.ascontiguousarray(vec, dtype=np.float32),

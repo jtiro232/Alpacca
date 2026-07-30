@@ -429,6 +429,11 @@ class QuantMatrix:
         idx = _np.asarray(rows, dtype=_np.int64)
         if idx.size and (int(idx.min()) < 0 or int(idx.max()) >= self.rows):
             raise IndexError("row index out of range")
+        if not idx.size:
+            # the native expanders reshape by block width, which numpy
+            # rejects for zero rows; every mode agrees an empty gather is
+            # an empty (0, cols) result
+            return _np.empty((0, self.cols), dtype=_np.float32)
         if self._dense_cache is not None or _HOT_WEIGHT_ENV in os.environ:
             _sync_hot_cache_budget(_hot_cache_limit_bytes())
             if self._dense_cache is not None:

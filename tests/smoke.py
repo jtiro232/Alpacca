@@ -892,6 +892,28 @@ def main() -> None:
                         rope_ok = rope_ok and np.array_equal(
                             got_r, v2.reshape(-1))
                 check("JIT rope is bit-identical to the NumPy path", rope_ok)
+                # review-confirmed edges: empty gathers must return (0, cols)
+                # in native modes, and degenerate rope dims (odd n_rot, or
+                # n_rot > head_dim - unvalidated GGUF metadata) must fall to
+                # the NumPy path, which raises loudly instead of returning
+                # uninitialized memory
+                empty = qm.rows_at([])
+                check("native-mode empty row gather returns (0, cols)",
+                      empty.shape == (0, qm.cols) and
+                      empty.dtype == np.float32)
+                from types import SimpleNamespace as _SNS
+                dm = Model.__new__(Model)
+                dm._use_kernel_attention = True
+                dm.hp = _SNS(head_dim=8, n_rot=7, rope_style="norm")
+                dm._rope_cos = np.zeros((4, 3), np.float32)
+                dm._rope_sin = np.zeros((4, 3), np.float32)
+                try:
+                    dm._rope_np(np.zeros(16, np.float32), 2, 0)
+                    odd_ok = False  # silent success would be the bug
+                except ValueError:
+                    odd_ok = True   # the loud NumPy failure, as before
+                check("odd n_rot bypasses the JIT rope and fails loudly",
+                      odd_ok)
 
         # ---- top-k selection ---------------------------------------------
         # This had no direct coverage at all, which is how a first version
