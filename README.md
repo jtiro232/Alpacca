@@ -513,6 +513,163 @@ Useful environment knobs:
   (`ALPACCA_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is now the
   default storage and needs no budget.)
 
+### The GPU tier: CUDA kernels, still our Python
+
+`python -m pip install ".[gpu]"` from this checkout adds a fourth optional
+tier: the quantized matvec/matmul kernels in `alpacca/cuda.py` - written
+and maintained as ordinary Python in this repository - get JIT-compiled
+for the local NVIDIA GPU at runtime by **numba-cuda, pinned at `0.30.4`**
+together with its exact CUDA wheel set (same pin policy as `[kernels]`:
+the pins are a validated combination, never bumped implicitly, and a
+different installed version deactivates the tier rather than running
+unvalidated; `ALPACCA_GPU=force` overrides at your own risk). Weight
+matrices upload once at load in the same int8-codes + float32-scales
+layout the NumPy backend unpacks and stay quantized in VRAM (~1.25
+bytes/weight); activations, the KV cache and attention stay on the CPU,
+so every other tier keeps working unchanged and `ALPACCA_GPU=0` restores
+them exactly. Like everything else here the wheels install once and run
+offline; keep copies (`pip download ".[gpu]"`) if the machine will be
+air-gapped later.
+
+Measured on this machine (RTX 4090 24 GB, driver 591.86, Windows 11)
+with `tests/bench.py` (512-token prefill, greedy decode), GPU tier vs
+the CPU kernels tier:
+
+| Model | tier | prefill tok/s | decode tok/s |
+| --- | --- | ---: | ---: |
+| llama3.2:1b Q8_0 | cpu kernels | 86.4 | 34.0 |
+| llama3.2:1b Q8_0 | **gpu** | **128.5** | **52.5-56.5** |
+| Hermes-3 8B Q4_K_M | cpu kernels | 6.1 | 9.4 |
+| Hermes-3 8B Q4_K_M | **gpu** | **39.9** | **27.8** |
+
+The 8B keeps 8.7 GiB resident in VRAM (161 of its 226 matrices; the
+token embedding never uploads - row gathers are the one workload these
+kernels are wrong for, which is also why the tied-embedding 1b gains
+less: its 128256-row output head stays on the CPU). Placement is
+per-matrix, so running out of VRAM mid-load just leaves the remaining
+matrices on the CPU tiers with one warning line - a capped run
+(`ALPACCA_GPU_VRAM_MB=500` on the 1b: 44 matrices on GPU, the rest on
+CPU) decodes token-identically to the uncapped one.
+
+Correctness, measured: GpuMatrix matches QuantMatrix within 9.8e-7
+worst relative error across all ten quant formats (bar 2e-5), row access
+is bit-exact, and 48-token greedy decode is token-identical to the exact
+f32 reference path on both test models (llama3.2:1b vs the CPU tiers
+directly, 48/48; the 8B vs `ALPACCA_INT_DOT=0`, 48/48, final logits
+within 1.6e-6 relative - the int-dot CPU tier is approximate by design,
+so greedy text can drift from *it* after ~25 tokens on Q4_K_M while both
+stay glued to the reference).
+
+Where a decoded 8B token goes (instrumented with `cuda.synchronize`
+timing, ~31-36 ms/token): 12.2 ms of GPU kernels streaming the 9.4 GB of
+resident codes at 772 GB/s (a plain saxpy measures 918 on this card),
+~13 ms of Python-side numba launch machinery across 161 kernel launches,
+2.2 ms of activation uploads, ~1.6 ms of result downloads, ~1 ms of CPU
+attention. The launch machinery is the honest next target; device-
+resident activation chaining would remove most of it and is deliberately
+not in v1.
+
+GPU knobs:
+
+- `ALPACCA_GPU=0`: disable the tier; `ALPACCA_GPU=force` accepts a
+  non-pinned numba-cuda at your own risk.
+- `ALPACCA_GPU_VRAM_MB=N`: cap uploaded weight bytes (the
+  mixed-placement test hook; free VRAM minus a 512 MiB reserve decides
+  otherwise).
+- `ALPACCA_GPU_WIDE_MATMUL_ELEMS=N`: matrices at or below `N` elements
+  use the one-launch wide matmul kernel for prefill, larger ones loop
+  the matvec kernel per batch row. Default 32M, just under the measured
+  ~34M-element crossover. Re-measure, do not re-guess.
+
+One installation trap the `[gpu]` pins exist to prevent: with
+`nvidia-nvjitlink` missing, cuda.core's DLL search can silently find a
+torch wheel's bundled stale nvJitLink and every kernel dies with
+`ERROR_OUTDATED_LIBRARY(14)`. The availability probe compiles and runs a
+real kernel before the tier may activate and reports the actual cause
+through `alpacca doctor`, which shows the device, free VRAM and tier
+status either way.
+
+### Ollama-native API
+
+`alpacca serve` also speaks the Ollama REST protocol on the same port, so
+the official `ollama` Python client works unmodified - point it at the
+server and `client.chat(...)`, `client.generate(...)`, `ollama.list()`,
+`show()`, and `ps()` behave as they do against Ollama itself (verified
+end to end against `ollama` 0.6.1, streaming and non-streaming):
+
+```python
+import ollama
+client = ollama.Client(host="http://127.0.0.1:8080")
+client.chat(model="llama3.2:1b",
+            messages=[{"role": "user", "content": "hi"}],
+            options={"num_predict": 64, "seed": 1})
+```
+
+Implemented: `POST /api/chat` and `POST /api/generate` (newline-delimited
+JSON streaming by default, exactly like Ollama; `stream: false` for a
+single response), `GET /api/tags` (the local model store, with the served
+model always present), `POST /api/show` (the loaded model's real GGUF
+metadata), `GET /api/ps`, and `GET /api/version`. Token counts in the
+responses are exact - counted by the generation loop, not inferred.
+Durations are honest wall-clock nanoseconds: `eval_duration` is the decode
+loop's own clock, `total_duration` is the request's, and
+`prompt_eval_duration` is the difference (genuinely prefill plus
+render/lock overhead - no fabricated split). Requests naming a model this
+process is not serving get Ollama's 404 error shape; `name` and
+`name:latest` are the same model.
+
+Deliberate divergences, stated plainly: one model is resident per server,
+so `keep_alive` is accepted and ignored and `/api/ps` reports a far-future
+expiry; `options.num_ctx` is accepted but the context window was fixed at
+load time - an oversize ask proceeds at the loaded window instead of
+erroring; `format` as a JSON-schema dict is honoured as `format: "json"`
+(the output is valid JSON, the schema itself is not enforced); and
+`/api/generate` returns `context: []` rather than a resumable token list.
+
+### Guaranteed-valid JSON output
+
+`chat.generate(...)` and `chat.chat_once(...)` take a keyword-only
+`json_only=True`. With it, every fragment the call streams or returns is a
+prefix of one syntactically valid JSON value, and generation stops
+(`stop_reason "stop"`) the moment the top-level value closes. This is a hard
+guarantee at any temperature, on any supported model, on both the NumPy and
+pure-Python backends - not a prompt trick.
+
+The mechanism is a byte-level JSON grammar guard (`alpacca/jsonform.py`)
+driving a candidate-rejection loop: each position is sampled normally, the
+candidate token's raw bytes are tested against the guard, and a token that
+would break the JSON is masked to -inf and the position resampled. The guard
+works on bytes rather than text because byte-level BPE tokens can split a
+UTF-8 character; end-of-generation tokens are banned until the value is
+complete, so a model that gives up mid-object is pushed to close it instead.
+After 512 rejections at one position the engine falls back to a ranked scan
+of the whole vocabulary, which is the guarantee rather than the fast path:
+measured over 10 llama3.2:1b replies at temperature 0.9 (807 positions), the
+loop rejected 33 candidates in total and never more than 4 at one position,
+and all 10 replies parsed with `json.loads`. A 24-seed sweep on the tiny test
+fixture at temperature 2.0 produced only valid values or valid prefixes on
+both backends.
+
+Measured cost on llama3.2:1b, 64-token decode, temperature 0.9: 27.3 ms/token
+plain vs 27.4 ms/token with `json_only` (+0.2%), plus a one-time 83 ms
+token-bytes table build per tokenizer (cached on the model).
+
+Honest limits: the guarantee is syntax, not schema - the model still chooses
+the keys and values, so keep prompting for the JSON you want (the prompt is
+never modified). A reply that hits the `n_predict` or context budget is cut
+mid-value; it is still a valid prefix, and `stop_reason` says `"length"` or
+`"context"` so the caller can tell. A reply that is a bare top-level number
+ends at the model's EOG (`stop_reason "eog"`), because a number has no
+closing character. Nesting is capped at 256 levels. If no token in the
+vocabulary could continue the JSON - impossible for any tokenizer that
+covers ASCII - the call raises `ValueError` rather than emit broken output.
+
+<!-- suggested bullet for "Landed recently": -->
+- Guaranteed-valid JSON decoding (`json_only=True` on `chat.generate` /
+  `chat.chat_once`): a byte-level grammar guard plus candidate-rejection
+  sampling makes every reply parseable JSON at any temperature, for +0.2%
+  measured decode overhead on llama3.2:1b.
+
 ## Roadmap
 
 The mission is fixed - pure Python, fast and reliable, all our own code -

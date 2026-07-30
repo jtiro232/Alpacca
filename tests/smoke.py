@@ -58,6 +58,12 @@ def run_cli(*args, env=None, expect=0,
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="alpacca-smoke-"))
     server = None
+    # The storage-policy checks below assert exact HOST placement (which
+    # matrices are quantized in RAM, dense, densified...). A GPU would claim
+    # most of them and change every count, so the suite pins CPU placement
+    # process-wide - subprocess checks inherit it through run_cli - and the
+    # gpu-tier section re-enables the tier explicitly for its own checks.
+    os.environ["ALPACCA_GPU"] = "0"
     try:
         # ---- engine unit checks -----------------------------------------
         print("== engine checks ==")
@@ -2686,6 +2692,420 @@ def main() -> None:
               f"expected={expected_forwarded} prompt={len(second_prompt)} lcp={lcp}")
 
         # ---- removal -------------------------------------------------------
+
+        # ---- guaranteed-valid-JSON decoding (jsonform) --------------------
+        # stdlib-only feature: runs identically on the numpy and pure paths,
+        # so no capability gate is needed
+        print("== json_only generation ==")
+        import json as _json
+        import make_tiny_model as _mtm
+        import alpacca.jsonform as _jf
+        from alpacca.jsonform import (JsonGuard, MAX_DEPTH as _JG_DEPTH,
+                                      sample_json_token)
+        from alpacca.chat import generate as _jgen
+        from alpacca.model import Model as _JModel
+        from alpacca.sample import Sampler as _JSampler, \
+            SamplerParams as _JParams
+
+        def _jg(data: bytes):
+            g = JsonGuard()
+            return g if g.feed(data) else None
+
+        _j_good = [b"{", b'{"a": [1, 2', b'{"a": {"b": nu', b"-0.5e",
+                   b"1e-5", b'"ab\\u00', b'"partial \xe2\x96', b"[[[[",
+                   b'  [ "x" , 1 ]']
+        _j_bad = [b"x", b"{]", b'{"a":}', b'{"a": 1,}', b"[1,]", b"01",
+                  b"1..", b"+1", b'"a\nb"', b"{} ", b"{}x", b"true1",
+                  b"{}{}", b'"\\u00g"']
+        check("JsonGuard accepts valid JSON prefixes",
+              all(_jg(p) is not None for p in _j_good))
+        check("JsonGuard rejects invalid prefixes",
+              all(_jg(p) is None for p in _j_bad))
+        _j_done_ok = True
+        for _p in (b"{}", b'{"a": [1.5e3, true]}', b"null", b'"s"'):
+            _g = _jg(_p)
+            _j_done_ok = (_j_done_ok and _g is not None and _g.done and
+                          not _g.can_accept(b" "))
+        check("JsonGuard reports done and allows nothing after", _j_done_ok)
+        _g = _jg(b"42")   # a top-level number never closes on its own
+        check("top-level number: not done, but valid if it ends here",
+              _g is not None and not _g.done and _g.at_valid_end and
+              _g.can_accept(b"5") and not _g.can_accept(b" "))
+        _g = JsonGuard()
+        _g.feed(b'{"a": ')
+        check("feed is transactional and can_accept never advances",
+              not _g.feed(b"12x") and _g.can_accept(b"12}") and
+              _g.feed(b"12}") and _g.done)
+        _g = JsonGuard()
+        check("nesting cap rejects one level too many yet still closes",
+              _g.feed(b"[" * _JG_DEPTH) and not _g.feed(b"[") and
+              _g.feed(b"1" + b"]" * _JG_DEPTH) and _g.done)
+        _j_docs_ok = True
+        for _doc in ({"k": [1, -0.5, 1e-5, True, None, "s\né"]},
+                     [{"a": {"b": []}}, "x"], True):
+            _enc = _json.dumps(_doc).encode()
+            _g = JsonGuard()
+            _j_docs_ok = (_j_docs_ok and
+                          all(_g.feed(_enc[i:i + 1])
+                              for i in range(len(_enc))) and _g.done)
+        check("every byte-prefix of json.dumps output is accepted", _j_docs_ok)
+
+        # the rejection loop, the ranked-scan fallback, and the one error
+        class _JTok:
+            def is_eog(self, t):
+                return t == 0
+
+        _jt = _JTok()
+        _jtab = [b"", b"x", b"{", b"}"]
+        _jgd = JsonGuard()
+        _js = _JSampler(_JParams(temperature=0.0, seed=1))
+        check("json loop bans invalid + EOG until the value completes",
+              sample_json_token(_js, [5.0, 9.0, 1.0, 0.5], _jgd, _jtab, _jt)
+              == 2 and
+              sample_json_token(_js, [9.0, 5.0, 1.0, 0.5], _jgd, _jtab, _jt)
+              == 3 and _jgd.done and
+              sample_json_token(_js, [1.0, 9.0, 5.0, 3.0], _jgd, _jtab, _jt)
+              == 0)
+        _j_old = _jf.MAX_REJECTS
+        _jf.MAX_REJECTS = 0   # force the ranked full-vocab scan
+        try:
+            check("ranked scan takes the best valid token",
+                  sample_json_token(_js, [0.0, 0.0, 1.0, 2.0], JsonGuard(),
+                                    _jtab, _jt) == 2)
+            _j_raised = False
+            try:
+                sample_json_token(_js, [1.0, 2.0, 3.0, 4.0], JsonGuard(),
+                                  [b"", b"x", b"]", b")"], _jt)
+            except ValueError:
+                _j_raised = True
+            check("no tokenizable continuation raises ValueError", _j_raised)
+        finally:
+            _jf.MAX_REJECTS = _j_old
+        _jl = [0.5, 2.0, 1.5, -1.0, 0.0]
+        check("Sampler banned= masks the same on both paths, copies first",
+              _JSampler(_JParams(temperature=0.8, top_k=3, seed=11)).sample(
+                  _jl, banned={1}) ==
+              _JSampler(_JParams(temperature=0.8, top_k=3, seed=11))
+              ._sample_list(list(_jl), {1}) and _jl[1] == 2.0)
+
+        # end to end: tiny model at temperature 2.0 - every reply is a valid
+        # JSON value or, when the budget cuts it, a valid prefix of one
+        _jdir = Path(tempfile.mkdtemp(prefix="alpacca-jsonform-"))
+        _mtm.main(str(_jdir / "tiny.gguf"), "F32")
+        _jm = _JModel.load(str(_jdir / "tiny.gguf"), progress=False)
+        _jp = _jm.tok.encode("hello world", add_bos=True)
+        _j_ok, _j_complete = True, 0
+        for _seed in range(12):
+            _jm.reset()
+            _jr = _jgen(_jm, list(_jp),
+                        _JParams(temperature=2.0, top_k=0, top_p=1.0,
+                                 seed=_seed),
+                        n_predict=32, json_only=True)
+            if _jr.stop_reason in ("stop", "eog"):
+                _j_complete += 1
+                try:
+                    _json.loads(_jr.text)
+                except ValueError:
+                    _j_ok = False
+            else:
+                _j_ok = _j_ok and JsonGuard().feed(_jr.text.encode("utf-8"))
+        check(f"tiny json_only sweep at temperature 2.0: 12 seeds valid "
+              f"({_j_complete} complete)", _j_ok)
+        _jm.reset()
+        _j_chunks = []
+        _jr = _jgen(_jm, list(_jp),
+                    _JParams(temperature=2.0, top_k=0, top_p=1.0, seed=1),
+                    n_predict=24, stream=_j_chunks.append, json_only=True)
+        check("json_only streams exactly the returned text",
+              "".join(_j_chunks) == _jr.text)
+        del _jm
+        gc.collect()
+        shutil.rmtree(_jdir, ignore_errors=True)
+
+        # ---- Ollama-native API (/api/*) -----------------------------------
+        print("== ollama-native API ==")
+        from alpacca.serve import (_iso_now, _ollama_options, _param_size_label,
+                                   _same_model, _wants_json)
+        from alpacca.sample import SamplerParams as _OllamaSP
+        check("ollama name match: :latest and path separators are cosmetic",
+              _same_model("m", "m:latest") and
+              _same_model("C:\\x\\m.gguf", "C:/x/m.gguf") and
+              not _same_model("a", "b"))
+        check("ollama format=json detection accepts a schema dict",
+              _wants_json({"format": "json"}) and
+              _wants_json({"format": {"type": "object"}}) and
+              not _wants_json({}) and not _wants_json({"format": ""}))
+        _oparams, _on_predict, _ostop = _ollama_options(
+            {"options": {"num_predict": 7, "temperature": 0.25, "seed": 3,
+                         "top_k": 5, "stop": "END", "num_ctx": 1 << 30}},
+            _OllamaSP())
+        check("ollama options map onto the sampler (oversize num_ctx ignored)",
+              _on_predict == 7 and _oparams.temperature == 0.25 and
+              _oparams.seed == 3 and _oparams.top_k == 5 and _ostop == ["END"])
+        check("ollama num_predict defaults to -1 (until EOG or context)",
+              _ollama_options({}, _OllamaSP())[1] == -1)
+        check("ollama created_at is RFC3339 UTC",
+              _iso_now().endswith("Z") and "T" in _iso_now())
+        check("ollama parameter size label",
+              _param_size_label(1_240_000_000) == "1.2B" and
+              _param_size_label(15_000_000) == "15M")
+
+        import threading as _oll_threading
+        from alpacca.model import Model as _OllamaModel
+        from alpacca.serve import serve as _ollama_serve
+        _oll_dir = Path(tempfile.mkdtemp(prefix="alpacca-ollama-api-"))
+        subprocess.run([sys.executable, str(REPO / "tests" / "make_tiny_model.py"),
+                        str(_oll_dir / "tiny.gguf")],
+                       check=True, capture_output=True, cwd=str(REPO))
+        _oll_model = _OllamaModel.load(str(_oll_dir / "tiny.gguf"), progress=False)
+        _oll_ready = _oll_threading.Event()
+        _oll_port: list[int] = []
+        _oll_threading.Thread(
+            target=_ollama_serve, args=(_oll_model, "tiny-api"),
+            kwargs={"host": "127.0.0.1", "port": 0,
+                    "defaults": _OllamaSP(temperature=0.0, seed=1),
+                    "ready_callback":
+                        lambda p: (_oll_port.append(p), _oll_ready.set())},
+            daemon=True).start()
+        check("ollama api server starts", _oll_ready.wait(10))
+        _oll_base = f"http://127.0.0.1:{_oll_port[0]}"
+
+        def _oll_post(path, body, timeout=60):
+            req = urllib.request.Request(
+                _oll_base + path, data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.headers.get("Content-Type", ""), resp.read()
+
+        _, _oll_raw = _oll_post("/api/chat", {
+            "model": "tiny-api", "stream": False, "keep_alive": "5m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 4, "seed": 1}})
+        _oll_body = json.loads(_oll_raw)
+        check("api/chat non-stream returns the ollama shape",
+              _oll_body["done"] is True and
+              _oll_body["message"]["role"] == "assistant" and
+              _oll_body["done_reason"] in ("stop", "length") and
+              isinstance(_oll_body["total_duration"], int) and
+              _oll_body["total_duration"] >= _oll_body["eval_duration"] >= 0 and
+              _oll_body["eval_count"] <= 4 and _oll_body["prompt_eval_count"] > 0,
+              _oll_raw[:200].decode("utf-8", "replace"))
+        _oll_ct, _oll_raw = _oll_post("/api/chat", {
+            "model": "tiny-api",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 4, "seed": 1}})
+        _oll_lines = [json.loads(ln) for ln in _oll_raw.split(b"\n") if ln.strip()]
+        check("api/chat streams ndjson by default and ends with done",
+              "ndjson" in _oll_ct and _oll_lines[-1]["done"] is True and
+              all(not ln["done"] for ln in _oll_lines[:-1]) and
+              _oll_lines[-1]["message"]["content"] == "",
+              f"{_oll_ct} {len(_oll_lines)}")
+        with urllib.request.urlopen(_oll_base + "/api/tags", timeout=10) as resp:
+            _oll_tags = json.loads(resp.read())
+        check("api/tags always contains the served model with real details",
+              any(m["model"] == "tiny-api" and m["details"]["format"] == "gguf"
+                  and m["details"]["family"] == "llama"
+                  and m["details"]["parameter_size"]
+                  for m in _oll_tags["models"]), str(_oll_tags)[:200])
+        with urllib.request.urlopen(_oll_base + "/api/version", timeout=10) as resp:
+            from alpacca import __version__ as _oll_version
+            check("api/version reports the package version",
+                  json.loads(resp.read())["version"] == _oll_version)
+        with urllib.request.urlopen(_oll_base + "/api/ps", timeout=10) as resp:
+            _oll_ps = json.loads(resp.read())
+        check("api/ps lists the resident model",
+              _oll_ps["models"][0]["model"] == "tiny-api" and
+              "expires_at" in _oll_ps["models"][0], str(_oll_ps)[:200])
+        _, _oll_raw = _oll_post("/api/show", {"model": "tiny-api"})
+        _oll_show = json.loads(_oll_raw)
+        check("api/show serves the loaded model's real metadata",
+              _oll_show["model_info"].get("general.architecture") == "llama" and
+              any(k.endswith(".context_length") for k in _oll_show["model_info"]) and
+              _oll_show["details"]["quantization_level"] != "",
+              _oll_raw[:200].decode("utf-8", "replace"))
+        _, _oll_raw = _oll_post("/api/generate", {
+            "model": "tiny-api", "stream": False, "prompt": "hello",
+            "options": {"num_predict": 3, "seed": 1}})
+        _oll_gen = json.loads(_oll_raw)
+        check("api/generate answers with response and empty context",
+              isinstance(_oll_gen["response"], str) and
+              _oll_gen["context"] == [] and _oll_gen["done"] is True)
+        try:
+            _oll_post("/api/chat", {"model": "other:1b", "stream": False,
+                                    "messages": [{"role": "user", "content": "hi"}]})
+            _oll_404 = False
+        except urllib.error.HTTPError as e:
+            _oll_404 = (e.code == 404 and json.loads(e.read())["error"]
+                        == "model 'other:1b' not found")
+        check("api requests naming another model 404 in ollama's error shape",
+              _oll_404)
+        _, _oll_raw = _oll_post("/api/chat", {
+            "model": "tiny-api:latest", "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 2, "seed": 1}})
+        check("api/chat accepts the served name with :latest appended",
+              json.loads(_oll_raw)["done"] is True)
+        # format=json is served whether or not the json_only tier is present:
+        # serve gates on chat_once's signature and degrades to plain output
+        try:
+            _, _oll_raw = _oll_post("/api/chat", {
+                "model": "tiny-api", "stream": False, "format": "json",
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"num_predict": 4, "seed": 1}})
+            check("api/chat format=json answers (constrained or degraded)",
+                  isinstance(json.loads(_oll_raw)["message"]["content"], str))
+        except TypeError:
+            check("api/chat format=json answers (constrained or degraded)", True)
+
+        # ---- gpu tier (alpacca/cuda.py, optional pinned numba-cuda) -------
+        # Cross-tier parity: GpuMatrix must match QuantMatrix within the
+        # same relative bar the fused-vs-tiled check uses, row access must
+        # be bit-exact, and greedy decode must be token-identical on every
+        # placement the VRAM budget can produce. Everything except the
+        # doctor line is gated on a working CUDA device + the pinned JIT.
+        # The suite-wide ALPACCA_GPU=0 pin lifts here; cuda caches its env
+        # gate at first init, so reset it before probing.
+        os.environ["ALPACCA_GPU"] = "1"
+        from alpacca import cuda as AG
+        AG._state = None
+        r = run_cli("doctor")
+        check("doctor reports a gpu line", "gpu:" in r.stdout, r.stdout)
+        if T.HAS_NUMPY and AG.available():
+            import numpy as np
+            from alpacca.qmatrix import QuantMatrix
+
+            def gpu_q4k(n):
+                out = bytearray()
+                for block in range(n // 256):
+                    d = 0.015625 + (block % 7) * 0.001953125
+                    dmin = 0.00390625 + (block % 5) * 0.0009765625
+                    sc = bytes(((block * 17 + i * 29) & 0xFF) for i in range(12))
+                    qs = bytes(((block * 31 + i * 7) & 0xFF) for i in range(128))
+                    out += struct.pack("<ee", d, dmin) + sc + qs
+                return bytes(out)
+
+            def gpu_q5k(n):
+                out = bytearray()
+                for block in range(n // 256):
+                    d = 0.015625 + (block % 7) * 0.001953125
+                    dmin = 0.00390625 + (block % 5) * 0.0009765625
+                    sc = bytes(((block * 17 + i * 29) & 0xFF) for i in range(12))
+                    qh = bytes(((block * 23 + i * 13) & 0xFF) for i in range(32))
+                    ql = bytes(((block * 31 + i * 7) & 0xFF) for i in range(128))
+                    out += struct.pack("<ee", d, dmin) + sc + qh + ql
+                return bytes(out)
+
+            def gpu_q6k(n):
+                out = bytearray()
+                for block in range(n // 256):
+                    ql = bytes(((block * 13 + i * 11) & 0xFF) for i in range(128))
+                    qh = bytes(((block * 19 + i * 5) & 0xFF) for i in range(64))
+                    sc = struct.pack("<16b", *[((block + i) % 63) - 31
+                                               for i in range(16)])
+                    d = 0.001953125 + (block % 5) * 0.000244140625
+                    out += ql + qh + sc + struct.pack("<e", d)
+                return bytes(out)
+
+            os.environ["ALPACCA_INT_DOT"] = "0"  # exact codes path CPU-side
+            try:
+                gworst = 0.0
+                groworst = 0.0
+                grng = np.random.default_rng(17)
+                for _dt, _rows, _cols, raw in (
+                        ("Q8_0", 5, 64, quants.quantize_q8_0(
+                            [((i * 37) % 251) / 251.0 - 0.5
+                             for i in range(5 * 64)])),
+                        ("Q4_K", 3, 512, gpu_q4k(3 * 512)),
+                        ("Q5_K", 3, 512, gpu_q5k(3 * 512)),
+                        ("Q6_K", 3, 512, gpu_q6k(3 * 512))):
+                    qm = QuantMatrix(raw, _dt, _rows, _cols)
+                    gm = AG.GpuMatrix(raw, _dt, _rows, _cols)
+                    gx = grng.standard_normal(_cols).astype(np.float32)
+                    ref = np.asarray(qm.matvec(gx))
+                    gscale = max(1e-6, float(np.abs(ref).max()))
+                    gworst = max(gworst, float(
+                        np.abs(ref - gm.matvec(gx)).max()) / gscale)
+                    for B in (2, 9):  # wide kernel and the stacked oracle
+                        GX = grng.standard_normal((B, _cols)).astype(np.float32)
+                        refm = np.asarray(qm.matmul_t(GX))
+                        gscale = max(1e-6, float(np.abs(refm).max()))
+                        gworst = max(gworst, float(
+                            np.abs(refm - gm.matmul_t(GX)).max()) / gscale)
+                        stacked = np.stack([np.asarray(qm.matvec(GX[i]))
+                                            for i in range(B)])
+                        gworst = max(gworst, float(
+                            np.abs(stacked - gm.matmul_t(GX)).max()) / gscale)
+                        # force the looped-matvec matmul path as well
+                        os.environ["ALPACCA_GPU_WIDE_MATMUL_ELEMS"] = "0"
+                        try:
+                            gworst = max(gworst, float(
+                                np.abs(refm - gm.matmul_t(GX)).max()) / gscale)
+                        finally:
+                            os.environ.pop("ALPACCA_GPU_WIDE_MATMUL_ELEMS",
+                                           None)
+                    for i in range(_rows):
+                        groworst = max(groworst, float(np.abs(
+                            np.asarray(qm.row(i)) - gm.row(i)).max()))
+                    groworst = max(groworst, float(np.abs(
+                        np.asarray(qm.rows_at([_rows - 1, 0]))
+                        - gm.rows_at([_rows - 1, 0])).max()))
+                    check(f"{_dt} gpu empty row gather shape",
+                          gm.rows_at([]).shape == (0, _cols))
+            finally:
+                os.environ.pop("ALPACCA_INT_DOT", None)
+            check(f"gpu matvec/matmul match QuantMatrix on both kernel paths "
+                  f"(worst rel {gworst:.2e})", gworst < 2e-5)
+            check(f"gpu row access is bit-exact (worst {groworst:.2e})",
+                  groworst == 0.0)
+
+            # end-to-end: greedy decode must be token-identical to the CPU
+            # tiers on full-GPU AND on VRAM-capped mixed placement (the cap
+            # fits the first fused matrix and refuses the second)
+            mk_gpu = REPO / "tests" / "make_tiny_model.py"
+            gpu_gguf = tmp / "gpu-tier-q4k.gguf"
+            r = subprocess.run([sys.executable, str(mk_gpu), str(gpu_gguf),
+                                "Q4_K"], capture_output=True, text=True)
+            check("write gpu-tier tiny Q4_K model", r.returncode == 0,
+                  r.stderr)
+            gpu_script = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(REPO)!r})\n"
+                "import numpy as np\n"
+                "from alpacca.model import Model\n"
+                f"m = Model.load({str(gpu_gguf)!r}, progress=False)\n"
+                "logits = m.prefill(m.tok.encode('hello world',"
+                " add_bos=True))\n"
+                "out = []\n"
+                "for _ in range(16):\n"
+                "    t = int(np.argmax(logits))\n"
+                "    out.append(t)\n"
+                "    logits = m.forward(t)\n"
+                "print('IDS', ' '.join(map(str, out)))\n")
+
+            def gpu_greedy(env):
+                e = dict(os.environ)
+                e.update(env)
+                r = subprocess.run([sys.executable, "-c", gpu_script],
+                                   capture_output=True, text=True, env=e,
+                                   cwd=str(REPO))
+                for line in r.stdout.splitlines():
+                    if line.startswith("IDS "):
+                        return line
+                return f"rc={r.returncode}: {r.stderr[-200:]}"
+
+            gpu_cpu_ids = gpu_greedy({"ALPACCA_GPU": "0"})
+            gpu_gpu_ids = gpu_greedy({"ALPACCA_GPU": "1"})
+            gpu_cap_ids = gpu_greedy({"ALPACCA_GPU": "1",
+                                      "ALPACCA_GPU_VRAM_MB": "0.2"})
+            check("gpu greedy decode is token-identical to cpu",
+                  gpu_cpu_ids.startswith("IDS ")
+                  and gpu_cpu_ids == gpu_gpu_ids,
+                  f"{gpu_cpu_ids} vs {gpu_gpu_ids}")
+            check("vram-capped mixed placement stays token-identical",
+                  gpu_cap_ids == gpu_cpu_ids,
+                  f"{gpu_cap_ids} vs {gpu_cpu_ids}")
+        os.environ["ALPACCA_GPU"] = "0"  # back to the suite-wide host pin
+
         print("== removal ==")
         run_cli("rm", "tiny", env=env)
         check("rm tiny", True)
