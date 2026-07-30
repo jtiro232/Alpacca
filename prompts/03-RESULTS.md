@@ -336,6 +336,22 @@ codegen or faster DRAM. Also: sustained decode runs this chassis at
 Tjmax (95C, clocks hold 4.26 GHz) - cooling/power limits, not code, set
 part of the wall.
 
+
+## Round 5 probes (2026-07-30): the last two tok/s doors
+
+- LLVM future CLOSED THROUGH v22: numba 0.66 / llvmlite 0.48 / LLVM
+  22.1.0 still does NOT auto-emit vpdpbusd from u8xs8 i32-recast loops -
+  and the premultiplied i16 shape our kernels rely on forms only
+  vpmaddwd there (LLVM 20 folds it to vpdpwssd). A pin bump today would
+  likely REGRESS decode. Pin stays at 0.65.1; re-test each numba major.
+- Model-file lever, measured: Q4_K_S (same 8B) = 101.2 ms/token, 9.89
+  tok/s - NOT the projected 11.5. Census: 90% Q4_K, 7% Q6_K (output
+  head only), 3% Q5_K (attn_v x8) - and Q5_K still runs the old
+  f32-activation path at 1.25 B/w. Projection missed because Q4_K_S
+  stores attn_v as Q5_K, not Q4_K. CONSEQUENCE: the Q5_K native int
+  path is now the top actionable decode item - it speeds Q4_K_S files,
+  Q5_K_M downloads (the #2 HF quant), and Gemma-class fallbacks.
+
 ### 6.4 f16 KV cache: DEFERRED with rationale
 
 At the benchmark's context (<=512) attention costs 1.17 ms/token; halving
