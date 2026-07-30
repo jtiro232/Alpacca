@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TextIO
 
 from .model import Model
@@ -46,8 +46,20 @@ class ChatFormat:
     """Renders a conversation into token ids for a given format."""
     model: Model
     name: str
+    _id_cache: dict = field(default_factory=dict, init=False, repr=False)
 
     def _ids(self, text: str, add_bos: bool = False) -> list[int]:
+        # role names and separators recur every message; on a tokenizer with
+        # thousands of special pieces (Gemma 3) each encode of even "\n"
+        # pays a fixed scan, so memoize the short constants. Copies out so a
+        # caller can never mutate a cached entry.
+        if len(text) <= 32:
+            key = (text, add_bos)
+            hit = self._id_cache.get(key)
+            if hit is None:
+                hit = self.model.tok.encode(text, add_bos=add_bos)
+                self._id_cache[key] = hit
+            return list(hit)
         return self.model.tok.encode(text, add_bos=add_bos)
 
     def _special(self, piece: str) -> list[int]:
@@ -190,7 +202,9 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             raise ValueError("prompt produced no tokens and the tokenizer has no BOS token")
         prompt_ids = [model.tok.bos_id]
     sampler = Sampler(params)
-    for t in prompt_ids:
+    # only the last repeat_last_n tokens can ever remain in the penalty
+    # window, so skip the rest rather than walk a 16k prompt to fill 64 slots
+    for t in prompt_ids[-max(params.repeat_last_n, 1):]:
         sampler.accept(t)
     logits = model.prefill(prompt_ids)
 
@@ -221,11 +235,18 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             reason = "stop"   # a turn-start token: the reply is complete
             break
         n_tokens += 1
-        text += dec.feed(tid)
-        if stop_strings:
-            hit = next((s for s in stop_strings if s and s in text), None)
+        piece = dec.feed(tid)
+        text += piece
+        if stop_strings and piece:
+            # a match must involve the newly decoded piece - anything fully
+            # inside older text was found on an earlier token - so search
+            # only the tail the piece could participate in: a stop of length
+            # L ending inside the piece starts at most L-1 (= hold) before it
+            scan = max(0, len(text) - len(piece) - hold)
+            tail = text[scan:]
+            hit = next((s for s in stop_strings if s and s in tail), None)
             if hit:
-                text = text[:text.index(hit)]
+                text = text[:scan + tail.index(hit)]
                 reason = "stop"
                 truncated = True
                 break

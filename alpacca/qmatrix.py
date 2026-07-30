@@ -353,26 +353,13 @@ class QuantMatrix:
         Same math as the per-token kernels' f32 side: d_eff = f16(d) * sc,
         m_eff = -f16(dmin) * mn, value = d_eff * code + m_eff.
         """
-        nr = r1 - r0
         if self._mode == "q4k_int":
-            qp = self._qp[r0:r1].reshape(nr, -1, 32)
-            codes = _np.empty((nr, qp.shape[1], 64), dtype=_np.uint8)
-            codes[:, :, :32] = qp & 0x0F
-            codes[:, :, 32:] = qp >> 4
-            d_eff = (self._dh[r0:r1].view(_np.float16).astype(_np.float32)
-                     [:, :, None] * self._sci[r0:r1].astype(_np.float32))
-            m_eff = (self._dmh[r0:r1].view(_np.float16).astype(_np.float32)
-                     [:, :, None] * self._mni[r0:r1].astype(_np.float32))
-            v = codes.reshape(nr, self.n_sub, self.sub_len).astype(_np.float32)
-            v *= d_eff.reshape(nr, self.n_sub, 1)
-            v -= m_eff.reshape(nr, self.n_sub, 1)
-            return v.reshape(nr, self.cols)
+            return _expand_q4k_f32(self._qp[r0:r1], self._sci[r0:r1],
+                                   self._mni[r0:r1], self._dh[r0:r1],
+                                   self._dmh[r0:r1], self.n_sub, self.sub_len)
         if self._mode == "q6k_int":
-            d_eff = (self._dh[r0:r1].view(_np.float16).astype(_np.float32)
-                     .repeat(16, axis=1) * self._sci[r0:r1].astype(_np.float32))
-            v = self._q3[r0:r1].astype(_np.float32)
-            v *= d_eff[:, :, None]
-            return v.reshape(nr, self.cols)
+            return _expand_q6k_f32(self._q3[r0:r1], self._sci[r0:r1],
+                                   self._dh[r0:r1])
         raise RuntimeError(f"_tile_f32 called in mode {self._mode}")
 
     # ---- row access (embedding lookups) ------------------------------------
@@ -406,11 +393,16 @@ class QuantMatrix:
             _sync_hot_cache_budget(_hot_cache_limit_bytes())
             if self._dense_cache is not None:
                 return self._dense_cache[idx].copy()
-        if self._mode != "codes":
-            out = _np.empty((idx.size, self.cols), dtype=_np.float32)
-            for n, i in enumerate(idx):
-                out[n] = self._tile_f32(int(i), int(i) + 1)[0]
-            return out
+        if self._mode == "q4k_int":
+            # fancy-index gathers, then the same expansion the tile path
+            # uses: one vectorized pass instead of a Python loop per row
+            # (a 900-token prompt gathers 900 embedding rows at once)
+            return _expand_q4k_f32(self._qp[idx], self._sci[idx],
+                                   self._mni[idx], self._dh[idx],
+                                   self._dmh[idx], self.n_sub, self.sub_len)
+        if self._mode == "q6k_int":
+            return _expand_q6k_f32(self._q3[idx], self._sci[idx],
+                                   self._dh[idx])
         v = self._q3[idx].astype(_np.float32)
         v *= self._d[idx][:, :, None]
         if self._m is not None:
@@ -446,6 +438,36 @@ class QuantMatrix:
         self._dense_cache_bytes = nbytes
         _HOT_CACHE_OWNERS.add(self)
         return dense
+
+
+# ---- native-mode f32 expansion helpers -------------------------------------
+# One implementation for both the contiguous tile slices (prefill, hot cache)
+# and the fancy-indexed row gathers (embedding lookups): the math must be
+# bit-identical everywhere or the row/tile parity tests would drift apart.
+
+def _expand_q4k_f32(qp, sci, mni, dh, dmh, n_sub, sub_len):
+    nr = qp.shape[0]
+    qp3 = qp.reshape(nr, -1, 32)
+    codes = _np.empty((nr, qp3.shape[1], 64), dtype=_np.uint8)
+    codes[:, :, :32] = qp3 & 0x0F
+    codes[:, :, 32:] = qp3 >> 4
+    d_eff = (dh.view(_np.float16).astype(_np.float32)[:, :, None]
+             * sci.astype(_np.float32))
+    m_eff = (dmh.view(_np.float16).astype(_np.float32)[:, :, None]
+             * mni.astype(_np.float32))
+    v = codes.reshape(nr, n_sub, sub_len).astype(_np.float32)
+    v *= d_eff.reshape(nr, n_sub, 1)
+    v -= m_eff.reshape(nr, n_sub, 1)
+    return v.reshape(nr, n_sub * sub_len)
+
+
+def _expand_q6k_f32(q3, sci, dh):
+    nr = q3.shape[0]
+    d_eff = (dh.view(_np.float16).astype(_np.float32).repeat(16, axis=1)
+             * sci.astype(_np.float32))
+    v = q3.astype(_np.float32)
+    v *= d_eff[:, :, None]
+    return v.reshape(nr, -1)
 
 
 # ---- optional hot-cache budget (module state) ------------------------------

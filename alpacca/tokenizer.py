@@ -7,6 +7,7 @@ from __future__ import annotations
 import heapq
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 SPM_SPACE = "\u2581"  # \u2581
 
@@ -32,10 +33,14 @@ _BYTE_ENC = _gpt2_byte_encoder()
 _BYTE_DEC = {v: k for k, v in _BYTE_ENC.items()}
 
 
+@lru_cache(maxsize=None)
 def _is_letter(ch: str) -> bool:
+    # cached: pretokenize asks per character and unicodedata.category is the
+    # single hottest call in it; the cache is bounded by distinct codepoints
     return unicodedata.category(ch).startswith("L")
 
 
+@lru_cache(maxsize=None)
 def _is_number(ch: str) -> bool:
     return unicodedata.category(ch).startswith("N")
 
@@ -54,12 +59,15 @@ def pretokenize(text: str) -> list[str]:
     while i < n:
         ch = text[i]
 
-        low = text[i:i + 3].lower()
-        matched = next((c for c in contractions if low.startswith(c)), None)
-        if matched:
-            out.append(text[i:i + len(matched)])
-            i += len(matched)
-            continue
+        # every contraction starts with a literal apostrophe, so the slice +
+        # lower + scan only ever matters there - not at every position
+        if ch == "'":
+            low = text[i:i + 3].lower()
+            matched = next((c for c in contractions if low.startswith(c)), None)
+            if matched:
+                out.append(text[i:i + len(matched)])
+                i += len(matched)
+                continue
 
         # optional non-letter/number/newline prefix + letters
         if _is_letter(ch) or (ch not in "\r\n" and not _is_number(ch)
@@ -142,6 +150,12 @@ class Tokenizer:
     byte_ids: dict[int, int] = field(default_factory=dict)  # byte -> token id
     # SPM: pieces pulled out of the raw text before the merge pass, longest first
     special_ids: list[int] = field(default_factory=list)
+    # lazily-built index: first character of a special piece -> its entries
+    # as (position in special_ids, sid). A piece whose first character never
+    # occurs in the text cannot occur in any fragment, so the scan only
+    # visits candidates whose first character is present - Gemma 3 has 6414
+    # special pieces and paid a fixed ~0.2 ms on every encode otherwise.
+    _special_by_first: dict | None = field(default=None, repr=False)
 
     # ---- construction --------------------------------------------------
 
@@ -248,8 +262,22 @@ class Tokenizer:
         that way); control and unknown pieces only when the caller asks, so a
         user who types `<start_of_turn>` cannot forge a turn boundary.
         """
+        candidates = self.special_ids
+        if candidates:
+            by_first = self._special_by_first
+            if by_first is None:
+                by_first = {}
+                for oi, sid in enumerate(self.special_ids):
+                    by_first.setdefault(self.pieces[sid][0], []).append((oi, sid))
+                self._special_by_first = by_first
+            present = set(text) & by_first.keys()
+            if not present:
+                return [(-1, text)]
+            # keep the global longest-first order across the selected groups
+            candidates = [sid for _, sid in
+                          sorted(t for fc in present for t in by_first[fc])]
         frags: list[tuple[int, str]] = [(-1, text)]
-        for sid in self.special_ids:
+        for sid in candidates:
             if not parse_special and self.types[sid] in (TT_CONTROL, TT_UNKNOWN):
                 continue
             piece = self.pieces[sid]
@@ -328,18 +356,61 @@ class Tokenizer:
 
     def _encode_bpe(self, text: str) -> list[int]:
         ids: list[int] = []
+        get_rank = self.merge_ranks.get
         for chunk in pretokenize(text):
             word = [_BYTE_ENC[b] for b in chunk.encode("utf-8")]
-            while len(word) > 1:
-                best_rank = None
-                best_i = -1
-                for i in range(len(word) - 1):
-                    r = self.merge_ranks.get((word[i], word[i + 1]))
-                    if r is not None and (best_rank is None or r < best_rank):
-                        best_rank, best_i = r, i
-                if best_i < 0:
-                    break
-                word[best_i:best_i + 2] = [word[best_i] + word[best_i + 1]]
+            n = len(word)
+            if 1 < n <= 16:
+                # ordinary words: the rescan-per-merge loop's constant beats
+                # the heap's on short chunks (measured ~10% on plain prose)
+                while len(word) > 1:
+                    best_rank = None
+                    best_i = -1
+                    for i in range(len(word) - 1):
+                        r = get_rank((word[i], word[i + 1]))
+                        if r is not None and (best_rank is None or r < best_rank):
+                            best_rank, best_i = r, i
+                    if best_i < 0:
+                        break
+                    word[best_i:best_i + 2] = [word[best_i] + word[best_i + 1]]
+            elif n > 16:
+                # lowest-rank pair first, leftmost on rank ties - the same
+                # order the rescan loop above produces, but via a lazy heap
+                # over a linked list so a long chunk costs O(L log L) instead
+                # of O(L^2) (unbroken CJK arrives as ONE chunk, and the old
+                # loop took ~5 s on 4000 characters of it)
+                sym = word[:]           # live piece at each original slot
+                prev = list(range(-1, n - 1))
+                nxt = list(range(1, n + 1))
+                nxt[n - 1] = -1
+                heap: list[tuple[int, int, int, str, str]] = []
+
+                def push(left: int, right: int) -> None:
+                    if left < 0 or right < 0:
+                        return
+                    rank = get_rank((sym[left], sym[right]))
+                    if rank is not None:
+                        heapq.heappush(heap, (rank, left, right,
+                                              sym[left], sym[right]))
+
+                for i in range(n - 1):
+                    push(i, i + 1)
+                while heap:
+                    _, left, right, a, b = heapq.heappop(heap)
+                    if nxt[left] != right or sym[left] != a or sym[right] != b:
+                        continue  # one side changed since this entry was made
+                    sym[left] = a + b
+                    sym[right] = ""   # dead: dates any remaining stale entry
+                    nxt[left] = nxt[right]
+                    if nxt[right] >= 0:
+                        prev[nxt[right]] = left
+                    push(prev[left], left)
+                    push(left, nxt[left])
+                word = []
+                i = 0
+                while i >= 0:
+                    word.append(sym[i])
+                    i = nxt[i]
             for piece in word:
                 tid = self.piece_to_id.get(piece)
                 if tid is not None:

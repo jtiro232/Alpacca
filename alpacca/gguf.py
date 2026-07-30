@@ -90,10 +90,20 @@ class GGUFFile:
     # -- reading ---------------------------------------------------------
 
     @classmethod
-    def open(cls, path: str | Path) -> "GGUFFile":
+    def open(cls, path: str | Path, prefetch: bool = False) -> "GGUFFile":
+        """Open and parse a GGUF file. `prefetch=True` advises the kernel
+        that the whole mapping is about to be read sequentially (the model
+        loader touches every tensor); header-only callers leave it off so a
+        metadata peek does not fault in gigabytes."""
         f = cls(Path(path))
         f._fh = open(f.path, "rb")
         f._mm = mmap.mmap(f._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        if prefetch:
+            try:
+                f._mm.madvise(mmap.MADV_SEQUENTIAL)
+                f._mm.madvise(mmap.MADV_WILLNEED)
+            except (AttributeError, ValueError, OSError):
+                pass  # purely advisory; platforms without madvise skip it
         f._parse()
         return f
 

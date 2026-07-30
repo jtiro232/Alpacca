@@ -785,9 +785,14 @@ def main() -> None:
                 finally:
                     os.environ.pop("ALPACCA_INT_MATMUL_MAX_BATCH", None)
                 ri = qm.rows_at([0, _rows - 1])
+                shuffled = list(range(_rows))
+                rng.shuffle(shuffled)
+                gathered = qm.rows_at(shuffled + [0, 0])  # repeats included
+                expect = dense[np.asarray(shuffled + [0, 0])]
                 check(f"{_dt} native row access is bit-exact",
                       np.array_equal(qm.row(2), dense[2]) and
-                      np.array_equal(ri, dense[[0, _rows - 1]]))
+                      np.array_equal(ri, dense[[0, _rows - 1]]) and
+                      np.array_equal(gathered, expect))
             os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
             try:
                 check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
@@ -925,6 +930,88 @@ def main() -> None:
               parts[0] == "" and parts[1] == "" and parts[2] == "€",
               str(parts))
 
+        # ---- BPE merge order: heap path vs the naive rescan reference ----
+        # long chunks take a lazy-heap merge (O(L log L)); it must produce
+        # exactly what the O(L^2) rescan-per-merge loop produces: lowest
+        # rank first, leftmost occurrence on ties.
+        def naive_bpe(tok, text):
+            ids = []
+            for chunk in _tokmod.pretokenize(text):
+                word = [_tokmod._BYTE_ENC[b] for b in chunk.encode("utf-8")]
+                while len(word) > 1:
+                    best_rank, best_i = None, -1
+                    for i in range(len(word) - 1):
+                        r = tok.merge_ranks.get((word[i], word[i + 1]))
+                        if r is not None and (best_rank is None or r < best_rank):
+                            best_rank, best_i = r, i
+                    if best_i < 0:
+                        break
+                    word[best_i:best_i + 2] = [word[best_i] + word[best_i + 1]]
+                for piece in word:
+                    tid = tok.piece_to_id.get(piece)
+                    if tid is not None:
+                        ids.append(tid)
+                    else:
+                        ids.extend(tok.piece_to_id[c] for c in piece
+                                   if c in tok.piece_to_id)
+            return ids
+
+        alpha = "abcdef"
+        bpe_pieces = list(alpha)
+        bpe_merges = []
+        # build pairs of existing pieces a few generations deep so long
+        # runs keep merging and rank ties happen at multiple positions
+        gen = list(alpha)
+        for _round in range(3):
+            new_pieces = []
+            for a in gen:
+                for b in gen:
+                    m = a + b
+                    if len(m) <= 8 and m not in bpe_pieces:
+                        bpe_pieces.append(m)
+                        new_pieces.append(m)
+                        bpe_merges.append(f"{a} {b}")
+            gen = new_pieces[:6]
+        bpe_tok = _tokmod.Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.tokens": bpe_pieces,
+            "tokenizer.ggml.token_type": [1] * len(bpe_pieces),
+            "tokenizer.ggml.merges": bpe_merges,
+        })
+        rng_bpe = random.Random(13)
+        bpe_ok = 0
+        bpe_cases = ["abcabcabc", "a" * 60, "abcdef" * 25, "fedcba" * 40,
+                     "".join(rng_bpe.choice(alpha) for _ in range(200))]
+        bpe_cases += ["".join(rng_bpe.choice(alpha)
+                              for _ in range(rng_bpe.randint(1, 120)))
+                      for _ in range(40)]
+        for s in bpe_cases:
+            if bpe_tok._encode_bpe(s) == naive_bpe(bpe_tok, s):
+                bpe_ok += 1
+        check("BPE heap merge matches the naive rescan on every case",
+              bpe_ok == len(bpe_cases), f"{bpe_ok}/{len(bpe_cases)}")
+
+        # ---- SPM special-piece prefilter -----------------------------------
+        # specials whose first character is absent from the text are skipped;
+        # splitting must be unchanged when they are present
+        spm_tok = _tokmod.Tokenizer.from_gguf({
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.tokens": ["<unk>", "a", "b", "<X>", "ab", "\n\n"],
+            "tokenizer.ggml.scores": [0.0, 0.0, 0.0, 0.0, -1.0, 0.0],
+            "tokenizer.ggml.token_type": [2, 1, 1, 4, 1, 4],
+            "tokenizer.ggml.unknown_token_id": 0,
+            "tokenizer.ggml.add_bos_token": False,
+            "tokenizer.ggml.add_space_prefix": False,
+        })
+        check("SPM user-defined piece still splits with the prefilter",
+              spm_tok.encode("ab<X>ab") == [4, 3, 4] and
+              spm_tok.encode("ab\n\nab") == [4, 5, 4],
+              str((spm_tok.encode("ab<X>ab"), spm_tok.encode("ab\n\nab"))))
+        check("SPM prefilter skips texts with no special first-chars",
+              spm_tok.encode("abab") == [4, 4] and
+              spm_tok._special_by_first is not None,
+              str(spm_tok.encode("abab")))
+
         # ---- model reference round-tripping ------------------------------
         from alpacca.store import _clean_nickname, parse_model_ref
         round_trip = ["llama3.2:1b", "llama3.2", "ollama:user/name:tag",
@@ -1047,6 +1134,24 @@ def main() -> None:
         split = _hf_choose(hf_files[:2], "")
         check("HF split GGUF parts are detected",
               len(_hf_collect_parts(hf_files[:2], split)) == 2)
+        # IQ files cannot load, so they must never be auto-chosen, and an
+        # explicit request for one must fail before the download starts
+        iq_mixed = [{"path": "toy-IQ4_XS.gguf", "size": 1, "sha256": ""},
+                    {"path": "toy-Q4_K_M.gguf", "size": 1, "sha256": ""}]
+        check("HF picker skips IQ quantizations when auto-choosing",
+              _hf_choose(iq_mixed, "")["path"] == "toy-Q4_K_M.gguf")
+        try:
+            _hf_choose(iq_mixed, "IQ4_XS")
+            iq_sel_raised = False
+        except ValueError as e:
+            iq_sel_raised = "IQ" in str(e)
+        check("an explicit IQ selector fails before downloading", iq_sel_raised)
+        try:
+            _hf_choose(iq_mixed[:1], "")
+            iq_only_raised = False
+        except ValueError as e:
+            iq_only_raised = "IQ" in str(e)
+        check("an IQ-only repo is rejected with a clear error", iq_only_raised)
 
         # ---- tiny models -------------------------------------------------
         print("== building tiny models (own GGUF writer) ==")

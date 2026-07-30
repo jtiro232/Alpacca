@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 from . import tensor as T
-from .gguf import GGUFFile
+from .gguf import GGML_BLOCK_INFO, GGUFFile
 from .quants import dequantize
 from .tokenizer import Tokenizer
 
@@ -215,7 +215,7 @@ class Model:
     @classmethod
     def load(cls, path: str, n_ctx: int = 0, progress: bool = True) -> "Model":
         t0 = time.time()
-        gf = GGUFFile.open(path)
+        gf = GGUFFile.open(path, prefetch=True)
         try:
             if int(gf.get("split.count", 1) or 1) > 1:
                 raise ValueError(
@@ -226,6 +226,15 @@ class Model:
                 raise ValueError(
                     f"architecture '{arch}' is not supported by the alpacca engine yet "
                     f"(supported: {', '.join(sorted(SUPPORTED_ARCHES))})")
+            # fail on unreadable storage now, in milliseconds, instead of a
+            # raw per-tensor error after the tokenizer and half the layers
+            unreadable = sorted({info.dtype for info in gf.tensors.values()
+                                 if info.dtype not in GGML_BLOCK_INFO})
+            if unreadable:
+                raise ValueError(
+                    f"{path}: stores tensors as {'/'.join(unreadable)}, "
+                    f"which alpacca cannot read yet - pick a Q4_K_M, Q5_K_M "
+                    f"or Q8_0 build of this model instead")
 
             def meta(key, default=None):
                 return gf.get(f"{arch}.{key}", default)
@@ -377,7 +386,6 @@ class Model:
             quantized_bytes = 0
             quantized_matrices: dict[str, int] = {}
             fallback_matrices: dict[str, int] = {}
-            shape_blocked: dict[str, int] = {}
             densified_names: list[str] = []
 
             # ALPACCA_DENSE_WEIGHT_MB: pick which quantizable matrices to
@@ -431,14 +439,10 @@ class Model:
                 if name in densify_plan:
                     densified_names.append(name)
                 elif info.dtype in _KNOWN_QUANT_DTYPES:
+                    # counted for describe(); the user-facing warning is
+                    # predicted from the header before the layer loop
                     fallback_matrices[info.dtype] = (
                         fallback_matrices.get(info.dtype, 0) + 1)
-                    # distinguish "this format has no kernel" from "this
-                    # matrix is the wrong width for one": Q4_K/Q6_K need a
-                    # multiple of 256 columns, and a third-party conversion
-                    # that ignores that goes fully dense with no other clue
-                    if T.can_quantized_matvec(info.dtype, 256):
-                        shape_blocked[info.dtype] = cols
                 dense_matrices += 1
                 dense_bytes += info.n_elements * 4
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
@@ -474,7 +478,9 @@ class Model:
                         raise ValueError(
                             f"tensor {nm} has {info.n_elements} elements, "
                             f"expected {r * cols}")
-                data = b"".join(bytes(gf.tensor_bytes(nm)) for nm in names)
+                # join accepts the mmap-backed memoryviews directly: one copy
+                # into the fused buffer, not a bytes() transient per tensor
+                data = b"".join(gf.tensor_bytes(nm) for nm in names)
                 for info in infos:
                     quantized_matrices[dt] = quantized_matrices.get(dt, 0) + 1
                     quantized_bytes += info.n_bytes
@@ -492,6 +498,53 @@ class Model:
                         f"expected {size}")
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
                 return T.vector(vals)
+
+            # A quantization the engine cannot matvec is dequantized to dense
+            # float32 at load - Q2_K weights become 8x their file size, which
+            # neither budget formula accounts for. The header alone predicts
+            # it, so say so BEFORE the RAM goes, not after the layer loop.
+            if progress:
+                pre_fb: dict[str, int] = {}
+                pre_shape: dict[str, int] = {}
+                fb_bytes = 0
+                quantize_ok = (T.HAS_NUMPY
+                               and not os.environ.get("ALPACCA_F32"))
+                for nm, info in gf.tensors.items():
+                    if (len(info.shape) < 2 or nm in densify_plan
+                            or info.dtype not in _KNOWN_QUANT_DTYPES):
+                        continue
+                    cols0 = int(info.shape[0])
+                    if quantize_ok and T.can_quantized_matvec(info.dtype, cols0):
+                        continue
+                    pre_fb[info.dtype] = pre_fb.get(info.dtype, 0) + 1
+                    fb_bytes += info.n_elements * 4
+                    # distinguish "this format has no kernel" from "this
+                    # matrix is the wrong width for one": Q4_K/Q6_K need a
+                    # multiple of 256 columns, and a third-party conversion
+                    # that ignores that goes fully dense with no other clue
+                    if T.can_quantized_matvec(info.dtype, 256):
+                        pre_shape[info.dtype] = cols0
+                if pre_fb and quantize_ok:
+                    fb_mb = fb_bytes / (1024 * 1024)
+                    size = (f"{fb_mb / 1024:.1f} GiB" if fb_mb >= 1024
+                            else f"{fb_mb:.0f} MiB")
+                    # a file can hit both causes at once, so report them apart
+                    unsupported = sorted(set(pre_fb) - set(pre_shape))
+                    reasons = []
+                    if pre_shape:
+                        reasons.append(
+                            "%s needs a column count that is a multiple of "
+                            "its block size and this file has %s"
+                            % ("/".join(sorted(pre_shape)),
+                               "/".join(str(pre_shape[d])
+                                        for d in sorted(pre_shape))))
+                    if unsupported:
+                        reasons.append("alpacca has no quantized matvec for %s"
+                                       % "/".join(unsupported))
+                    print(f"warning: {'; '.join(reasons)}, so "
+                          f"{sum(pre_fb.values())} matrices load as dense "
+                          f"float32 ({size}) - no memory budget accounts for "
+                          f"this", file=sys.stderr)
 
             kv_dim = hp.n_kv * hp.head_dim
             q_dim = hp.n_head * hp.head_dim
@@ -557,34 +610,6 @@ class Model:
                 "densified": sorted(densified_names),
                 "densified_bytes": densified_bytes,
             }
-
-            # A quantization the engine cannot matvec is dequantized to dense
-            # float32 at load - Q2_K weights become 8x their file size, which
-            # neither budget formula accounts for. Say so before the RAM goes.
-            if fallback_matrices and progress:
-                fb_bytes = sum(gf.tensors[nm].n_elements * 4
-                               for nm in gf.tensors
-                               if gf.tensors[nm].dtype in fallback_matrices
-                               and len(gf.tensors[nm].shape) >= 2)
-                fb_mb = fb_bytes / (1024 * 1024)
-                size = f"{fb_mb / 1024:.1f} GiB" if fb_mb >= 1024 else f"{fb_mb:.0f} MiB"
-                # a file can hit both causes at once, so report them apart
-                unsupported = sorted(set(fallback_matrices) - set(shape_blocked))
-                reasons = []
-                if shape_blocked:
-                    reasons.append(
-                        "%s needs a column count that is a multiple of its "
-                        "block size and this file has %s"
-                        % ("/".join(sorted(shape_blocked)),
-                           "/".join(str(shape_blocked[d])
-                                    for d in sorted(shape_blocked))))
-                if unsupported:
-                    reasons.append("alpacca has no quantized matvec for %s"
-                                   % "/".join(unsupported))
-                print(f"warning: {'; '.join(reasons)}, so "
-                      f"{sum(fallback_matrices.values())} matrices load as dense "
-                      f"float32 ({size}) - no memory budget accounts for this",
-                      file=sys.stderr)
 
             m.n_ctx = min(n_ctx, hp.n_ctx_train) if n_ctx else min(hp.n_ctx_train, 4096)
             m._init_cache()

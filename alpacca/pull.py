@@ -240,6 +240,11 @@ def _is_split_gguf(path: str) -> bool:
     return re.match(r"^.*-\d{5}-of-\d{5}\.gguf$", path, re.IGNORECASE) is not None
 
 
+# IQ-family quantizations have no decoder in the engine yet; choosing one
+# would download gigabytes that then fail to load
+_UNSUPPORTED_QUANT = re.compile(r"iq\d", re.IGNORECASE)
+
+
 def _hf_choose(files: list[dict], selector: str) -> dict | None:
     weights = [f for f in files if not _is_mmproj(f["path"])]
     if not weights:
@@ -247,17 +252,36 @@ def _hf_choose(files: list[dict], selector: str) -> dict | None:
     single_file_weights = [f for f in weights if not _is_split_gguf(f["path"])]
     candidates = single_file_weights or weights
     if selector:
+        chosen = None
         for f in candidates:
             if f["path"] == selector or _basename(f["path"]) == selector:
-                return f
-        sel = selector.lower()
-        matches = [f for f in candidates if sel in _basename(f["path"]).lower()]
-        return min(matches, key=lambda f: len(f["path"])) if matches else None
+                chosen = f
+                break
+        if chosen is None:
+            sel = selector.lower()
+            matches = [f for f in candidates
+                       if sel in _basename(f["path"]).lower()]
+            chosen = (min(matches, key=lambda f: len(f["path"]))
+                      if matches else None)
+        if chosen is not None and \
+                _UNSUPPORTED_QUANT.search(_basename(chosen["path"])):
+            raise ValueError(
+                f"{_basename(chosen['path'])} is an IQ quantization, which "
+                f"alpacca cannot read yet - pick a Q4_K_M, Q5_K_M or Q8_0 "
+                f"file from the repo instead")
+        return chosen
+    loadable = [f for f in candidates
+                if not _UNSUPPORTED_QUANT.search(_basename(f["path"]))]
+    if not loadable:
+        names = ", ".join(sorted(_basename(f["path"]) for f in candidates)[:5])
+        raise ValueError(
+            f"this repo only ships IQ quantizations ({names}), which "
+            f"alpacca cannot read yet")
     for q in _QUANT_PREFERENCE:
-        for f in candidates:
+        for f in loadable:
             if q in _basename(f["path"]).lower():
                 return f
-    return candidates[0]
+    return loadable[0]
 
 
 def _hf_collect_parts(files: list[dict], chosen: dict) -> list[dict]:
