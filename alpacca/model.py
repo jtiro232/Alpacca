@@ -227,9 +227,27 @@ class Model:
                     f"architecture '{arch}' is not supported by the alpacca engine yet "
                     f"(supported: {', '.join(sorted(SUPPORTED_ARCHES))})")
             # fail on unreadable storage now, in milliseconds, instead of a
-            # raw per-tensor error after the tokenizer and half the layers
-            unreadable = sorted({info.dtype for info in gf.tensors.values()
-                                 if info.dtype not in GGML_BLOCK_INFO})
+            # raw per-tensor error after the tokenizer and half the layers.
+            # Only the tensors the loader actually consumes count: a file
+            # carrying an unused auxiliary tensor in an exotic type loaded
+            # fine before this check existed and must keep loading.
+            n_layer_pre = int(gf.get(f"{arch}.block_count", 0) or 0)
+            consumed = {"token_embd.weight", "output.weight",
+                        "output_norm.weight"}
+            roles = ["attn_norm.weight", "attn_q.weight", "attn_k.weight",
+                     "attn_v.weight", "attn_output.weight", "attn_q.bias",
+                     "attn_k.bias", "attn_v.bias", "ffn_norm.weight",
+                     "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]
+            if arch == "gemma3":
+                roles += ["attn_q_norm.weight", "attn_k_norm.weight",
+                          "post_attention_norm.weight",
+                          "post_ffw_norm.weight"]
+            for i in range(n_layer_pre):
+                for role in roles:
+                    consumed.add(f"blk.{i}.{role}")
+            unreadable = sorted({info.dtype for nm, info in gf.tensors.items()
+                                 if nm in consumed
+                                 and info.dtype not in GGML_BLOCK_INFO})
             if unreadable:
                 raise ValueError(
                     f"{path}: stores tensors as {'/'.join(unreadable)}, "

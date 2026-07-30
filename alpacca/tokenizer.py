@@ -156,6 +156,10 @@ class Tokenizer:
     # visits candidates whose first character is present - Gemma 3 has 6414
     # special pieces and paid a fixed ~0.2 ms on every encode otherwise.
     _special_by_first: dict | None = field(default=None, repr=False)
+    # candidate lists memoized per set of present first-characters: on Gemma
+    # 3, 6321 of the 6414 specials start with '<', and re-sorting that list
+    # on every encode of '<'-containing text cost more than the old scan
+    _special_cand: dict = field(default_factory=dict, repr=False)
 
     # ---- construction --------------------------------------------------
 
@@ -270,12 +274,17 @@ class Tokenizer:
                 for oi, sid in enumerate(self.special_ids):
                     by_first.setdefault(self.pieces[sid][0], []).append((oi, sid))
                 self._special_by_first = by_first
-            present = set(text) & by_first.keys()
+            present = frozenset(set(text) & by_first.keys())
             if not present:
                 return [(-1, text)]
-            # keep the global longest-first order across the selected groups
-            candidates = [sid for _, sid in
-                          sorted(t for fc in present for t in by_first[fc])]
+            candidates = self._special_cand.get(present)
+            if candidates is None:
+                if len(self._special_cand) > 64:
+                    self._special_cand.clear()  # unbounded text, bounded cache
+                # keep the global longest-first order across selected groups
+                candidates = [sid for _, sid in
+                              sorted(t for fc in present for t in by_first[fc])]
+                self._special_cand[present] = candidates
         frags: list[tuple[int, str]] = [(-1, text)]
         for sid in candidates:
             if not parse_special and self.types[sid] in (TT_CONTROL, TT_UNKNOWN):

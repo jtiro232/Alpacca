@@ -88,32 +88,39 @@ class Sampler:
             self.recent.pop(0)
 
     def sample(self, logits) -> int:
+        p = self.params
         if T.HAS_NUMPY:
             # np.array always copies, so the penalty below cannot mutate the
             # caller's logits; float64 matches the Python-float arithmetic of
             # the list path bit for bit
             arr = _np.array(logits, dtype=_np.float64)
-            # a NaN anywhere, or a +/-inf *maximum*, drives the softmax
-            # through inf-inf=NaN and the two paths' NaN comparisons differ;
-            # np.max propagates NaN, so one finiteness test covers both and
-            # the degenerate vectors keep the historical list behaviour.
+            if p.repeat_penalty and p.repeat_penalty != 1.0 and self.recent:
+                for t in set(self.recent):
+                    v = arr[t]
+                    arr[t] = (v / p.repeat_penalty if v > 0
+                              else v * p.repeat_penalty)
+            # The finiteness gate must run AFTER the penalty: a degenerate
+            # repeat_penalty (NaN, inf against a 0.0 logit, or a subnormal
+            # whose division overflows) mints non-finite values the raw
+            # logits never had. A NaN anywhere, or a +/-inf *maximum*,
+            # drives the softmax through inf-inf=NaN and the two paths'
+            # NaN comparisons differ; np.max propagates NaN, so one test
+            # covers both. A NaN temperature poisons the softmax the same
+            # way. All such vectors keep the historical list behaviour;
             # -inf among finite logits stays on the fast path: exp(-inf)=0.
-            if arr.size and bool(_np.isfinite(arr.max())):
+            if (arr.size and bool(_np.isfinite(arr.max()))
+                    and not math.isnan(p.temperature)):
                 return self._sample_array(arr)
         return self._sample_list(T.to_list(logits))
 
     def _sample_array(self, arr) -> int:
-        """NumPy sampling path. Same arithmetic as _sample_list in the same
-        order (cumsum accumulates sequentially, like the running Python
-        sums), so a given seed picks the same token; measured 0.5 ms vs
-        6.6 ms per token on a 128256 vocabulary, and a request asking for
-        top_k=0 costs a lexsort instead of a full-vocab Python sort."""
+        """NumPy sampling path over already-penalized float64 logits. Same
+        arithmetic as _sample_list in the same order (cumsum accumulates
+        sequentially, like the running Python sums), so a given seed picks
+        the same token; measured 0.5 ms vs 6.6 ms per token on a 128256
+        vocabulary, and a request asking for top_k=0 costs a lexsort
+        instead of a full-vocab Python sort."""
         p = self.params
-
-        if p.repeat_penalty and p.repeat_penalty != 1.0 and self.recent:
-            for t in set(self.recent):
-                v = arr[t]
-                arr[t] = v / p.repeat_penalty if v > 0 else v * p.repeat_penalty
 
         if p.temperature <= 0:
             return int(_np.argmax(arr))

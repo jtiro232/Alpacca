@@ -867,6 +867,32 @@ def main() -> None:
             [1.0] * 99 + [float("nan")])
         check("sampling a NaN logit vector does not raise",
               isinstance(nan_sampled, int))
+        # degenerate PARAMS (reachable from the serve API: json accepts the
+        # NaN/Infinity literals unclamped) must not crash and must pick the
+        # same token as the reference list path - the penalty can mint
+        # non-finite logits AFTER the fast path's raw-logits gate
+        degen_ok = True
+        for bad in (dict(repeat_penalty=float("nan")),
+                    dict(repeat_penalty=float("inf")),
+                    dict(repeat_penalty=1e-320),
+                    dict(temperature=float("nan"))):
+            dp = dict(temperature=0.8, top_k=3, top_p=0.95, seed=5,
+                      repeat_penalty=1.1)
+            dp.update(bad)
+            s_fast = Sampler(SamplerParams(**dp))
+            s_ref = Sampler(SamplerParams(**dp))
+            for t in (0, 1):
+                s_fast.accept(t)
+                s_ref.accept(t)
+            try:
+                got = s_fast.sample([0.0, 1.0, 0.5, 2.0])
+                ref = s_ref._sample_list([0.0, 1.0, 0.5, 2.0])
+                degen_ok = degen_ok and got == ref
+            except Exception as e:
+                degen_ok = False
+                print(f"     | degenerate {bad}: {e!r}")
+        check("degenerate sampler params match the list path and never raise",
+              degen_ok)
 
         # ---- generation stop reasons -------------------------------------
         from alpacca.chat import GenerationResult
