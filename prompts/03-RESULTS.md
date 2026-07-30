@@ -211,6 +211,40 @@ B/w, strictly better than the planned 1.125. No separate work remains.
   Prefill runs are 2-minute windows and jitter +-15% here; one
   contended run showed 3.0 tok/s prefill / 118 ms decode, both noise.
 
+## Fix round 2 (2026-07-30, commits d98d71c + a5d6296): request/load path
+
+A full-repo scan (2 deep read agents + inline measurement) found waste
+outside the engine; everything defect-shaped was fixed with a mandatory
+closure protocol: differential proof old-vs-new per fix, suites
+non-decreasing, e2e re-measure, then a 16-agent adversarial review
+(4 lenses x 2 executing refuters per finding) whose confirmed findings
+were fixed and re-proven.
+
+| fix | before | after | proof |
+|---|---|---|---|
+| sampler numpy path | 6.6 ms/token (chat), 4.9 greedy | 1.94 / 0.05 ms | 19380 differential trials vs old, 0 mismatches |
+| top_k<=0 serve cliff | 55 / 132 ms/token | 12.7 / 28.5 ms | same harness |
+| BPE O(L^2) merge | 48 ms per 460-char CJK chunk | 1.0 ms | 352 real-vocab differential encodes, 0 mismatches |
+| SPM special scan | 0.2 ms floor per encode | 0.005 ms ('\n') | same + in-suite synthetic pins |
+| stop-string scan | O(output^2) | tail-window | invariant documented; suite generation tests |
+| rows_at native gather | Python loop per row | one fancy-index | bit-exact shuffled-gather check |
+| load prefetch | none | madvise SEQ+WILLNEED | advisory; header peeks unaffected |
+| IQ downloads | GBs then load crash | rejected at choose/load with clear message | 3 new pull checks + preflight repros |
+| fallback warning | printed AFTER the RAM was spent | predicted from header, before the loop | matches old text |
+
+Adversarial review CONFIRMED 3 defects in the first fix commit (all
+reproduced by execution, none refuted): (1) penalty-minted NaN crashed
+the new fast path (old code never crashed; reachable via serve JSON
+NaN/Infinity literals) - penalty now runs before the finiteness gate,
+NaN temperature also routes to the list path; (2) the SPM prefilter was
+SLOWER on '<'-heavy text (6321/6414 Gemma specials start with '<') -
+candidate lists now memoized per first-char set, 0.41 -> 0.23 ms;
+(3) the unreadable-dtype preflight rejected files with UNUSED exotic
+tensors that previously loaded - now only loader-consumed names count,
+verified in both directions. End state: engine decode unchanged
+(~104 ms, noise band), real CLI generation 8.8 -> 9.2 tok/s, suites
+410 numpy / 312 pure / 430 kernels, CI green.
+
 ### 6.4 f16 KV cache: DEFERRED with rationale
 
 At the benchmark's context (<=512) attention costs 1.17 ms/token; halving
