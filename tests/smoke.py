@@ -826,6 +826,34 @@ def main() -> None:
             aerr = float(np.max(np.abs(fast - slow)))
             check(f"numpy grouped attention matches per-head loop (diff {aerr:.2e})",
                   aerr < 1e-6)
+            # the fused decode-attention kernel (used when the JIT is active
+            # so decode never enters OpenBLAS's own thread pool) must match
+            # the NumPy matmul math; fastmath reassociation allows last-ulp
+            # drift, nothing more. Direct calls so neither side is vacuous.
+            if AK.available():
+                arng = np.random.default_rng(23)
+                worst_att = 0.0
+                for n_kv_t, group_t, hd_t, t_t in ((2, 2, 3, 5), (1, 4, 8, 1),
+                                                   (4, 1, 16, 33),
+                                                   (2, 4, 32, 700)):
+                    n_head_t = n_kv_t * group_t
+                    qv = arng.standard_normal(n_head_t * hd_t).astype(np.float32)
+                    Kt = arng.standard_normal((t_t, n_kv_t, hd_t)).astype(np.float32)
+                    Vt = arng.standard_normal((t_t, n_kv_t, hd_t)).astype(np.float32)
+                    isq = 1.0 / hd_t ** 0.5
+                    got = AK.attention_decode(qv, Kt, Vt, group_t, isq)
+                    qg = qv.reshape(n_kv_t, group_t, hd_t)
+                    sc2 = np.matmul(qg, Kt.transpose(1, 2, 0)) * isq
+                    sc2 -= sc2.max(axis=2, keepdims=True)
+                    w2 = np.exp(sc2)
+                    w2 /= w2.sum(axis=2, keepdims=True)
+                    ref_att = np.matmul(w2, Vt.transpose(1, 0, 2)).reshape(
+                        n_head_t, hd_t)
+                    worst_att = max(worst_att,
+                                    float(np.abs(got - ref_att).max()))
+                check(f"fused decode attention matches the matmul math "
+                      f"(diff {worst_att:.2e})", worst_att < 2e-5,
+                      f"worst {worst_att:.2e}")
 
         # ---- top-k selection ---------------------------------------------
         # This had no direct coverage at all, which is how a first version

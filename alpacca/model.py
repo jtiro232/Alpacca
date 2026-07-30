@@ -777,6 +777,14 @@ class Model:
 
     def _attention_np(self, q, K, V, group: int, inv_sqrt: float):
         hp = self.hp
+        # the fused kernel runs on the matvec kernels' own thread pool; the
+        # np.matmul path below enters OpenBLAS, whose separate pool fans out
+        # per call once the context passes its size threshold (~600 tokens)
+        # and thrashes against the kernel threads - measured 124 -> 800+
+        # ms/token. Kernels absent (reference path), the matmuls stand.
+        from . import kernels
+        if kernels.available():
+            return kernels.attention_decode(q, K, V, group, inv_sqrt)
         qg = q.reshape(hp.n_kv, group, hp.head_dim)
         scores = np.matmul(qg, K.transpose(1, 2, 0)) * inv_sqrt
         scores -= scores.max(axis=2, keepdims=True)

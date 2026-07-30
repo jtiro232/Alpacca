@@ -348,6 +348,48 @@ def _init() -> dict:
         return out
 
     @njit(parallel=True, fastmath=True, cache=True)
+    def _attention_decode(q3, K, V, scores, out, inv_sqrt):
+        # Single-token grouped-query attention over the KV cache, one prange
+        # worker per query head, softmax fused in. This exists because the
+        # NumPy path's np.matmul enters OpenBLAS, whose OWN thread pool fans
+        # out once the context passes its size threshold (~600 tokens) - 64
+        # pool fan-outs per token fighting the kernels' 6 omp threads took
+        # decode from 124 to 800-2260 ms/token. This kernel runs on the same
+        # omp pool as the matvecs, so there is nothing to fight.
+        #   q3 (n_kv, group, hd); K, V (t, n_kv, hd); scores (heads, t)
+        t = K.shape[0]
+        group = q3.shape[1]
+        hd = q3.shape[2]
+        heads = q3.shape[0] * group
+        for h in prange(heads):
+            kv = h // group
+            g = h % group
+            srow = scores[h]
+            m = np.float32(-3.4e38)
+            for i in range(t):
+                dot = np.float32(0.0)
+                for d in range(hd):
+                    dot += q3[kv, g, d] * K[i, kv, d]
+                s = dot * inv_sqrt
+                srow[i] = s
+                if s > m:
+                    m = s
+            ssum = np.float32(0.0)
+            for i in range(t):
+                e = np.exp(srow[i] - m)
+                srow[i] = e
+                ssum += e
+            inv = np.float32(1.0) / ssum
+            acc = out[kv, g]
+            for d in range(hd):
+                acc[d] = np.float32(0.0)
+            for i in range(t):
+                w = srow[i] * inv
+                vrow = V[i, kv]
+                for d in range(hd):
+                    acc[d] += w * vrow[d]
+
+    @njit(parallel=True, fastmath=True, cache=True)
     def _dequant_q4k(qp, sc, mn, dh, dmh, lut, out):
         # expand native Q4_K rows to float32 in one parallel pass; the
         # prefill GEMM path needs f32 tiles and NumPy's multi-pass nibble
@@ -393,6 +435,7 @@ def _init() -> dict:
               "matvec_q6k_int": _matvec_q6k_int,
               "dequant_q4k": _dequant_q4k,
               "dequant_q6k": _dequant_q6k,
+              "attention_decode": _attention_decode,
               "f16_lut": lut,
               "numba_version": numba.__version__}
     return _state
@@ -489,6 +532,23 @@ def matvec_q6k_int(q3, sc, dh, x):
     return st["matvec_q6k_int"](qf, sc, dh, st["f16_lut"], xq, ascale)
 
 
+def attention_decode(q, K, V, group, inv_sqrt):
+    """Single-token grouped-query attention over the KV cache.
+
+    q f32 (n_head*head_dim,), K/V f32 (t, n_kv, head_dim); returns
+    (n_head, head_dim) float32, numerically the softmax(q.K/sqrt d).V of
+    the NumPy path (fastmath reassociation differs in the last ulps).
+    """
+    st = _init()
+    np = st["np"]
+    t, n_kv, hd = K.shape
+    q3 = np.ascontiguousarray(q, dtype=np.float32).reshape(n_kv, group, hd)
+    scores = np.empty((n_kv * group, t), np.float32)
+    out = np.empty((n_kv, group, hd), np.float32)
+    st["attention_decode"](q3, K, V, scores, out, np.float32(inv_sqrt))
+    return out.reshape(n_kv * group, hd)
+
+
 def dequant_q4k_tile(qp, sc, mn, dh, dmh, out=None):
     """Expand native Q4_K rows to a float32 (nr, cols) tile.
 
@@ -545,3 +605,6 @@ def warmup() -> None:
     dequant_q6k_tile(np.zeros((2, 16, 16), dtype=np.int8),
                      np.zeros((2, 16), dtype=np.int8),
                      np.zeros((2, 1), dtype=np.uint16))
+    attention_decode(np.zeros(2 * 4, dtype=np.float32),
+                     np.zeros((3, 2, 4), dtype=np.float32),
+                     np.zeros((3, 2, 4), dtype=np.float32), 1, 0.5)
