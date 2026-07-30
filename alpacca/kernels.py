@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import os
 
+from . import _platform
+
 NUMBA_PIN = "0.65.1"
 
 # Batch at which the wide (batch-contiguous) matmul kernel overtakes the
@@ -33,33 +35,6 @@ NUMBA_PIN = "0.65.1"
 NARROW_BATCH = 8
 
 _state: dict | None = None  # lazy: {"matvec": compiled fn} or {} if inactive
-
-
-def _physical_cores() -> int:
-    """Physical core count, or 0 when it cannot be determined.
-
-    Decode is memory-bandwidth-bound and SMT siblings contend for the same
-    load ports: measured on a 6C/12T Ryzen, 6 threads decode 9-16% faster
-    than 12. Linux exposes the topology in sysfs; elsewhere we return 0 and
-    leave numba's default (all logical CPUs) alone rather than guess.
-    """
-    try:
-        cores = set()
-        base = "/sys/devices/system/cpu"
-        for name in os.listdir(base):
-            if not name.startswith("cpu") or not name[3:].isdigit():
-                continue
-            try:
-                with open(f"{base}/{name}/topology/core_id") as f:
-                    core = f.read().strip()
-                with open(f"{base}/{name}/topology/physical_package_id") as f:
-                    pkg = f.read().strip()
-            except OSError:
-                continue
-            cores.add((pkg, core))
-        return len(cores)
-    except Exception:
-        return 0
 
 
 def int_dot_enabled() -> bool:
@@ -99,7 +74,7 @@ def _init() -> dict:
         except (ValueError, RuntimeError):
             pass
     elif "NUMBA_NUM_THREADS" not in os.environ:
-        phys = _physical_cores()
+        phys = _platform.physical_cores()
         if 0 < phys < numba.get_num_threads():
             try:
                 numba.set_num_threads(phys)

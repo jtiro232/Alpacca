@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from . import _platform
+
 GGUF_MAGIC = b"GGUF"
 GGUF_VERSION = 3
 DEFAULT_ALIGNMENT = 32
@@ -99,11 +101,7 @@ class GGUFFile:
         f._fh = open(f.path, "rb")
         f._mm = mmap.mmap(f._fh.fileno(), 0, access=mmap.ACCESS_READ)
         if prefetch:
-            try:
-                f._mm.madvise(mmap.MADV_SEQUENTIAL)
-                f._mm.madvise(mmap.MADV_WILLNEED)
-            except (AttributeError, ValueError, OSError):
-                pass  # purely advisory; platforms without madvise skip it
+            _platform.prefetch(f._mm, f._fh)
         f._parse()
         return f
 
