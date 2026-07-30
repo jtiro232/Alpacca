@@ -180,6 +180,10 @@ class Layer:
 
 
 class Model:
+    # class default so instances built without load() (tests use __new__)
+    # take the reference attention path; load() sets the real value
+    _use_kernel_attention = False
+
     def __init__(self, hp: Hyperparams, tokenizer: Tokenizer):
         self.hp = hp
         self.tok = tokenizer
@@ -635,6 +639,7 @@ class Model:
                 from . import kernels
                 if kernels.available():
                     kernels.warmup()  # JIT compile/cache-load counts as load
+                    m._use_kernel_attention = True
             m.load_seconds = time.time() - t0
             return m
         finally:
@@ -781,9 +786,14 @@ class Model:
         # np.matmul path below enters OpenBLAS, whose separate pool fans out
         # per call once the context passes its size threshold (~600 tokens)
         # and thrashes against the kernel threads - measured 124 -> 800+
-        # ms/token. Kernels absent (reference path), the matmuls stand.
-        from . import kernels
-        if kernels.available():
+        # ms/token. The gate is "this model runs quantized kernels", the
+        # same condition that warmed the JIT at load: a fully DENSE model
+        # decodes single-pool on OpenBLAS, and sending only its attention
+        # to numba would create the two-pool thrash here instead of fixing
+        # it (measured 75 -> 258 ms/token), plus a mid-token JIT compile
+        # that load never warmed.
+        if self._use_kernel_attention:
+            from . import kernels
             return kernels.attention_decode(q, K, V, group, inv_sqrt)
         qg = q.reshape(hp.n_kv, group, hp.head_dim)
         scores = np.matmul(qg, K.transpose(1, 2, 0)) * inv_sqrt

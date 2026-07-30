@@ -365,15 +365,17 @@ def _init() -> dict:
             kv = h // group
             g = h % group
             srow = scores[h]
-            m = np.float32(-3.4e38)
             for i in range(t):
                 dot = np.float32(0.0)
                 for d in range(hd):
                     dot += q3[kv, g, d] * K[i, kv, d]
-                s = dot * inv_sqrt
-                srow[i] = s
-                if s > m:
-                    m = s
+                srow[i] = dot * inv_sqrt
+            # seed from the first score, not a constant: a finite score can
+            # sit below any magic seed and a stuck seed zeroes the softmax
+            m = srow[0]
+            for i in range(1, t):
+                if srow[i] > m:
+                    m = srow[i]
             ssum = np.float32(0.0)
             for i in range(t):
                 e = np.exp(srow[i] - m)

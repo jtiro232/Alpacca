@@ -245,6 +245,46 @@ verified in both directions. End state: engine decode unchanged
 (~104 ms, noise band), real CLI generation 8.8 -> 9.2 tok/s, suites
 410 numpy / 312 pure / 430 kernels, CI green.
 
+## Fix round 3 (2026-07-30): the long-context decode cliff
+
+User report: decode slowed "significantly" toward the end of a long
+answer. Diagnosed by measurement, not guesswork:
+- growth probe: 107 ms/token at ctx 128 -> 124 at 512 -> CLIFF to
+  800-860 at 640+ (temp pinned 95C but clocks 4.26 GHz, DRAM 16.7 GB/s,
+  20 GB free - thermals/bandwidth/swap all ruled out).
+- caught live: decode process at 1136% CPU (numba capped at 6 threads),
+  37% kernel time, load 17. Root cause: decode attention's np.matmul
+  enters OpenBLAS, whose own 12-thread pool starts fanning out per call
+  past its size threshold (~600 ctx) - 64 fan-outs/token thrashing the
+  kernels' omp pool. A/B at ctx ~750: default 2259 ms/token,
+  OPENBLAS_NUM_THREADS=1 gives 131 (clean machine).
+
+Fix: fused decode-attention kernel in alpacca's own Python (prange over
+query heads, softmax in-kernel), on the SAME omp pool as the matvecs.
+Result: ctx 25 104.5 ms (unchanged), ctx 768-960 113-115 ms in the
+DEFAULT env - cliff gone, and fused attention is ~3x cheaper than even
+single-threaded matmul (9 vs 27 ms at ~900 ctx). Kernel-vs-matmul parity
+1.6e-07; 48/48 greedy tokens unchanged.
+
+Adversarial review (8 agents) CONFIRMED 3 defects in the first cut, all
+fixed and re-verified:
+1. Fully DENSE models (F16/ALPACCA_F32) used to decode single-pool on
+   OpenBLAS; dispatching only their attention to numba CREATED the
+   two-pool thrash (75 -> 258-316 ms/token measured). Gate changed from
+   "JIT importable" to "this model runs quantized kernels" (same
+   condition as warmup); dense F32 model verified to never initialize
+   numba at all.
+2. Dense models skipped warmup, so the first decode token paid a 0.68 s
+   in-token JIT compile. Same gate fix; quantized models compile the
+   attention kernel inside load's warmup.
+3. The f32 running-max seed (-3.4e38) NaN'd a head whose finite scores
+   sat below it; now seeded from the first score (verified: the
+   adversarial [[5.0]]-vs-NaN case returns 5.0).
+Suites: 411 numpy / 313 pure / 433 kernels (gate pinned both ways).
+Known limitation, documented: the kernels-ABSENT numpy reference path
+keeps its historical BLAS-threaded attention (proportionally minor at
+its 1.4 tok/s baseline).
+
 ### 6.4 f16 KV cache: DEFERRED with rationale
 
 At the benchmark's context (<=512) attention costs 1.17 ms/token; halving

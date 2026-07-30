@@ -1793,6 +1793,16 @@ def main() -> None:
         check("tiny F16 forward runs",
               len(f16_logits) == f16_model.hp.n_vocab and
               all(v == v for v in f16_logits[:8]))
+        # a fully dense model decodes single-pool on OpenBLAS: sending only
+        # its attention to the numba pool creates the two-pool thrash the
+        # kernel exists to avoid (measured 75 -> 258 ms/token), so the
+        # kernel-attention gate must follow the weights, not the JIT
+        check("dense models do not engage kernel attention",
+              not f16_model._use_kernel_attention)
+        if T.HAS_NUMPY and AK.available():
+            q4k_gate = Model.load(str(srv / "tiny-q4k.gguf"), progress=False)
+            check("quantized models engage kernel attention with the JIT",
+                  q4k_gate._use_kernel_attention)
 
         # ---- context window --------------------------------------------
         # Nothing covered n_past near n_ctx for any architecture, which is why
