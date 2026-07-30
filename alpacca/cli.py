@@ -160,6 +160,16 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
         return
     from . import kernels
     pinned = os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None
+    from . import cuda
+    if cuda.available():
+        # weights are bound for VRAM: densifying them to host float32
+        # would keep them off the GPU, so the auto budget stays unset (a
+        # user-pinned ALPACCA_DENSE_WEIGHT_MB still flows into Model.load)
+        print(cuda.status(), file=sys.stderr)
+        if kernels.available():
+            kernels.warmup()
+            print(kernels.status(), file=sys.stderr)
+        return
     if kernels.available():
         # fused quantized kernels read ~1.1-1.3 B/weight at native speed:
         # faster than dense BLAS (4 B/weight) AND ~3x less RAM, so the
@@ -327,6 +337,8 @@ def cmd_doctor(_args) -> int:
     print(f"backend:     {tensor.backend_name()}"
           + ("  (optional accelerator active)" if tensor.HAS_NUMPY
              else "  (pip install numpy for big speedups)"))
+    from . import cuda
+    print(f"gpu:         {cuda.doctor_line()}")
     root = models_root()
     try:
         root.mkdir(parents=True, exist_ok=True)

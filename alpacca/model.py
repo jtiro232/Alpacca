@@ -193,7 +193,8 @@ class Model:
         self.output = None
         self.metadata: dict = {}
         self.weight_storage: dict = {"dense": 0, "quantized": {}, "fallback": {},
-                                     "densified": [], "densified_bytes": 0}
+                                     "densified": [], "densified_bytes": 0,
+                                     "gpu": 0, "gpu_bytes": 0}
         self.cached_ids: list[int] = []
         self.last_prefill_forwarded = 0
         self._rope_inv_freq = None
@@ -440,8 +441,26 @@ class Model:
                                 densify_plan.add(nm)
                                 densified_bytes += nbytes
 
+            # GPU tier: quantized matrices upload their codes-layout arrays
+            # to VRAM at load; dispatch is per-matrix, so a partial upload
+            # (VRAM exhausted mid-load) is exact mixed placement, not an
+            # error. Anything the tier declines falls back to the exact
+            # QuantMatrix it would have been. The token embedding never
+            # uploads: row gathers are the wrong shape for these kernels.
+            gpu_matrices = 0
+            gpu_bytes = 0
+            _gpu = None
+            if T.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+                try:
+                    from . import cuda as _gpu_mod
+                    if _gpu_mod.available():
+                        _gpu = _gpu_mod
+                except Exception:
+                    _gpu = None
+
             def tensor_mat(name, rows, cols, required=True):
                 nonlocal dense_matrices, dense_bytes, quantized_bytes
+                nonlocal gpu_matrices, gpu_bytes
                 info = gf.tensors.get(name)
                 if info is None:
                     if required:
@@ -454,6 +473,15 @@ class Model:
                 if (T.HAS_NUMPY and not os.environ.get("ALPACCA_F32") and
                         name not in densify_plan and
                         T.can_quantized_matvec(info.dtype, cols)):
+                    if _gpu is not None and name != "token_embd.weight":
+                        g = _gpu.gpu_matrix(gf.tensor_bytes(name),
+                                            info.dtype, rows, cols)
+                        if g is not None:
+                            # counted as GPU storage only: no QuantMatrix is
+                            # built, so these bytes never exist in host RAM
+                            gpu_matrices += 1
+                            gpu_bytes += g.vram_nbytes
+                            return g
                     quantized_matrices[info.dtype] = (
                         quantized_matrices.get(info.dtype, 0) + 1)
                     quantized_bytes += info.n_bytes
@@ -482,7 +510,7 @@ class Model:
                             .lower() not in ("0", "off", "no"))
 
             def fused_mat(names, rows_each, cols):
-                nonlocal quantized_bytes
+                nonlocal quantized_bytes, gpu_matrices, gpu_bytes
                 if not fuse_enabled:
                     return None
                 infos = [gf.tensors.get(nm) for nm in names]
@@ -503,6 +531,13 @@ class Model:
                 # join accepts the mmap-backed memoryviews directly: one copy
                 # into the fused buffer, not a bytes() transient per tensor
                 data = b"".join(gf.tensor_bytes(nm) for nm in names)
+                if _gpu is not None:
+                    g = _gpu.gpu_matrix(data, dt, sum(rows_each), cols)
+                    if g is not None:
+                        # GPU storage only - see tensor_mat
+                        gpu_matrices += 1
+                        gpu_bytes += g.vram_nbytes
+                        return g
                 for info in infos:
                     quantized_matrices[dt] = quantized_matrices.get(dt, 0) + 1
                     quantized_bytes += info.n_bytes
@@ -631,15 +666,22 @@ class Model:
                 "fallback": dict(sorted(fallback_matrices.items())),
                 "densified": sorted(densified_names),
                 "densified_bytes": densified_bytes,
+                "gpu": gpu_matrices,
+                "gpu_bytes": gpu_bytes,
             }
 
             m.n_ctx = min(n_ctx, hp.n_ctx_train) if n_ctx else min(hp.n_ctx_train, 4096)
             m._init_cache()
-            if quantized_matrices and T.HAS_NUMPY:
+            # gpu_matrices counts too: attention and rope stay on the CPU in
+            # the GPU tier, so a fully-GPU weight placement (possible when the
+            # embedding is dense) still wants the JIT attention kernels
+            if (quantized_matrices or gpu_matrices) and T.HAS_NUMPY:
                 from . import kernels
                 if kernels.available():
                     kernels.warmup()  # JIT compile/cache-load counts as load
                     m._use_kernel_attention = True
+            if gpu_matrices and _gpu is not None:
+                _gpu.warmup()  # same rule: JIT compile counts as load time
             m.load_seconds = time.time() - t0
             return m
         finally:
@@ -1382,4 +1424,9 @@ class Model:
         if densified:
             size = self._size(self.weight_storage.get("densified_bytes", 0))
             parts.append(f"dense budget {len(densified)} matrices ({size})")
+        gpu_n = int(self.weight_storage.get("gpu", 0) or 0)
+        if gpu_n:
+            g_bytes = self.weight_storage.get("gpu_bytes", 0)
+            parts.append(f"gpu {gpu_n} matrices "
+                         f"({self._size(g_bytes)} VRAM)")
         return ", ".join(parts)

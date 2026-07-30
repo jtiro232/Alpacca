@@ -36,8 +36,21 @@ from .qmatrix import (  # noqa: E402  (re-exported quantized-matrix surface)
 from .quants import QK, QK_K  # noqa: E402,F401  (block sizes, for callers/tests)
 
 
+# Flipped by alpacca.cuda when the first weight matrix reaches VRAM, so
+# backend_name() reflects what is actually running, not what is installed.
+_GPU_ACTIVE = False
+
+
 def backend_name() -> str:
+    if _GPU_ACTIVE:
+        return "gpu (cuda)"
     return "numpy" if HAS_NUMPY else "pure-python"
+
+
+def _is_gpu_matrix(W) -> bool:
+    # duck-typed marker, not isinstance: importing alpacca.cuda here would
+    # drag the CUDA stack into every CPU-only import of this module
+    return getattr(W, "is_gpu_matrix", False)
 
 
 def quantized_matrix(data, dtype: str, rows: int, cols: int) -> QuantizedMatrix:
@@ -82,7 +95,7 @@ def to_list(v) -> list:
 
 def matvec(W, x):
     """W (rows x cols) times x (cols) -> rows."""
-    if isinstance(W, QuantizedMatrix):
+    if isinstance(W, QuantizedMatrix) or _is_gpu_matrix(W):
         return W.matvec(x)
     if HAS_NUMPY:
         return W @ x
@@ -98,6 +111,16 @@ def matvec_group(Ws, x):
     function of x). Falls back to plain matvecs everywhere else.
     """
     if HAS_NUMPY:
+        gpu = [W for W in Ws if _is_gpu_matrix(W)]
+        if len(gpu) >= 2 and len({W.cols for W in gpu}) == 1:
+            from . import cuda as _cuda
+            dx = _cuda.upload_vector(x)
+            if dx is not None:  # None degrades to per-matvec uploads
+                # dispatch on the marker, never `W in gpu`: list membership
+                # compares a dense ndarray against GpuMatrix with ==, and
+                # NumPy broadcasts that into an ambiguous truth value
+                return [W.matvec(x, dx) if _is_gpu_matrix(W)
+                        else matvec(W, x) for W in Ws]
         native = [W for W in Ws
                   if isinstance(W, QuantizedMatrix)
                   and getattr(W, "_mode", "codes") in ("q4k_int", "q5k_int",
@@ -113,7 +136,7 @@ def matvec_group(Ws, x):
 
 def matmul_t(X, W):
     """X (batch x cols) times W.T (cols x rows) -> batch x rows."""
-    if isinstance(W, QuantizedMatrix):
+    if isinstance(W, QuantizedMatrix) or _is_gpu_matrix(W):
         return W.matmul_t(X)
     if not HAS_NUMPY:
         return [matvec(W, row) for row in X]
@@ -121,7 +144,7 @@ def matmul_t(X, W):
 
 
 def matrix_row(W, r: int):
-    if isinstance(W, QuantizedMatrix):
+    if isinstance(W, QuantizedMatrix) or _is_gpu_matrix(W):
         return W.row(r)
     if HAS_NUMPY:
         return W[r].copy()
@@ -129,7 +152,7 @@ def matrix_row(W, r: int):
 
 
 def matrix_rows(W, rows):
-    if isinstance(W, QuantizedMatrix):
+    if isinstance(W, QuantizedMatrix) or _is_gpu_matrix(W):
         return W.rows_at(rows)
     if HAS_NUMPY:
         return W[_np.asarray(rows, dtype=_np.int64)].copy()

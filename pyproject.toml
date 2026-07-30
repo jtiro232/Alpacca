@@ -18,6 +18,25 @@ fast = ["numpy"]
 # our own Python-source kernels, JIT-compiled by a PINNED numba; the pin
 # is a validated pair with this code and is never bumped implicitly
 kernels = ["numpy", "numba==0.65.1"]
+# our own Python-source CUDA kernels (alpacca/cuda.py), JIT-compiled by a
+# PINNED numba-cuda; same policy as [kernels] - the set below is a
+# validated combination and is never bumped implicitly. nvidia-nvjitlink
+# is load-bearing: without it cuda.core can silently pick up a torch
+# wheel's stale nvJitLink DLL and every kernel dies with
+# ERROR_OUTDATED_LIBRARY(14).
+gpu = [
+    "numpy",
+    "numba==0.65.1",
+    "numba-cuda==0.30.4",
+    "cuda-bindings==13.3.1",
+    "cuda-core==1.1.1",
+    "cuda-pathfinder==1.6.0",
+    "nvidia-cuda-nvrtc==13.3.33",
+    "nvidia-nvvm==13.3.33",
+    "nvidia-nvjitlink==13.3.33",
+    "nvidia-cuda-runtime==13.3.29",
+    "nvidia-cuda-cccl==13.2.86",
+]
 
 [project.scripts]
 alpacca = "alpacca.cli:main"
