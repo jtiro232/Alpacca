@@ -194,13 +194,23 @@ class GenerationResult:
 
 def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
              n_predict: int = -1, stream=None, stop_strings: list[str] | None = None,
-             stop_tokens: set[int] | None = None) -> GenerationResult:
+             stop_tokens: set[int] | None = None, *,
+             json_only: bool = False) -> GenerationResult:
     """Generate until EOG / n_predict / a stop string. `stream` is an
-    optional callable receiving text fragments as they decode."""
+    optional callable receiving text fragments as they decode.
+
+    With json_only=True every emitted fragment is a prefix of one
+    syntactically valid JSON value, on any backend at any temperature, and
+    generation stops with reason "stop" the moment the value completes."""
     if not prompt_ids:
         if model.tok.bos_id < 0:
             raise ValueError("prompt produced no tokens and the tokenizer has no BOS token")
         prompt_ids = [model.tok.bos_id]
+    guard = table = None
+    if json_only:
+        from .jsonform import JsonGuard, sample_json_token, token_bytes_table
+        guard = JsonGuard()
+        table = token_bytes_table(model.tok)
     sampler = Sampler(params)
     # only the last repeat_last_n tokens can ever remain in the penalty
     # window, so skip the rest rather than walk a 16k prompt to fill 64 slots
@@ -212,7 +222,12 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
     emitted = 0
     n_tokens = 0
     t0 = time.time()
-    budget = n_predict if n_predict and n_predict > 0 else (model.n_ctx - model.n_past)
+    # 0 means "no new tokens" (prefill only, matching Ollama/llama.cpp);
+    # only negative values mean "until EOG or the context fills"
+    if n_predict >= 0:
+        budget = n_predict
+    else:
+        budget = model.n_ctx - model.n_past
 
     text = ""
     reason = "eog"
@@ -227,7 +242,14 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
         if n_tokens >= budget:
             reason = "length"
             break
-        tid = sampler.sample(logits)
+        if guard is None:
+            tid = sampler.sample(logits)
+        else:
+            # rejection loop: only a token whose bytes extend valid JSON can
+            # come back, and its bytes are already fed into the guard. EOG
+            # only comes back once the value is complete.
+            tid = sample_json_token(sampler, logits, guard, table,
+                                    model.tok, stop_tokens)
         sampler.accept(tid)
         if model.tok.is_eog(tid):
             break  # never forwarded into the cache, so never counted either
@@ -237,6 +259,15 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
         n_tokens += 1
         piece = dec.feed(tid)
         text += piece
+        if guard is not None and guard.done:
+            # the top-level value just closed; checked before stop strings so
+            # the closing token itself cannot be truncated. Caller-supplied
+            # stop strings still win at every EARLIER token - a stop that
+            # matches inside a JSON string value cuts the reply mid-value, so
+            # callers wanting the completeness guarantee must not combine
+            # stop_strings with json_only.
+            reason = "stop"
+            break
         if stop_strings and piece:
             # a match must involve the newly decoded piece - anything fully
             # inside older text was found on an earlier token - so search
@@ -298,11 +329,12 @@ def fit_to_context(fmt: "ChatFormat", messages: list[dict], n_ctx: int,
 
 def chat_once(model: Model, messages: list[dict], params: SamplerParams,
               n_predict: int = -1, stream=None,
-              stop_strings: list[str] | None = None) -> GenerationResult:
+              stop_strings: list[str] | None = None, *,
+              json_only: bool = False) -> GenerationResult:
     fmt = ChatFormat(model, detect_format(model.metadata))
     ids = fmt.render(messages)
     return generate(model, ids, params, n_predict, stream, stop_strings,
-                    stop_tokens=fmt.stop_tokens())
+                    stop_tokens=fmt.stop_tokens(), json_only=json_only)
 
 
 def _read_chat_line(prompt: str = "> ", stdin: TextIO | None = None,

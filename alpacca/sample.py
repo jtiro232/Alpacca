@@ -87,13 +87,23 @@ class Sampler:
         if len(self.recent) > max(self.params.repeat_last_n, 1):
             self.recent.pop(0)
 
-    def sample(self, logits) -> int:
+    def sample(self, logits, banned=None) -> int:
+        """Pick a token id. `banned` is an optional set of token ids to
+        exclude (constrained decoding - see jsonform): they are masked to
+        -inf on a private copy, so the caller's logits are never touched
+        and repeated resampling of one position stays independent."""
         p = self.params
         if T.HAS_NUMPY:
             # np.array always copies, so the penalty below cannot mutate the
             # caller's logits; float64 matches the Python-float arithmetic of
             # the list path bit for bit
             arr = _np.array(logits, dtype=_np.float64)
+            if banned:
+                # exp(-inf)=0 keeps the fast path safe (comment below); a
+                # mask covering every finite logit turns arr.max() into -inf
+                # and falls through the finiteness gate to the list path,
+                # which tolerates the all--inf vector without raising
+                arr[list(banned)] = -_np.inf
             if p.repeat_penalty and p.repeat_penalty != 1.0 and self.recent:
                 for t in set(self.recent):
                     v = arr[t]
@@ -111,7 +121,7 @@ class Sampler:
             if (arr.size and bool(_np.isfinite(arr.max()))
                     and not math.isnan(p.temperature)):
                 return self._sample_array(arr)
-        return self._sample_list(T.to_list(logits))
+        return self._sample_list(T.to_list(logits), banned)
 
     def _sample_array(self, arr) -> int:
         """NumPy sampling path over already-penalized float64 logits. Same
@@ -148,11 +158,18 @@ class Sampler:
             j = idx.size - 1  # r beyond the last running sum: keep last
         return int(idx[j])
 
-    def _sample_list(self, logits: list) -> int:
+    def _sample_list(self, logits: list, banned=None) -> int:
         """Reference implementation over Python lists: the pure-stdlib path,
         and the fallback for NaN logits (whose comparison quirks the tests
         pin down)."""
         p = self.params
+
+        if banned:
+            # same masking as the array path; T.to_list always copies, so
+            # this never reaches the caller's logits either
+            ninf = float("-inf")
+            for t in banned:
+                logits[t] = ninf
 
         if p.repeat_penalty and p.repeat_penalty != 1.0 and self.recent:
             for t in set(self.recent):
