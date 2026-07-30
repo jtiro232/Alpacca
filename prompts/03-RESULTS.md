@@ -4,6 +4,72 @@ One line per avenue: what was tried, what was expected, what was measured,
 kept or discarded. Written as work happens, not at the end. Numbers are
 end-to-end 8B Q4_K_M decode unless marked "micro".
 
+## FINAL SUMMARY (2026-07-30)
+
+8B Q4_K_M, single stream, CPU only, warm JIT, model loaded, same machine,
+same day:
+
+|  | Ollama (llama.cpp) | Alpacca before | Alpacca after |
+|---|---:|---:|---:|
+| Decode | 11.91-11.95 tok/s | 5.07-5.20 tok/s | **9.1-9.9 tok/s** |
+| Prefill 911 tok | 31.5 tok/s | 5.9 (same-day) | 7.2-8.0 tok/s |
+| Weight RAM | ~4.6 GiB | 9.35 GiB | **5.03 GiB** (RSS 5.78) |
+| Load time | - | 14.3 s | 7.8-9.4 s |
+
+Alpacca decode: 101.6/101.8/101.8 ms/token in quiet windows (9.83-9.85
+tok/s), 104.8-109.4 ms in windows with background load; final pairing in
+one session: Alpacca 9.14/9.40/9.54 vs Ollama 11.91. Decode gap closed
+from 2.3x to 1.21-1.30x. Every avenue below; commits on
+perf/fused-quantized-matmul. Both suites green throughout, counts
+402->403 numpy / 305 pure / 403->423 kernels; CI green.
+
+| avenue | expected | measured | verdict |
+|---|---|---|---|
+| 6 threads not 12 (6.1) | +9% | +16% (5.18 vs 4.45) | KEPT, auto physical cores |
+| threading layer (6.1) | ? | default==omp best; workqueue -19%; tbb n/a | default KEPT |
+| ceiling probe (6.1) | maybe >59 GB/s | 58.7-60.1 flat at 4-12 thr | wall is REAL |
+| THP (6.2) | few % | unmaterializable from userspace; streaming already at wall | CLOSED, ~0 |
+| non-matvec 20% (6.3) | 1.25x cap | it was launch-bound f32 kernels; now 6.5 ms/token total | mooted by int path |
+| QK+gate/up fusion (6.3) | 1-2 ms | 0.0 ms here, bit-identical logits | KEPT (structure) |
+| head shortcut (6.3) | - | sampler needs full logits, no exact shortcut | REJECTED |
+| f16 KV (6.4) | <1 ms at short ctx | analysis only; needs u16+LUT attention kernel | DEFERRED |
+| f16 scales (6.5) | +11% | +11% micro, then subsumed by native format | SUBSUMED |
+| VNNI (6.7) | decides everything | vpdpwssd EMITTED once int64 promotion defeated | THE key result |
+| packed Q4_K + int8 acts (7 revisited) | "a wash" per prior pass | 2.42x micro, wall-bound | KEPT (0.578 B/w) |
+| Q6_K int kernel | memory-bound | 33.8 -> 52.2 Gw/s (94% of wall) after j-outer | KEPT (1.066 B/w) |
+| Q6_K 6-bit packing (0.82 B/w) | 1.3x for Q6_K share | ALU headroom insufficient (52 < 72 Gw/s needed) | NOT PURSUED, future |
+| prefill dequant tiles | fix regression | numpy unpack 2x slower than JIT kernel; pool ping-pong; page faults | FIXED, net +1.2-1.35x |
+
+### Verdict on the central question
+
+Can pure Python reach llama.cpp's decode throughput on this hardware?
+**Within ~20%: yes, measured. Exact parity: no, and the remaining gap is
+now bytes-per-weight and per-token fixed cost, not kernel quality.**
+
+The binding constraints, quantified:
+1. DRAM wall 59-60 GB/s (measured four ways, flat across thread counts).
+2. Alpacca streams 0.578 B/w for Q4_K vs llama.cpp's 0.5625 (+2.7%), and
+   1.066 B/w for Q6_K vs 0.82 (+30% on 19% of weights) - worth ~6 ms of
+   the 17 ms/token gap. Closing it needs the 6-bit code packing whose
+   unpack currently costs more ALU than the bandwidth it saves (52 Gw/s
+   measured vs 72 needed); a smarter packed layout might close it and is
+   the highest-value remaining lead.
+3. ~8-9 ms/token of non-weight work (attention, rope, norms, sampling,
+   activation quantization, Python dispatch) that llama.cpp's C runtime
+   does in ~1-2 ms. Fusing these into JIT kernels is possible in
+   principle; each is small and the sum matters at this speed.
+Evidence that would change the answer: a Q6_K (and Q4_K sc/mn) packed
+layout whose in-kernel unpack stays under ~15 ops/32 weights, or a Numba
+release whose f16 support removes the LUT detour.
+
+What made the difference: Numba promotes scalar integer arithmetic to
+int64 (documented semantics), which had compiled every prior integer-dot
+experiment to 8-lane vpmuldq - the prior pass's "VNNI never emitted" and
+"4-bit packing is a wash" conclusions were both artifacts of that. One
+idiom (`acc = np.int32(acc + i32*i32)`) unlocked vpdpwssd at 220 Gw/s
+flat, and everything else followed from spending the recovered ALU on
+narrower storage.
+
 ## Baseline reproduction (2026-07-30) — ALL REPRODUCED
 
 - [x] smoke.py system python: 402 checks pass
@@ -121,6 +187,29 @@ sit on the same wall.
 Measured standalone (+11%: 1.15ms vs 1.28ms micro) but the shipped Q4_K
 format stores the file's own f16 supers + 6-bit int sub-scales at 0.578
 B/w, strictly better than the planned 1.125. No separate work remains.
+
+### 6.3 fusion + prefill tiled path (2026-07-30)
+
+- attn_q+attn_k and ffn_gate+ffn_up fused by raw-byte concat (row-major
+  blocks make this valid): launches 226 -> 162, logits bit-identical
+  (new smoke check, guards fusion engaged). Decode unchanged on this
+  machine (101.8 vs 101.6 ms/token) - omp fork/join was already cheap.
+  KEPT for structure; ALPACCA_FUSE=0 reverts.
+- Output-head shortcut (6.3c): REJECTED - sampler needs full logits
+  (global top-k, repeat penalty on arbitrary ids); no exact-equivalent
+  shortcut exists.
+- Prefill scare, resolved: native storage first made the batch>64 tiled
+  path unpack via NumPy (911-tok prefill measured 6.9 tok/s vs the
+  brief's 10). Fixes: JIT dequant-tile kernels (2.1x the NumPy unpack),
+  32 MB tiles (4 MB tiles ping-pong the numba and BLAS pools: 1077 vs
+  271 ms for the same matmul), reused tile buffer (fresh 32 MB allocs
+  fault their pages every call). Final same-day pairing: NEW 7.2-8.0
+  tok/s vs OLD-PATH 5.9 tok/s - the brief's "10 tok/s" does not
+  reproduce today (background load); same-day, prefill IMPROVED
+  1.2-1.35x. GEMM itself is at the 240 GFLOP/s BLAS floor (17.1s of a
+  29s chunk); int8 GEMM a la llama.cpp remains the only route past it.
+  Prefill runs are 2-minute windows and jitter +-15% here; one
+  contended run showed 3.0 tok/s prefill / 118 ms decode, both noise.
 
 ### 6.4 f16 KV cache: DEFERRED with rationale
 

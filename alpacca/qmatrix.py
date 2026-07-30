@@ -300,10 +300,27 @@ class QuantMatrix:
                     out[i] = self.matvec(X[i])
                 return out
             out = _np.empty((X.shape[0], self.rows), dtype=_np.float32)
-            tile_rows = max(16, (4 << 20) // max(self.cols * 4, 1))
+            # 32 MB tiles, not the f32 path's 4 MB: each iteration hands off
+            # between the numba pool (dequant) and the BLAS pool (GEMM), and
+            # small tiles pay that ping-pong per tile - measured 1077 ms vs
+            # 271 ms for the same 28672x4096 matmul at 4 MB vs 32 MB tiles
+            tile_rows = max(256, (32 << 20) // max(self.cols * 4, 1))
+            buf = _np.empty((min(tile_rows, self.rows), self.cols),
+                            dtype=_np.float32)
             for r0 in range(0, self.rows, tile_rows):
                 r1 = min(self.rows, r0 + tile_rows)
-                out[:, r0:r1] = X @ self._tile_f32(r0, r1).T
+                # the JIT dequant kernel, not _tile_f32: one parallel pass
+                # instead of NumPy's multi-pass unpack (~2x, measured); the
+                # buffer is reused so its pages fault in exactly once
+                if self._mode == "q4k_int":
+                    tile = _kernels.dequant_q4k_tile(
+                        self._qp[r0:r1], self._sci[r0:r1], self._mni[r0:r1],
+                        self._dh[r0:r1], self._dmh[r0:r1], buf[:r1 - r0])
+                else:
+                    tile = _kernels.dequant_q6k_tile(
+                        self._q3[r0:r1], self._sci[r0:r1], self._dh[r0:r1],
+                        buf[:r1 - r0])
+                out[:, r0:r1] = X @ tile.T
             return out
         # Below the crossover, stream the codes once with the fused kernel.
         # The tiled path underneath costs O(weights) no matter how small the

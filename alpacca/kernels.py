@@ -347,6 +347,43 @@ def _init() -> dict:
             out[r] = acc
         return out
 
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _dequant_q4k(qp, sc, mn, dh, dmh, lut, out):
+        # expand native Q4_K rows to float32 in one parallel pass; the
+        # prefill GEMM path needs f32 tiles and NumPy's multi-pass nibble
+        # unpack measured ~3x slower than this
+        nr = qp.shape[0]
+        nblk = dh.shape[1]
+        for r in prange(nr):
+            for b in range(nblk):
+                d = lut[dh[r, b]]
+                dm = lut[dmh[r, b]]
+                for c in range(4):
+                    d0 = d * np.float32(sc[r, b, 2 * c])
+                    d1 = d * np.float32(sc[r, b, 2 * c + 1])
+                    m0 = dm * np.float32(mn[r, b, 2 * c])
+                    m1 = dm * np.float32(mn[r, b, 2 * c + 1])
+                    pb = b * 128 + c * 32
+                    ob = b * 256 + c * 64
+                    for j in range(32):
+                        v = qp[r, pb + j]
+                        out[r, ob + j] = (d0 * np.float32(v & np.uint8(15))
+                                          - m0)
+                        out[r, ob + 32 + j] = (d1 * np.float32(v >> np.uint8(4))
+                                               - m1)
+
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _dequant_q6k(qf, sc, dh, lut, out):
+        # qf: (nr, cols) int8 codes in element order, sc per 16, d per 256
+        nr = qf.shape[0]
+        nsub = sc.shape[1]
+        for r in prange(nr):
+            for su in range(nsub):
+                d_eff = lut[dh[r, su // 16]] * np.float32(sc[r, su])
+                e0 = su * 16
+                for j in range(16):
+                    out[r, e0 + j] = d_eff * np.float32(qf[r, e0 + j])
+
     lut = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
 
     _state = {"np": np, "matvec": _matvec_codes, "matmul": _matmul_codes,
@@ -354,6 +391,8 @@ def _init() -> dict:
               "quantize_acts": _quantize_acts,
               "matvec_q4k_int": _matvec_q4k_int,
               "matvec_q6k_int": _matvec_q6k_int,
+              "dequant_q4k": _dequant_q4k,
+              "dequant_q6k": _dequant_q6k,
               "f16_lut": lut,
               "numba_version": numba.__version__}
     return _state
@@ -450,6 +489,31 @@ def matvec_q6k_int(q3, sc, dh, x):
     return st["matvec_q6k_int"](qf, sc, dh, st["f16_lut"], xq, ascale)
 
 
+def dequant_q4k_tile(qp, sc, mn, dh, dmh, out=None):
+    """Expand native Q4_K rows to a float32 (nr, cols) tile.
+
+    Pass a preallocated `out` when calling in a loop: a fresh tile buffer
+    is newly mapped memory and the page faults cost more than the kernel.
+    """
+    st = _init()
+    np = st["np"]
+    if out is None:
+        out = np.empty((qp.shape[0], qp.shape[1] * 2), np.float32)
+    st["dequant_q4k"](qp, sc, mn, dh, dmh, st["f16_lut"], out)
+    return out
+
+
+def dequant_q6k_tile(q3, sc, dh, out=None):
+    """Expand native Q6_K rows to a float32 (nr, cols) tile."""
+    st = _init()
+    np = st["np"]
+    qf = q3.reshape(q3.shape[0], -1)
+    if out is None:
+        out = np.empty(qf.shape, np.float32)
+    st["dequant_q6k"](qf, sc, dh, st["f16_lut"], out)
+    return out
+
+
 def warmup() -> None:
     """Trigger JIT compilation once (cached on disk afterwards)."""
     st = _init()
@@ -473,3 +537,11 @@ def warmup() -> None:
     matvec_q6k_int(np.zeros((2, 16, 16), dtype=np.int8),
                    np.zeros((2, 16), dtype=np.int8),
                    np.zeros((2, 1), dtype=np.uint16), x256)
+    dequant_q4k_tile(np.zeros((2, 128), dtype=np.uint8),
+                     np.zeros((2, 1, 8), dtype=np.uint8),
+                     np.zeros((2, 1, 8), dtype=np.uint8),
+                     np.zeros((2, 1), dtype=np.uint16),
+                     np.zeros((2, 1), dtype=np.uint16))
+    dequant_q6k_tile(np.zeros((2, 16, 16), dtype=np.int8),
+                     np.zeros((2, 16), dtype=np.int8),
+                     np.zeros((2, 1), dtype=np.uint16))

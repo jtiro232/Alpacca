@@ -215,16 +215,45 @@ feed, so wrapping F16 would only slow decode down).
 
 #### Where the time goes on a large model
 
-Single-stream decode is memory-bandwidth-bound, and on an 8B model alpacca
-is already at the wall. On a Ryzen 5 7640HS (6 cores, DDR5) a BLAS float32
-GEMV, a plain Numba float32 loop, and the fused quantized kernel all reach
-~59 GB/s - the same number, because that is what the memory delivers.
-Llama-3.1-8B-Instruct Q4_K_M holds 9.35 GiB of codes and scales, so decode
-lands at 200 ms/token (5.0 tok/s) at 50 GB/s, or 85% of that ceiling.
-Kernel work cannot buy much more; only fewer bytes per weight could, and
-storing the codes packed at 4 bits was measured *slower* on this toolchain
-(three layouts tried, including int8-quantized activations - each one goes
-ALU-bound around 30 GB/s, below the memory ceiling it was trying to save).
+Single-stream decode is memory-bandwidth-bound: on a Ryzen 5 7640HS
+(6 cores, DDR5) streaming reads top out at ~59-60 GB/s no matter how many
+threads ask (measured at 4/6/8/12), so tokens per second is bytes per
+weight divided into that wall. With the pinned Numba kernels, Q4_K and
+Q6_K weights now stay in the *file's own* block fields - 4-bit split-nibble
+codes, 6-bit integer sub-scales, and float16 super-scales, 0.578 bytes per
+weight for Q4_K and 1.066 for Q6_K - and the decode kernel dots them
+against int8-quantized activations (per-256-block absmax/127 scale, our
+own Q8-style scheme) using AVX-512 VNNI integer instructions that LLVM
+emits from these Python loops. Llama-3.1-8B-Instruct Q4_K_M decodes at
+**101.8 ms/token (9.83 tok/s) in 5.0 GiB of weight RAM**, against 5.2
+tok/s and 9.35 GiB for the previous int8-codes + float32-scales storage,
+and 11.9 tok/s for Ollama/llama.cpp on the same machine. An earlier
+attempt at 4-bit packed storage measured *slower*; the culprit was found
+this pass - Numba promotes scalar integer arithmetic to int64, which had
+been hiding every 8/16-bit SIMD pattern from LLVM - and the fix (int32
+re-cast accumulators) is load-bearing in every integer kernel.
+
+The integer dot changes numerics: activations are rounded to int8 before
+the weight dot, the same trade llama.cpp makes. Measured end to end on the
+8B model, 48 greedy-decoded tokens agree 48/48 with the exact float32
+path, and the kernels are bit-exact against an integer simulation of
+their own algebra (a smoke check enforces <=1e-5 and was verified to fail
+under a mutated kernel). `ALPACCA_INT_DOT=0` restores the previous exact
+storage and kernels. Weights themselves are represented exactly - the
+codes and scales are the file's own bits.
+
+Long-prompt prefill (batch > 64) dequantizes tiles with a JIT kernel and
+hands them to BLAS, whose GEMM is the floor (~240 GFLOP/s measured):
+911 tokens prefill at 7-8 tok/s vs 5.9 for the previous storage measured
+the same day. Prefill numbers on this machine jitter +-15% with
+background load; compare like with like.
+
+What did not help, measured: transparent huge pages (madvise accepted but
+never materialized on this kernel; 4K-page streaming already sits on the
+DRAM wall), fusing attn_q+attn_k and gate+up launches (kept for structure,
+but 226 -> 162 launches was worth 0.0 ms here), and thread counts above
+the physical-core count (SMT contention costs 9-16%; kernels now default
+to physical cores, override with ALPACCA_THREADS).
 
 Batched work was a different story. `matmul_t` used to dequantize the whole
 matrix to float32 before handing it to BLAS, a cost proportional to the
