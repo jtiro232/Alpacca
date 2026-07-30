@@ -76,3 +76,56 @@ premultiplied into i16 codes in-register (exact: sc*q <= 945 < 2^15), one
 vector reduce per 256 weights. 63.9 GB/s effective = at the memory wall for
 0.578 B/w. THIS is the integration candidate.
 
+### Integration results (2026-07-30, commits e728089 + Q6_K follow-up)
+
+End-to-end 8B Q4_K_M decode, warm JIT, ALPACCA_DENSE_WEIGHT_MB=0:
+  5.18 tok/s (best pre-existing) -> 8.42 (int-dot v1) -> 9.85 tok/s after
+  the Q6_K j-outer kernel (101.6 ms/token). Ollama: 11.95.
+Load time 14.3s -> 7.8s (native unpack is lighter than int8+f32 expand).
+Numerics: greedy decode 48 tokens, int-dot vs exact-f32 path: 48/48
+identical tokens (twice, incl. after the Q6_K kernel change), coherent
+text, min top-1 margin 0.112. Kernel-vs-integer-simulation exact (<=1e-5
+gate in smoke.py, mutation-tested). Suites: 402 numpy / 305 pure / 422
+kernels.
+Decode profile after: Q4_K matvecs 67.3ms (at the wall), Q6_K 45.7->~30ms,
+quantize_acts 2.2ms, rope 1.45, attention 1.17, rmsnorm 1.04, embed+rest
+0.6. The old "20% non-matvec" is now ~6.5ms total.
+Q6_K kernel: per-sub-block reduces 33.8 Gw/s -> j-outer all-16-scales
+premultiplied, two acc chains 52.2 Gw/s = 94% of the 1.066 B/w wall.
+(pair-variant regression 17.2 Gw/s - kept in log per 5.2.)
+
+### 6.1 ceiling probe: the ~59 GB/s wall is REAL (2026-07-30)
+
+Multi-thread disjoint-chunk streaming reads, 1 GiB working set:
+4 thr 59.5 | 6 thr 60.1 | 8 thr 59.5 | 12 thr 58.7 GB/s. Flat across
+thread counts => hard DRAM limit, not per-thread/prefetcher. Both engines
+sit on the same wall.
+
+### 6.2 THP: NEGATIVE - unmaterializable from userspace here, and ~zero prize
+
+- No root; system-wide 'always' untestable (sudo needs a password).
+- stdlib mmap.madvise(MADV_HUGEPAGE) on MAP_PRIVATE|MAP_ANONYMOUS: VMA gets
+  the hg flag, but fault-in allocates 0 huge pages (AnonHugePages: 0) and
+  MADV_COLLAPSE returns EINVAL, despite enabled=[madvise],
+  defrag=[madvise], hugepages-2048kB=[inherit] and ~2400 free order-9
+  blocks. This kernel (7.0.0-28-generic) will not hand THP to userspace.
+- Sizing evidence that makes it moot: streaming on plain 4K pages already
+  hits 60.0 GB/s = the DRAM wall, so TLB misses are not limiting
+  sequential streams. Expected prize ~0 for decode. CLOSED.
+- Python gotcha for the record: mmap.mmap(-1, n) defaults to MAP_SHARED =
+  shmem, governed by shmem_enabled=[never] here - madvise silently no-ops.
+  MAP_PRIVATE|MAP_ANONYMOUS is required for anon THP.
+
+### 6.5 f16 scales: SUBSUMED by the native int format (better than planned)
+
+Measured standalone (+11%: 1.15ms vs 1.28ms micro) but the shipped Q4_K
+format stores the file's own f16 supers + 6-bit int sub-scales at 0.578
+B/w, strictly better than the planned 1.125. No separate work remains.
+
+### 6.4 f16 KV cache: DEFERRED with rationale
+
+At the benchmark's context (<=512) attention costs 1.17 ms/token; halving
+KV traffic buys <1ms now. It matters at long context (ctx 4096: ~1 GB/token
+of KV reads), but numba 0.65 cannot take f16 arrays, so the route is a
+u16-bits + LUT attention kernel - real work, low benchmark impact. Future.
+

@@ -1598,6 +1598,30 @@ def main() -> None:
                 check(f"tiny {fmt} forward runs",
                       len(logits) == qm.hp.n_vocab and all(v == v for v in logits[:8]))
 
+        # fused attn_q+attn_k / ffn_gate+ffn_up must be a pure launch-count
+        # optimization: same per-row math, same logits. Guard that fusion
+        # actually engaged, or this compares a path with itself (see 5.6).
+        if T.HAS_NUMPY:
+            import numpy as np
+            fm = Model.load(str(srv / "tiny-q4k.gguf"), progress=False)
+            fm_ids = fm.tok.encode("hi") or [fm.tok.bos_id]
+            fused_logits = np.asarray(fm.prefill(fm_ids[:1]), dtype=np.float64)
+            fused_engaged = (all(ly.wqk is not None for ly in fm.layers) and
+                             all(ly.wgu is not None for ly in fm.layers))
+            os.environ["ALPACCA_FUSE"] = "0"
+            try:
+                um = Model.load(str(srv / "tiny-q4k.gguf"), progress=False)
+                unfused_engaged = (all(ly.wqk is None for ly in um.layers) and
+                                   all(ly.wgu is None for ly in um.layers))
+                unfused_logits = np.asarray(um.prefill(fm_ids[:1]),
+                                            dtype=np.float64)
+            finally:
+                os.environ.pop("ALPACCA_FUSE", None)
+            fdiff = float(np.abs(fused_logits - unfused_logits).max())
+            check(f"fused qk/gate-up matches unfused logits (diff {fdiff:.2e})",
+                  fused_engaged and unfused_engaged and fdiff < 1e-4,
+                  f"engaged={fused_engaged}/{unfused_engaged} diff={fdiff:.2e}")
+
         f16_model = Model.load(str(srv / "tiny-f16.gguf"), progress=False)
         f16_desc = f16_model.describe()
         check("load tiny F16 stays dense float32 (no quantized wrap)",

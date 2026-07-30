@@ -174,6 +174,7 @@ class Hyperparams:
 
 class Layer:
     __slots__ = ("attn_norm", "wq", "wk", "wv", "wo", "bq", "bk", "bv",
+                 "wqk", "wgu",
                  "q_norm", "k_norm", "post_attn_norm",
                  "ffn_norm", "w_gate", "w_up", "w_down", "post_ffw_norm")
 
@@ -443,6 +444,42 @@ class Model:
                 vals = dequantize(gf.tensor_bytes(name), info.n_elements, info.dtype)
                 return T.matrix(vals, rows, cols)
 
+            # Fuse row-adjacent same-dtype quantized pairs (attn_q+attn_k,
+            # ffn_gate+ffn_up) into one matrix: GGUF blocks are row-major, so
+            # concatenating the raw bytes of two (r, cols) tensors IS a valid
+            # (r1+r2, cols) matrix of the same dtype. One kernel launch and
+            # one activation quantization instead of two; the per-row math is
+            # unchanged. attn_v stays separate - it is Q6_K in Q4_K_M files
+            # while q/k are Q4_K, and mixed dtypes cannot share blocks.
+            fuse_enabled = (T.HAS_NUMPY and not os.environ.get("ALPACCA_F32")
+                            and os.environ.get("ALPACCA_FUSE", "").strip()
+                            .lower() not in ("0", "off", "no"))
+
+            def fused_mat(names, rows_each, cols):
+                nonlocal quantized_bytes
+                if not fuse_enabled:
+                    return None
+                infos = [gf.tensors.get(nm) for nm in names]
+                if any(i is None for i in infos):
+                    return None
+                dt = infos[0].dtype
+                if any(i.dtype != dt for i in infos):
+                    return None
+                if any(nm in densify_plan for nm in names):
+                    return None
+                if not T.can_quantized_matvec(dt, cols):
+                    return None
+                for nm, info, r in zip(names, infos, rows_each):
+                    if info.n_elements != r * cols:
+                        raise ValueError(
+                            f"tensor {nm} has {info.n_elements} elements, "
+                            f"expected {r * cols}")
+                data = b"".join(bytes(gf.tensor_bytes(nm)) for nm in names)
+                for info in infos:
+                    quantized_matrices[dt] = quantized_matrices.get(dt, 0) + 1
+                    quantized_bytes += info.n_bytes
+                return T.quantized_matrix(data, dt, sum(rows_each), cols)
+
             def tensor_vec(name, required=True, size=None):
                 info = gf.tensors.get(name)
                 if info is None:
@@ -470,8 +507,13 @@ class Model:
                 ly.post_attn_norm = None
                 ly.post_ffw_norm = None
                 ly.attn_norm = tensor_vec(p + "attn_norm.weight", size=hp.n_embd)
-                ly.wq = tensor_mat(p + "attn_q.weight", q_dim, hp.n_embd)
-                ly.wk = tensor_mat(p + "attn_k.weight", kv_dim, hp.n_embd)
+                ly.wqk = fused_mat([p + "attn_q.weight", p + "attn_k.weight"],
+                                   [q_dim, kv_dim], hp.n_embd)
+                if ly.wqk is not None:
+                    ly.wq = ly.wk = None
+                else:
+                    ly.wq = tensor_mat(p + "attn_q.weight", q_dim, hp.n_embd)
+                    ly.wk = tensor_mat(p + "attn_k.weight", kv_dim, hp.n_embd)
                 ly.wv = tensor_mat(p + "attn_v.weight", kv_dim, hp.n_embd)
                 ly.wo = tensor_mat(p + "attn_output.weight", hp.n_embd, q_dim)
                 ly.bq = tensor_vec(p + "attn_q.bias", required=False, size=q_dim)
@@ -486,8 +528,13 @@ class Model:
                     ly.post_attn_norm = tensor_vec(p + "post_attention_norm.weight",
                                                    size=hp.n_embd)
                 ly.ffn_norm = tensor_vec(p + "ffn_norm.weight", size=hp.n_embd)
-                ly.w_gate = tensor_mat(p + "ffn_gate.weight", hp.n_ff, hp.n_embd)
-                ly.w_up = tensor_mat(p + "ffn_up.weight", hp.n_ff, hp.n_embd)
+                ly.wgu = fused_mat([p + "ffn_gate.weight", p + "ffn_up.weight"],
+                                   [hp.n_ff, hp.n_ff], hp.n_embd)
+                if ly.wgu is not None:
+                    ly.w_gate = ly.w_up = None
+                else:
+                    ly.w_gate = tensor_mat(p + "ffn_gate.weight", hp.n_ff, hp.n_embd)
+                    ly.w_up = tensor_mat(p + "ffn_up.weight", hp.n_ff, hp.n_embd)
                 ly.w_down = tensor_mat(p + "ffn_down.weight", hp.n_embd, hp.n_ff)
                 if arch == "gemma3":
                     ly.post_ffw_norm = tensor_vec(p + "post_ffw_norm.weight",
@@ -731,10 +778,16 @@ class Model:
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
+        qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
-            q = T.matmul_t(h, ly.wq)
-            k = T.matmul_t(h, ly.wk)
+            if ly.wqk is not None:
+                qk = T.matmul_t(h, ly.wqk)
+                q = qk[:, :qd]
+                k = qk[:, qd:]
+            else:
+                q = T.matmul_t(h, ly.wq)
+                k = T.matmul_t(h, ly.wk)
             v = T.matmul_t(h, ly.wv)
             if ly.bq is not None:
                 q = q + ly.bq
@@ -756,8 +809,13 @@ class Model:
             x = x + T.matmul_t(att_out, ly.wo)
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            gate = T.matmul_t(h, ly.w_gate)
-            up = T.matmul_t(h, ly.w_up)
+            if ly.wgu is not None:
+                gu = T.matmul_t(h, ly.wgu)
+                gate = gu[:, :hp.n_ff]
+                up = gu[:, hp.n_ff:]
+            else:
+                gate = T.matmul_t(h, ly.w_gate)
+                up = T.matmul_t(h, ly.w_up)
             act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
                    else gate / (1.0 + np.exp(-gate))) * up
             x = x + T.matmul_t(act, ly.w_down)
@@ -777,10 +835,16 @@ class Model:
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
+        qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
-            q = T.matvec(ly.wq, h)
-            k = T.matvec(ly.wk, h)
+            if ly.wqk is not None:
+                qk = T.matvec(ly.wqk, h)
+                q = qk[:qd]
+                k = qk[qd:]
+            else:
+                q = T.matvec(ly.wq, h)
+                k = T.matvec(ly.wk, h)
             v = T.matvec(ly.wv, h)
             if ly.bq is not None:
                 q = q + ly.bq
@@ -799,8 +863,13 @@ class Model:
             x = x + T.matvec(ly.wo, att_out.reshape(-1))
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            gate = T.matvec(ly.w_gate, h)
-            up = T.matvec(ly.w_up, h)
+            if ly.wgu is not None:
+                gu = T.matvec(ly.wgu, h)
+                gate = gu[:hp.n_ff]
+                up = gu[hp.n_ff:]
+            else:
+                gate = T.matvec(ly.w_gate, h)
+                up = T.matvec(ly.w_up, h)
             act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
                    else gate / (1.0 + np.exp(-gate))) * up
             x = x + T.matvec(ly.w_down, act)
@@ -917,10 +986,16 @@ class Model:
         inv_sqrt = hp.attention_scale
         group = hp.n_head // hp.n_kv
 
+        qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
-            q = T.matmul_t(h, ly.wq)
-            k = T.matmul_t(h, ly.wk)
+            if ly.wqk is not None:
+                qk = T.matmul_t(h, ly.wqk)
+                q = qk[:, :qd]
+                k = qk[:, qd:]
+            else:
+                q = T.matmul_t(h, ly.wq)
+                k = T.matmul_t(h, ly.wk)
             v = T.matmul_t(h, ly.wv)
             if ly.bq is not None:
                 q = q + ly.bq
@@ -950,8 +1025,13 @@ class Model:
             x = x + T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps)
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            gate = T.matmul_t(h, ly.w_gate)
-            up = T.matmul_t(h, ly.w_up)
+            if ly.wgu is not None:
+                gu = T.matmul_t(h, ly.wgu)
+                gate = gu[:, :hp.n_ff]
+                up = gu[:, hp.n_ff:]
+            else:
+                gate = T.matmul_t(h, ly.w_gate)
+                up = T.matmul_t(h, ly.w_up)
             act = T.gelu_pytorch_tanh(gate) * up
             ffn_out = T.matmul_t(act, ly.w_down)
             x = x + T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps)
@@ -970,10 +1050,16 @@ class Model:
         inv_sqrt = hp.attention_scale
         group = hp.n_head // hp.n_kv
 
+        qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
-            q = T.matvec(ly.wq, h)
-            k = T.matvec(ly.wk, h)
+            if ly.wqk is not None:
+                qk = T.matvec(ly.wqk, h)
+                q = qk[:qd]
+                k = qk[qd:]
+            else:
+                q = T.matvec(ly.wq, h)
+                k = T.matvec(ly.wk, h)
             v = T.matvec(ly.wv, h)
             if ly.bq is not None:
                 q = q + ly.bq
@@ -999,7 +1085,11 @@ class Model:
             x = x + T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps)
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            act = T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)) * T.matvec(ly.w_up, h)
+            if ly.wgu is not None:
+                gu = T.matvec(ly.wgu, h)
+                act = T.gelu_pytorch_tanh(gu[:hp.n_ff]) * gu[hp.n_ff:]
+            else:
+                act = T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)) * T.matvec(ly.w_up, h)
             ffn_out = T.matvec(ly.w_down, act)
             x = x + T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps)
 
