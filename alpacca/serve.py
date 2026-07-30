@@ -1,8 +1,11 @@
 # Alpacca - OpenAI-compatible HTTP API on the standard library only.
 # Endpoints: /health, /v1/models, /v1/chat/completions (incl. streaming),
-# and a llama.cpp-style /completion. MIT License. See LICENSE.
+# a llama.cpp-style /completion, and the Ollama-native surface (/api/chat,
+# /api/generate, /api/tags, /api/show, /api/ps, /api/version) so the official
+# ollama client works unmodified against this port. MIT License. See LICENSE.
 from __future__ import annotations
 
+import inspect
 import json
 import socketserver
 import sys
@@ -11,7 +14,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import chat
+from . import __version__, chat
 from .model import Model
 from .sample import SamplerParams
 
@@ -97,6 +100,124 @@ def _stop_from(body: dict) -> list[str]:
     return []
 
 
+# -- Ollama-native API helpers ----------------------------------------------
+
+def _accepts_json_only(fn) -> bool:
+    """The json_only contract (emitted text is a prefix of valid JSON and
+    generation stops when the top-level value closes) may not be in chat.py
+    yet. Detect it once at import: retrying a rejected keyword after pieces
+    already streamed would replay the whole answer, so format=json has to
+    degrade to plain generation up front, never mid-stream."""
+    try:
+        return "json_only" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_CHAT_JSON_ONLY = _accepts_json_only(chat.chat_once)
+_GEN_JSON_ONLY = _accepts_json_only(chat.generate)
+
+
+def _iso_now() -> str:
+    # RFC3339 UTC. Ollama emits fractional timestamps and the client's
+    # pydantic models parse created_at/modified_at into datetimes, which
+    # accept this form with or without the fraction.
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + \
+        f".{int(t % 1 * 1e6):06d}Z"
+
+
+def _same_model(a: str, b: str) -> bool:
+    """Ollama treats "name" and "name:latest" as the same model. Slashes are
+    unified because a file ref's display() is Path-normalised on Windows -
+    the client that launched `serve C:/x/m.gguf` must not 404 on that same
+    string; registry refs never contain a backslash, so they are unaffected."""
+    def base(s: str) -> str:
+        s = s.strip().replace("\\", "/")
+        return s[:-len(":latest")] if s.endswith(":latest") else s
+    return base(a) == base(b)
+
+
+def _wants_json(body: dict) -> bool:
+    # format="json" asks for constrained output; a dict is a JSON schema,
+    # honoured here as plain "json" - the output is valid JSON but the
+    # schema itself is not enforced (Ollama-lite)
+    fmt = body.get("format")
+    return fmt == "json" or isinstance(fmt, dict)
+
+
+def _ollama_options(body: dict, defaults: SamplerParams) -> tuple[SamplerParams, int, list[str]]:
+    """Map Ollama's options block onto the sampler. num_ctx is accepted and
+    ignored: the window was fixed when the model loaded, so a larger ask just
+    proceeds at model.n_ctx rather than erroring. keep_alive is ignored the
+    same way - the one model stays resident for the life of the process."""
+    options = body.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    params = SamplerParams(
+        temperature=_float_param(options, "temperature", defaults.temperature),
+        top_k=_int_param(options, ("top_k",), defaults.top_k),
+        top_p=_float_param(options, "top_p", defaults.top_p),
+        repeat_penalty=_float_param(options, "repeat_penalty", defaults.repeat_penalty),
+        repeat_last_n=_int_param(options, ("repeat_last_n",), defaults.repeat_last_n),
+        seed=_int_param(options, ("seed",), defaults.seed),
+    )
+    # Ollama's num_predict default is -1: generate until EOG or the window
+    # fills, which is exactly what generate() does with a non-positive budget
+    n_predict = _int_param(options, ("num_predict",), -1)
+    return params, n_predict, _stop_from(options)
+
+
+def _param_count(model: Model) -> int:
+    """Mirror of Model.describe()'s arithmetic (embeddings, norms, attention,
+    FFN) so /api/tags and /api/show report the same size the CLI prints."""
+    hp = model.hp
+    params = hp.n_vocab * hp.n_embd
+    if model.output is not model.tok_embd:
+        params += hp.n_vocab * hp.n_embd  # untied output projection
+    params += hp.n_embd  # output_norm
+    for _ in range(hp.n_layer):
+        params += 2 * hp.n_embd  # norms
+        if hp.arch == "gemma3":
+            params += 2 * hp.head_dim  # q_norm/k_norm are shared per head
+            params += 2 * hp.n_embd    # post-attention/post-ffw norms
+        params += hp.n_embd * hp.n_head * hp.head_dim * 2  # wq, wo
+        params += hp.n_embd * hp.n_kv * hp.head_dim * 2    # wk, wv
+        params += 3 * hp.n_embd * hp.n_ff
+    return params
+
+
+def _param_size_label(n: int) -> str:
+    return f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.0f}M"
+
+
+def _served_details(model: Model) -> dict:
+    """Ollama's details block, filled from the loaded model's real state."""
+    q = model.weight_storage.get("quantized") or {}
+    # the dominant stored type stands in for llama.cpp's file-level label;
+    # an all-dense load (an F16/F32 GGUF) has no meaningful level to report
+    level = max(q, key=q.get) if q else "unknown"
+    return {"format": "gguf", "family": model.hp.arch,
+            "families": [model.hp.arch],
+            "parameter_size": _param_size_label(_param_count(model)),
+            "quantization_level": level}
+
+
+def _model_info(model: Model) -> dict:
+    """Flat metadata map for /api/show: scalars only. Long strings (the chat
+    template) and arrays (the tokenizer vocab) are dropped - the template has
+    its own response field and the vocab would be megabytes of JSON."""
+    info = {}
+    for k, v in model.metadata.items():
+        if isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200):
+            info[k] = v
+    hp = model.hp
+    # guaranteed present even if the loader stripped the metadata
+    info.setdefault("general.architecture", hp.arch)
+    info.setdefault(f"{hp.arch}.context_length", hp.n_ctx_train)
+    return info
+
+
 def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 8080,
           defaults: SamplerParams | None = None, ready_callback=None) -> None:
     defaults = defaults or SamplerParams()
@@ -136,6 +257,17 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             if path == "/v1/models":
                 return self.send_json({"object": "list", "data": [
                     {"id": model_name, "object": "model", "owned_by": "alpacca"}]})
+            if path == "/api/tags":
+                return self.api_tags()
+            if path == "/api/version":
+                return self.send_json({"version": __version__})
+            if path == "/api/ps":
+                # one resident model that never unloads, hence the far-future
+                # expiry; sizes are reported 0 rather than guessed
+                return self.send_json({"models": [{
+                    "name": model_name, "model": model_name, "size": 0,
+                    "size_vram": 0, "expires_at": "2099-01-01T00:00:00Z",
+                    "details": _served_details(model)}]})
             self.send_json({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -149,6 +281,12 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                     return self.chat_completions(body)
                 if path == "/completion":
                     return self.completion(body)
+                if path == "/api/chat":
+                    return self.api_chat(body)
+                if path == "/api/generate":
+                    return self.api_generate(body)
+                if path == "/api/show":
+                    return self.api_show(body)
                 self.send_json({"error": "not found"}, 404)
             except (TypeError, ValueError) as e:
                 self.send_json({"error": str(e)}, 400)
@@ -235,10 +373,219 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                           "total_tokens": res.prompt_tokens + res.tokens},
             })
 
+        # -- Ollama-native API (/api/*) ----------------------------------
+
+        def check_served_model(self, body: dict) -> bool:
+            """404 in Ollama's error shape when the request names a model this
+            process is not serving. An absent name means the served model, and
+            "name" matches "name:latest" - the client normalises both ways."""
+            requested = str(body.get("model") or "").strip()
+            if not requested or _same_model(requested, model_name):
+                return True
+            self.send_json({"error": f"model '{requested}' not found"}, 404)
+            return False
+
+        def ollama_usage(self, res, total_ns: int) -> dict:
+            """Final-response bookkeeping fields. All durations nanoseconds.
+            Counts are exact (counted by generate()); total is this handler's
+            wall clock, eval is generate()'s decode clock (its timer starts
+            after prefill), so the prompt_eval remainder genuinely is prefill
+            plus render/lock overhead - nothing here is fabricated."""
+            eval_ns = int(res.seconds * 1e9)
+            return {
+                "done": True,
+                "done_reason": _finish_reason(res),
+                "total_duration": total_ns,
+                "load_duration": int(getattr(model, "load_seconds", 0.0) * 1e9),
+                "prompt_eval_count": res.prompt_tokens,
+                "prompt_eval_duration": max(0, total_ns - eval_ns),
+                "eval_count": res.tokens,
+                "eval_duration": eval_ns,
+            }
+
+        def start_ndjson(self):
+            # Ollama streams newline-delimited JSON objects, not SSE
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+        def ndline(self, obj):
+            payload = json.dumps(obj).encode("utf-8") + b"\n"
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+
+        def probe_reply(self, body: dict, extra: dict | None = None) -> None:
+            """Answer a model load/unload probe. Ollama's CLI and clients send
+            /api/chat with no messages and /api/generate with no prompt to
+            (pre)load a model, and keep_alive 0 to unload it; both expect an
+            immediate done response, never a generation - without this special
+            case an `ollama stop` triggers a full unprompted decode from BOS
+            while holding the generation lock."""
+            keep = _body_value(body, "keep_alive", None)
+            unload = keep in (0, "0", "0s", "0m")
+            out = {"model": model_name, "created_at": _iso_now(),
+                   "done": True,
+                   "done_reason": "unload" if unload else "load"}
+            if extra:
+                out.update(extra)
+            self.send_json(out)
+
+        def api_chat(self, body: dict):
+            if not self.check_served_model(body):
+                return
+            if not body.get("messages"):
+                return self.probe_reply(
+                    body, {"message": {"role": "assistant", "content": ""}})
+            messages = _messages_from(body)
+            params, n_predict, stop = _ollama_options(body, defaults)
+            kwargs = {"json_only": True} if _wants_json(body) and _CHAT_JSON_ONLY else {}
+            t0 = time.perf_counter_ns()
+
+            def line_for(content: str, extra: dict | None = None) -> dict:
+                out = {"model": model_name, "created_at": _iso_now(),
+                       "message": {"role": "assistant", "content": content},
+                       "done": False}
+                if extra:
+                    out.update(extra)
+                return out
+
+            if _body_value(body, "stream", True):  # ollama streams by default
+                self.start_ndjson()
+                try:
+                    try:
+                        with lock:
+                            res = chat.chat_once(
+                                model, messages, params, n_predict,
+                                stream=lambda s: self.ndline(line_for(s)),
+                                stop_strings=stop, **kwargs)
+                        self.ndline(line_for("", self.ollama_usage(
+                            res, time.perf_counter_ns() - t0)))
+                    except Exception as e:
+                        # the 200 and earlier pieces may be on the wire; an
+                        # error line is Ollama's mid-stream failure shape and
+                        # the official client raises ResponseError on it
+                        self.log_message("stream failed: %r", e)
+                        self.ndline({"error": str(e)})
+                finally:
+                    self.wfile.write(b"0\r\n\r\n")
+                return
+
+            with lock:
+                res = chat.chat_once(model, messages, params, n_predict,
+                                     stop_strings=stop, **kwargs)
+            self.send_json(line_for(res.text, self.ollama_usage(
+                res, time.perf_counter_ns() - t0)))
+
+        def api_generate(self, body: dict):
+            if not self.check_served_model(body):
+                return
+            prompt = str(_body_value(body, "prompt", ""))
+            if not prompt:
+                return self.probe_reply(body, {"response": "", "context": []})
+            params, n_predict, stop = _ollama_options(body, defaults)
+            kwargs = {"json_only": True} if _wants_json(body) and _GEN_JSON_ONLY else {}
+            # Ollama renders /api/generate prompts through the model's chat
+            # template unless raw is set; a bare encode hands an instruct
+            # model an untemplated string and it produces continuations, not
+            # answers. The template's turn-end tokens come along as stop
+            # tokens, exactly as chat_once wires them.
+            stop_tokens = None
+            if _body_value(body, "raw", False):
+                def encode() -> list[int]:
+                    return model.tok.encode(prompt)
+            else:
+                fmt = chat.ChatFormat(model, chat.detect_format(model.metadata))
+                msgs = [{"role": "user", "content": prompt}]
+                system = str(_body_value(body, "system", "") or "")
+                if system:
+                    msgs.insert(0, {"role": "system", "content": system})
+                stop_tokens = fmt.stop_tokens()
+
+                def encode() -> list[int]:
+                    return fmt.render(msgs)
+            t0 = time.perf_counter_ns()
+
+            def line_for(piece: str, extra: dict | None = None) -> dict:
+                out = {"model": model_name, "created_at": _iso_now(),
+                       "response": piece, "done": False}
+                if extra:
+                    out.update(extra)
+                return out
+
+            if _body_value(body, "stream", True):
+                self.start_ndjson()
+                try:
+                    try:
+                        with lock:
+                            res = chat.generate(
+                                model, encode(), params, n_predict,
+                                stream=lambda s: self.ndline(line_for(s)),
+                                stop_strings=stop, stop_tokens=stop_tokens,
+                                **kwargs)
+                        final = line_for("", self.ollama_usage(
+                            res, time.perf_counter_ns() - t0))
+                        final["context"] = []  # no per-request state is kept
+                        self.ndline(final)
+                    except Exception as e:
+                        self.log_message("stream failed: %r", e)
+                        self.ndline({"error": str(e)})
+                finally:
+                    self.wfile.write(b"0\r\n\r\n")
+                return
+
+            with lock:
+                res = chat.generate(model, encode(), params, n_predict,
+                                    stop_strings=stop, stop_tokens=stop_tokens,
+                                    **kwargs)
+            out = line_for(res.text, self.ollama_usage(
+                res, time.perf_counter_ns() - t0))
+            out["context"] = []
+            self.send_json(out)
+
+        def api_tags(self):
+            """Installed models from the store, with the served model always
+            present even when the store is unreadable or empty."""
+            entries = []
+            try:
+                from .store import list_models
+                for m in list_models():
+                    entries.append({
+                        "name": m["name"], "model": m["name"],
+                        "modified_at": m.get("pulled_at") or _iso_now(),
+                        "size": int(m.get("size", 0) or 0), "digest": "",
+                        # manifests do not record arch/quant; only the loaded
+                        # model has real values, filled in below
+                        "details": {"format": "gguf", "family": "",
+                                    "families": [], "parameter_size": "",
+                                    "quantization_level": ""}})
+            except Exception as e:  # a broken store must not take /api/tags down
+                self.log_message("store listing failed: %r", e)
+                entries = []
+            served = next((e for e in entries
+                           if _same_model(e["name"], model_name)), None)
+            if served is None:
+                served = {"name": model_name, "model": model_name,
+                          "modified_at": _iso_now(), "size": 0, "digest": ""}
+                entries.insert(0, served)
+            served["details"] = _served_details(model)
+            self.send_json({"models": entries})
+
+        def api_show(self, body: dict):
+            if not self.check_served_model(body):
+                return
+            self.send_json({
+                "modelfile": "", "parameters": "",
+                "template": str(model.metadata.get("tokenizer.chat_template", "")),
+                "details": _served_details(model),
+                "model_info": _model_info(model),
+            })
+
     httpd = _Server((host, port), Handler)
     actual_port = httpd.server_address[1]
     print(f"alpacca serving {model_name} on http://{host}:{actual_port} "
-          f"(OpenAI-compatible: POST /v1/chat/completions)", file=sys.stderr)
+          f"(OpenAI-compatible: POST /v1/chat/completions; "
+          f"Ollama-native: POST /api/chat)", file=sys.stderr)
     if ready_callback:
         ready_callback(actual_port)
     try:
