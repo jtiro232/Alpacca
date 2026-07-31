@@ -3104,6 +3104,12 @@ def main() -> None:
             check("vram-capped mixed placement stays token-identical",
                   gpu_cap_ids == gpu_cpu_ids,
                   f"{gpu_cap_ids} vs {gpu_cpu_ids}")
+            # opt-in f16 K/V mirror: no parity claim (the numerics shift
+            # by design), but it must engage and decode without parking
+            gpu_f16_ids = gpu_greedy({"ALPACCA_GPU": "1",
+                                      "ALPACCA_KV_F16": "1"})
+            check("f16 K/V mirror decodes without parking",
+                  gpu_f16_ids.startswith("IDS "), gpu_f16_ids)
 
             # ---- device prefill chain legs + the prefix cache on the chain
             # In-process on the tiny model. Within one path the chain is

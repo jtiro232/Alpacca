@@ -639,6 +639,15 @@ GPU knobs:
 - `ALPACCA_GPU_VRAM_MB=N`: cap uploaded weight bytes (the
   mixed-placement test hook; free VRAM minus a 512 MiB reserve decides
   otherwise).
+- `ALPACCA_KV_F16=1`: opt-in half-precision K/V mirror for the decode
+  chain (stores cast f32 -> f16 on the device, kernels read back up to
+  f32; the host cache stays f32 and authoritative). Halves the mirror's
+  VRAM - 1.1 GiB -> 0.55 GiB for the 8B at ctx 8192 - which is the
+  measured benefit; decode at depth 8000 is unchanged (49.2 vs 49.4
+  tok/s) and prefill pays ~4% for the converts, so treat it as a VRAM
+  dial, not a speed dial. The numerics legitimately shift (~1e-3): no
+  byte- or token-parity claim is made for this mode, and the default
+  stays f32 so every parity guarantee above holds untouched.
 - `ALPACCA_GPU_WIDE_MATMUL_ELEMS` is retired: the tiled GEMM handles
   every matrix size in one launch, so there are no longer two batched
   kernels to choose between. The variable is accepted and silently

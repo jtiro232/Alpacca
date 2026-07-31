@@ -1726,7 +1726,17 @@ class DecodeChain:
                            gm(ly.w_down, "ffn_down")))
 
         n_ctx = model.n_ctx
-        mirror = 2 * hp.n_layer * n_ctx * kvd * 4
+        # ALPACCA_KV_F16=1: opt-in half-precision K/V mirror - stores cast
+        # f32 -> f16 on the device, kernels read f16 back up to f32.
+        # Halves the mirror's VRAM and the per-token K/V bandwidth decode
+        # pays at depth, but the numbers legitimately shift (~1e-3), so
+        # the default stays f32: every parity claim, and BTBK, run the
+        # default. Read once at chain build; the host cache stays f32
+        # and authoritative either way (rows come home widened).
+        self.kv_f16 = os.environ.get("ALPACCA_KV_F16", "").strip() == "1"
+        kv_dtype = np_.float16 if self.kv_f16 else np_.float32
+        kv_itemsize = 2 if self.kv_f16 else 4
+        mirror = 2 * hp.n_layer * n_ctx * kvd * kv_itemsize
         err, free_b, _total = st["rt"].cudaMemGetInfo()
         if int(err):
             raise RuntimeError(f"cudaMemGetInfo: {err}")
@@ -1754,11 +1764,11 @@ class DecodeChain:
         self.group = hp.n_head // hp.n_kv
         self.eps = float(hp.rms_eps)
         self.inv_sqrt = 1.0 / math.sqrt(hd)
-        self.rowb = kvd * 4
+        self.rowb = kvd * kv_itemsize
 
-        self.dK = [cuda.device_array((n_ctx, hp.n_kv, hd), np_.float32)
+        self.dK = [cuda.device_array((n_ctx, hp.n_kv, hd), kv_dtype)
                    for _ in range(hp.n_layer)]
-        self.dV = [cuda.device_array((n_ctx, hp.n_kv, hd), np_.float32)
+        self.dV = [cuda.device_array((n_ctx, hp.n_kv, hd), kv_dtype)
                    for _ in range(hp.n_layer)]
         self.kdev = [a.__cuda_array_interface__["data"][0] for a in self.dK]
         self.vdev = [a.__cuda_array_interface__["data"][0] for a in self.dV]
@@ -1821,7 +1831,7 @@ class DecodeChain:
             self.out_gm = None  # degraded head computes host-side anyway
         self.n_vocab = (self.out_gm.rows if self.out_gm is not None else 0)
         self.hemb = cuda.pinned_array(hp.n_embd, np_.float32)
-        self.hkv = cuda.pinned_array((hp.n_layer, 2, kvd), np_.float32)
+        self.hkv = cuda.pinned_array((hp.n_layer, 2, kvd), kv_dtype)
         hkv_base = self.hkv.ctypes.data
         self.hk_ptr = [hkv_base + (li * 2) * self.rowb
                        for li in range(hp.n_layer)]
@@ -1876,15 +1886,18 @@ class DecodeChain:
         this runs once after each prefill or truncation, not per token."""
         rows = b - a
         n = rows * self.kvd
+        np_ = st["np"]
         stage = _grown(st, "hMirror", n)
-        hv = stage[:n].reshape(rows, self.n_kv, self.hd)
+        flat = stage.view(np_.float16)[:n] if self.kv_f16 else stage[:n]
+        hv = flat.reshape(rows, self.n_kv, self.hd)
+        nb = rows * self.rowb
         for li in range(self.n_layer):
             hv[...] = model.cache_k[li][a:b]
             _memcpy_h2d_ptr(st, self.kdev[li] + a * self.rowb,
-                            stage.ctypes.data, n * 4)
+                            stage.ctypes.data, nb)
             hv[...] = model.cache_v[li][a:b]
             _memcpy_h2d_ptr(st, self.vdev[li] + a * self.rowb,
-                            stage.ctypes.data, n * 4)
+                            stage.ctypes.data, nb)
 
     def _pbuf(self, st, key: str, n: int):
         """Grow-only device scratch for the prefill path (one chunk's
@@ -2032,11 +2045,26 @@ class DecodeChain:
         # home now (and drain everything queued above)
         nb = batch * self.rowb
         off = pos0 * self.rowb
-        for li in range(self.n_layer):
-            _memcpy_d2h_ptr(st, model.cache_k[li].ctypes.data + off,
-                            self.kdev[li] + off, nb)
-            _memcpy_d2h_ptr(st, model.cache_v[li].ctypes.data + off,
-                            self.vdev[li] + off, nb)
+        if self.kv_f16:
+            # the f32 host cache cannot take f16 rows by raw memcpy:
+            # stage them pinned and let the slice assignment widen
+            n = batch * self.kvd
+            stage = _grown(st, "hMirror", n)
+            hrows = stage.view(np_.float16)[:n].reshape(
+                batch, self.n_kv, self.hd)
+            for li in range(self.n_layer):
+                _memcpy_d2h_ptr(st, stage.ctypes.data,
+                                self.kdev[li] + off, nb)
+                model.cache_k[li][pos0:pos0 + batch] = hrows
+                _memcpy_d2h_ptr(st, stage.ctypes.data,
+                                self.vdev[li] + off, nb)
+                model.cache_v[li][pos0:pos0 + batch] = hrows
+        else:
+            for li in range(self.n_layer):
+                _memcpy_d2h_ptr(st, model.cache_k[li].ctypes.data + off,
+                                self.kdev[li] + off, nb)
+                _memcpy_d2h_ptr(st, model.cache_v[li].ctypes.data + off,
+                                self.vdev[li] + off, nb)
         self.valid_upto = t_kv
         if not want_logits:
             return None
