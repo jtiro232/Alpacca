@@ -32,6 +32,16 @@ paths; both degrade to the exact v1/CPU behavior on any failure:
   written on the device and copied back inside the same sync, so the host
   cache remains the source of truth, and Model._chain_invalidate re-syncs
   exactly the rows any host path rewrites.
+- chain_prefill: whole prefill chunks on the same chain. The per-chunk
+  host glue the stage-2 paths still paid - numpy batch rope, rmsnorm,
+  residual adds, and an H2D/D2H ping-pong around every GEMM and the
+  attention (measured 10.6 s of the 8B's 17.6 s 4096-token prefill) -
+  moves into batch kernels chained device-side: one embedding upload per
+  chunk, K/V rows written straight into the decode mirror (which the
+  batched attention then READS, retiring the re-upload tax above), and
+  one synchronous copy-back of the chunk's K/V rows to the authoritative
+  host cache. Same gate, same fallback: any failure recomputes the chunk
+  on the exact existing path.
 
 The token embedding never uploads: it is a row-gather workload, the one
 shape these kernels are wrong for, and it must stay gatherable on the host.
@@ -843,6 +853,117 @@ def _init() -> dict:
         if t == 0:
             out[r] = res[r] + sh[0]
 
+    @cuda.jit(fastmath=True, cache=True)
+    def _rmsnorm_batch(X, w, out, eps):
+        # _rmsnorm_dev over a (batch, n) block, one block per row - the
+        # prefill chunk's tensor.rmsnorm. Same deterministic tree
+        # reduction per row as the decode kernel.
+        sh = cuda.shared.array(_TPB, float32)
+        r = cuda.blockIdx.x
+        t = cuda.threadIdx.x
+        n = X.shape[1]
+        acc = float32(0.0)
+        i = t
+        while i < n:
+            v = X[r, i]
+            acc += v * v
+            i += _TPB
+        sh[t] = acc
+        cuda.syncthreads()
+        i = _TPB // 2
+        while i > 0:
+            if t < i:
+                sh[t] += sh[t + i]
+            cuda.syncthreads()
+            i >>= 1
+        inv = float32(1.0) / math.sqrt(sh[0] / float32(n) + float32(eps))
+        i = t
+        while i < n:
+            out[r, i] = X[r, i] * inv * w[i]
+            i += _TPB
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _rope_store_batch(qk, v, cos_tab, sin_tab, bqk, bv, has_bqk,
+                          has_bv, n_head, n_rot, neox, Q, Kl, Vl, pos0):
+        # _rope_store_decode over a whole prefill chunk: the same thread
+        # jobs (rotation pairs for the q then k heads, pass-through dims,
+        # the v row) crossed with the chunk's rows; row b sits at
+        # absolute position pos0 + b, contiguous by construction
+        # (forward_batch's arange). Rotated q lands in the contiguous Q
+        # block the batched attention kernel reads; k and v go straight
+        # into the mirror rows at their absolute positions.
+        i = cuda.grid(1)
+        hd = Kl.shape[2]
+        n_kv = Kl.shape[1]
+        half = n_rot >> 1
+        nheads = n_head + n_kv
+        npair = nheads * half
+        ntail = nheads * (hd - n_rot)
+        jobs = npair + ntail + n_kv * hd
+        b = i // jobs
+        if b >= qk.shape[0]:
+            return
+        j = i - b * jobs
+        pos = pos0 + b
+        if j < npair:
+            hh = j // half
+            jj = j - hh * half
+            base = hh * hd
+            if neox:
+                a = base + jj
+                a2 = base + half + jj
+            else:
+                a = base + 2 * jj
+                a2 = base + 2 * jj + 1
+            x0 = qk[b, a]
+            x1 = qk[b, a2]
+            if has_bqk:
+                x0 += bqk[a]
+                x1 += bqk[a2]
+            c = cos_tab[pos, jj]
+            s = sin_tab[pos, jj]
+            y0 = x0 * c - x1 * s
+            y1 = x0 * s + x1 * c
+            if hh < n_head:
+                Q[b, hh, a - base] = y0
+                Q[b, hh, a2 - base] = y1
+            else:
+                Kl[pos, hh - n_head, a - base] = y0
+                Kl[pos, hh - n_head, a2 - base] = y1
+        elif j < npair + ntail:
+            k = j - npair
+            w2 = hd - n_rot
+            hh = k // w2
+            dd = n_rot + (k - hh * w2)
+            idx = hh * hd + dd
+            x0 = qk[b, idx]
+            if has_bqk:
+                x0 += bqk[idx]
+            if hh < n_head:
+                Q[b, hh, dd] = x0
+            else:
+                Kl[pos, hh - n_head, dd] = x0
+        else:
+            k = j - npair - ntail
+            kvh = k // hd
+            dd = k - kvh * hd
+            x0 = v[b, k]
+            if has_bv:
+                x0 += bv[k]
+            Vl[pos, kvh, dd] = x0
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _add_batch(res, src):
+        # res += src over a (batch, n) block: the prefill chunk's
+        # residual adds, which the CPU path does with one numpy `+`
+        n = res.shape[1]
+        total = res.shape[0] * n
+        i = cuda.grid(1)
+        if i < total:
+            b = i // n
+            j = i - b * n
+            res[b, j] += src[b, j]
+
     _state = {
         "ok": True, "np": np, "cuda": cuda, "rt": rt,
         "H2D": rt.cudaMemcpyKind.cudaMemcpyHostToDevice,
@@ -856,6 +977,8 @@ def _init() -> dict:
         "rmsnorm": _rmsnorm_dev, "rope_store": _rope_store_decode,
         "silu_mul": _silu_mul_dev, "silu_mul_batch": _silu_mul_batch,
         "matvec_res": _matvec_codes_res,
+        "rmsnorm_batch": _rmsnorm_batch,
+        "rope_store_batch": _rope_store_batch, "add_batch": _add_batch,
         # per-size activation buffers, reused across calls (a cudaMalloc
         # per matvec costs more than the transfer it serves), plus the
         # grow-only pinned/device staging pairs for batched matmul
@@ -894,8 +1017,8 @@ def vram_stats() -> dict[str, int]:
     st = _init()
     return {"matrices": st.get("matrices", 0),
             "uploaded_bytes": st.get("uploaded_bytes", 0),
-            # decode-chain K/V mirrors: device-resident but not weight
-            # uploads, so reported separately from the capped figure
+            # chain K/V mirrors + prefill scratch: device-resident but
+            # not weight uploads, so reported apart from the capped figure
             "chain_bytes": st.get("chain_bytes", 0),
             "skipped": st.get("skipped", 0)}
 
@@ -943,6 +1066,18 @@ def _memcpy_d2h_ptr_async(st, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
     err, = st["rt"].cudaMemcpyAsync(dst_ptr, src_ptr, nbytes, st["D2H"], 0)
     if int(err):
         raise RuntimeError(f"cudaMemcpyAsync D2H: {err}")
+
+
+def _memcpy_d2h_ptr(st, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Synchronous D2H to a raw host pointer (prefill's per-chunk K/V
+    copy-back lands straight in the host cache rows - pageable memory,
+    which the runtime synchronizes on anyway, so staging through a
+    pinned block would only add a host-side memcpy per layer). The
+    first such copy of a chunk is also the drain that makes restaging
+    the chunk's pinned upload buffer safe."""
+    err, = st["rt"].cudaMemcpy(dst_ptr, src_ptr, nbytes, st["D2H"])
+    if int(err):
+        raise RuntimeError(f"cudaMemcpy D2H: {err}")
 
 
 def _upload_x(st, x):
@@ -1523,16 +1658,25 @@ class DecodeChain:
     so the mirror re-uploads exactly the rows the host changed before the
     next chained token.
 
-    Built lazily on the first decoded token (mirror allocation + upload);
-    construction raises _ChainUnsupported for anything it cannot serve
-    bit-for-bit honestly - gemma-family forward passes (extra norms,
-    GELU, softcap, scaled embeddings), heads wider than _ATT_HD, degraded
-    or CPU-resident chain matrices - and chain_forward then parks the
-    chain permanently for that model instance. A TIED output head is not
-    a refusal: the final hidden vector downloads (that D2H is the one
-    sync) and the host computes the logits, since the tied embedding
-    never uploads. ANY runtime failure also parks the chain; the token
-    that failed is recomputed by the unchanged per-matvec path.
+    Built lazily on the first device-resident forward - the first
+    PREFILL chunk when chain_prefill runs, the first decoded token
+    otherwise (mirror allocation + upload); construction raises
+    _ChainUnsupported for anything it cannot serve bit-for-bit honestly
+    - gemma-family forward passes (extra norms, GELU, softcap, scaled
+    embeddings), heads wider than _ATT_HD, degraded or CPU-resident
+    chain matrices - and chain_forward then parks the chain permanently
+    for that model instance. A TIED output head is not a refusal: the
+    final hidden vector downloads (that D2H is the one sync) and the
+    host computes the logits, since the tied embedding never uploads.
+    ANY runtime failure also parks the chain; the token that failed is
+    recomputed by the unchanged per-matvec path.
+
+    The same instance serves prefill_chunk, the device-resident prefill
+    path: whole chunks run through the batch kernels with the chunk's
+    K/V rows written straight into this mirror (and copied back to the
+    authoritative host cache), so the batched attention reads the
+    mirror instead of re-uploading host K/V every chunk and the first
+    decoded token finds valid_upto already at n_past.
     """
 
     def __init__(self, model):
@@ -1622,6 +1766,10 @@ class DecodeChain:
             np_.ascontiguousarray(model._rope_cos, dtype=np_.float32))
         self.dsin = cuda.to_device(
             np_.ascontiguousarray(model._rope_sin, dtype=np_.float32))
+        # absolute positions 0..n_ctx-1: prefill chunks pass the
+        # [pos0, pos0+batch) slice to the batched attention kernel, so
+        # no per-chunk positions upload ever happens
+        self.dpos_all = cuda.to_device(np_.arange(n_ctx, dtype=np_.int32))
 
         def dev_vec(v, size, role):
             if v is None:
@@ -1694,9 +1842,15 @@ class DecodeChain:
         half = hp.n_rot // 2
         rope_jobs = ((hp.n_head + hp.n_kv) * half
                      + (hp.n_head + hp.n_kv) * (hd - hp.n_rot) + kvd)
+        self.rope_jobs = rope_jobs  # per row; prefill_chunk scales by batch
         self.rope_blocks = (rope_jobs + _TPB - 1) // _TPB
         self.silu_blocks = (hp.n_ff + _TPB - 1) // _TPB
         self.valid_upto = 0  # device-mirror rows in sync with the host
+        # prefill scratch: grow-only device buffers (see _pbuf) plus the
+        # pinned staging for the chunk's one embedding upload, allocated
+        # on first use so a decode-only run pays nothing
+        self._pdev = {}
+        self._hpx = None
 
     def __del__(self):
         try:
@@ -1731,6 +1885,152 @@ class DecodeChain:
             hv[...] = model.cache_v[li][a:b]
             _memcpy_h2d_ptr(st, self.vdev[li] + a * self.rowb,
                             stage.ctypes.data, n * 4)
+
+    def _pbuf(self, st, key: str, n: int):
+        """Grow-only device scratch for the prefill path (one chunk's
+        activations). Chain-owned rather than module-level pools so a
+        freed model releases the VRAM with its mirror; growth is charged
+        to chain_bytes alongside the mirror (visibility, not budget)."""
+        buf = self._pdev.get(key)
+        if buf is None or buf.size < n:
+            grown = (n - buf.size if buf is not None else n) * 4
+            buf = st["cuda"].device_array(n, st["np"].float32)
+            self._pdev[key] = buf
+            st["chain_bytes"] = st.get("chain_bytes", 0) + grown
+            self._mirror_bytes += grown
+        return buf[:n]
+
+    def _pinned_x(self, st, n: int):
+        """Grow-only pinned staging for the chunk's embedding upload."""
+        buf = self._hpx
+        if buf is None or buf.size < n:
+            buf = st["cuda"].pinned_array(n, st["np"].float32)
+            self._hpx = buf
+        return buf
+
+    def prefill_chunk(self, model, tokens: list[int], want_logits: bool):
+        """One prefill chunk fully on the device; returns the last row's
+        logits, or None when want_logits is False. The caller
+        (Model.forward_batch via chain_prefill) advances n_past on
+        success, exactly as its own body would have.
+
+        The chunk's embedding rows gather on the host (token_embd never
+        uploads) and ride ONE H2D; everything between - batch rmsnorm,
+        the qkv GEMMs, batch rope with the K/V rows stored straight into
+        the decode mirror, batched GQA attention reading the mirror (no
+        per-chunk K/V re-upload, the tax the attention_batch wrapper
+        documents), the output/down GEMMs, silu*up and the residual adds
+        - stays device-resident. Downloads: the chunk's K/V rows into
+        the authoritative host cache (one synchronous copy-back stage
+        per chunk, two copies per layer because the mirror is per-layer
+        arrays; the first also drains the queued kernels, making the
+        pinned staging reusable - the same contract every sync D2H in
+        this file relies on), plus the logits or hidden row when the
+        caller wants them. valid_upto then covers the chunk, so the
+        first decoded token skips its bulk mirror upload."""
+        st = _init()
+        np_ = st["np"]
+        batch = len(tokens)
+        pos0 = model.n_past
+        if pos0 + batch > self.n_ctx:
+            raise RuntimeError("device K/V mirror full")
+        if self.valid_upto < pos0:
+            # prefix reuse restarted above the synced watermark: fill
+            # the gap from the host cache, the decode step's own copy
+            self._sync_mirror(st, model, self.valid_upto, pos0)
+        self.valid_upto = pos0  # rows from here on are rewritten below
+        from . import tensor as T
+        x = np_.ascontiguousarray(T.matrix_rows(model.tok_embd, tokens),
+                                  dtype=np_.float32)
+        n_x = batch * self.n_embd
+        hX = self._pinned_x(st, n_x)
+        hX[:n_x] = x.reshape(-1)
+        dX = self._pbuf(st, "x", n_x).reshape(batch, self.n_embd)
+        _memcpy_h2d_async(st, dX, hX, n_x * 4)
+        dH = self._pbuf(st, "h", n_x).reshape(batch, self.n_embd)
+        dO = self._pbuf(st, "o", n_x).reshape(batch, self.n_embd)
+        dqk = self._pbuf(st, "qk", batch * (self.qd + self.kvd)).reshape(
+            batch, self.qd + self.kvd)
+        dv = self._pbuf(st, "v", batch * self.kvd).reshape(batch, self.kvd)
+        dQ = self._pbuf(st, "q3", batch * self.qd).reshape(
+            batch, self.n_head, self.hd)
+        datt = self._pbuf(st, "att", batch * self.qd).reshape(
+            batch, self.n_head, self.hd)
+        dgu = self._pbuf(st, "gu", batch * 2 * self.n_ff).reshape(
+            batch, 2 * self.n_ff)
+        dact = self._pbuf(st, "act", batch * self.n_ff).reshape(
+            batch, self.n_ff)
+        dpos = self.dpos_all[pos0:pos0 + batch]
+
+        rms = st["rmsnorm_batch"]
+        rope = st["rope_store_batch"]
+        attb = st["att_batch"]
+        smul = st["silu_mul_batch"]
+        addb = st["add_batch"]
+        eps = self.eps
+        t_kv = pos0 + batch
+        rope_blocks = (batch * self.rope_jobs + _TPB - 1) // _TPB
+        add_blocks = (n_x + _TPB - 1) // _TPB
+        silu_blocks = (batch * self.n_ff + _TPB - 1) // _TPB
+        att_gx = (batch * self.group + _ATT_R - 1) // _ATT_R
+
+        def gemm(gmat, din, dout):
+            if gmat._dead:
+                raise RuntimeError("matrix degraded mid-chain")
+            _launch_gemm(st, gmat, din, dout, batch)
+
+        for li, (dn1, wqk, wq, wk, wv, wo, dn2, wgu, wg, wu, wdown,
+                 dbqk, has_bqk, dbv, has_bv) in enumerate(self.layers):
+            rms[batch, _TPB](dX, dn1, dH, eps)
+            if wqk is not None:
+                gemm(wqk, dH, dqk)
+            else:
+                gemm(wq, dH, dqk[:, :self.qd])
+                gemm(wk, dH, dqk[:, self.qd:])
+            gemm(wv, dH, dv)
+            rope[rope_blocks, _TPB](
+                dqk, dv, self.dcos, self.dsin,
+                self.dqk if dbqk is None else dbqk,
+                self.dvt if dbv is None else dbv,
+                has_bqk, has_bv, self.n_head, self.n_rot, self.neox,
+                dQ, self.dK[li], self.dV[li], pos0)
+            attb[(att_gx, self.n_kv), _ATT_TPB](
+                dQ, self.dK[li][:t_kv], self.dV[li][:t_kv], dpos,
+                datt, self.group, self.inv_sqrt, 0, 0)
+            gemm(wo, datt.reshape(batch, self.qd), dO)
+            addb[add_blocks, _TPB](dX, dO)
+            rms[batch, _TPB](dX, dn2, dH, eps)
+            if wgu is not None:
+                gemm(wgu, dH, dgu)
+            else:
+                gemm(wg, dH, dgu[:, :self.n_ff])
+                gemm(wu, dH, dgu[:, self.n_ff:])
+            smul[silu_blocks, _TPB](dgu, dact)
+            gemm(wdown, dact, dO)
+            addb[add_blocks, _TPB](dX, dO)
+
+        # host cache stays authoritative: the chunk's mirror rows come
+        # home now (and drain everything queued above)
+        nb = batch * self.rowb
+        off = pos0 * self.rowb
+        for li in range(self.n_layer):
+            _memcpy_d2h_ptr(st, model.cache_k[li].ctypes.data + off,
+                            self.kdev[li] + off, nb)
+            _memcpy_d2h_ptr(st, model.cache_v[li].ctypes.data + off,
+                            self.vdev[li] + off, nb)
+        self.valid_upto = t_kv
+        if not want_logits:
+            return None
+        rms_row = st["rmsnorm"]
+        rms_row[1, _TPB](dX[batch - 1], self.dnorm_out, self.dh, eps)
+        if self.out_gm is not None and not self.out_gm._dead:
+            _launch_mv(st, self.out_gm, self.dh, self.dlogits)
+            _memcpy_d2h(st, self.hlog, self.dlogits, self.n_vocab * 4)
+            return np_.array(self.hlog)
+        # tied (or degraded) head: hidden row home, host projects - the
+        # same split step() uses
+        _memcpy_d2h(st, self.hxout, self.dh, self.n_embd * 4)
+        return T.matvec(model.output, np_.array(self.hxout))
 
     def step(self, model, token: int):
         """Decode one token fully on the device; returns logits. The
@@ -1848,6 +2148,55 @@ def chain_forward(model, token: int):
         return None
 
 
+def chain_prefill(model, tokens, want_logits: bool):
+    """One device-resident prefill chunk for `model`, or None when the
+    path is unavailable - the caller (Model.forward_batch) then runs its
+    existing body, which is always correct. Success is a 1-tuple
+    carrying the logits (None inside it when want_logits is False, so a
+    legitimately logits-free chunk is distinguishable from a refusal).
+
+    Shares the decode chain's gate and instance: llama-class geometry,
+    every chain matrix resident, and ALPACCA_GPU_CHAIN=0 refuses both
+    paths - no knob of its own. The chain now builds at the first
+    prefill chunk rather than the first decoded token, so the chunk's
+    K/V rows land in the mirror as they are computed and the decode
+    chain's bulk mirror upload becomes a no-op. Batch 1 stays on the
+    existing path (GEMM batch 1 rides the matvec kernel there,
+    bit-identical with decode - see GpuMatrix.matmul_t). ANY runtime
+    failure parks the prefill path for this model instance with one
+    line, and the caller recomputes the failed chunk; the decode chain
+    keeps its own verdict (though a chain that failed on ITS side also
+    takes this path down, since the mirror dies with the instance)."""
+    st = _init()
+    if not st.get("ok") or len(tokens) < 2:
+        return None
+    if model._gpu_prefill_dead:
+        return None
+    ch = model._gpu_chain
+    if ch is None:
+        if model._gpu_chain_dead or _chain_env_off():
+            return None
+        try:
+            ch = DecodeChain(model)
+        except _ChainUnsupported:
+            model._gpu_chain_dead = True
+            return None
+        except Exception as e:
+            model._gpu_chain_dead = True
+            print(f"alpacca-gpu: decode chain unavailable "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
+            return None
+        model._gpu_chain = ch
+    try:
+        return (ch.prefill_chunk(model, tokens, want_logits),)
+    except Exception as e:
+        model._gpu_prefill_dead = True
+        print(f"alpacca-gpu: device prefill disabled ({type(e).__name__}: "
+              f"{e}); prefill continues on the existing path",
+              file=sys.stderr)
+        return None
+
+
 def warmup() -> None:
     """Trigger JIT compilation once (cached on disk afterwards)."""
     st = _init()
@@ -1894,6 +2243,18 @@ def warmup() -> None:
         for neox in (False, True):
             st["rope_store"][1, _TPB](qk8, v4, ctab, ctab, qk8, v4,
                                       False, False, 1, 4, neox, Kl, Vl, 0)
+        # prefill-chain batch kernels, so the first device chunk pays no
+        # JIT compile either
+        ob = cuda.device_array((2, 32), np_.float32)
+        st["rmsnorm_batch"][2, _TPB](dX, x, ob, 1e-5)
+        st["add_batch"][1, _TPB](ob, dX)
+        qkb = cuda.to_device(np_.zeros((2, 8), np_.float32))
+        vb = cuda.to_device(np_.zeros((2, 4), np_.float32))
+        Qb = cuda.device_array((2, 1, 4), np_.float32)
+        for neox in (False, True):
+            st["rope_store_batch"][1, _TPB](qkb, vb, ctab, ctab, qk8, v4,
+                                            False, False, 1, 4, neox,
+                                            Qb, Kl, Vl, 0)
         adec = cuda.device_array(4, np_.float32)
         pm = cuda.device_array((1, 1), np_.float32)
         pl = cuda.device_array((1, 1), np_.float32)
@@ -1911,5 +2272,6 @@ def warmup() -> None:
 
 
 __all__ = ["DecodeChain", "GpuMatrix", "NUMBA_CUDA_PIN", "attention_batch",
-           "available", "chain_forward", "doctor_line", "ffn_swiglu_batch",
-           "gpu_matrix", "status", "upload_vector", "vram_stats", "warmup"]
+           "available", "chain_forward", "chain_prefill", "doctor_line",
+           "ffn_swiglu_batch", "gpu_matrix", "status", "upload_vector",
+           "vram_stats", "warmup"]

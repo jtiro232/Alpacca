@@ -188,8 +188,11 @@ class Model:
     _use_kernel_attention = False
     _use_gpu_batch_attention = False
     _use_gpu_chain = False
-    _gpu_chain = None          # built lazily by cuda.chain_forward
+    _gpu_chain = None          # built lazily by cuda.chain_prefill/_forward
     _gpu_chain_dead = False    # any chain failure parks it for good
+    _gpu_prefill_dead = False  # ...and any prefill-chunk failure parks
+    #                            the device prefill path (decode chain
+    #                            keeps its own verdict)
 
     def __init__(self, hp: Hyperparams, tokenizer: Tokenizer):
         self.hp = hp
@@ -919,6 +922,21 @@ class Model:
             return None
         if self.n_past + len(tokens) > self.n_ctx:
             raise RuntimeError(f"context window full ({self.n_ctx} tokens)")
+
+        if self._use_gpu_chain and len(tokens) > 1:
+            # device-resident prefill chunk (alpacca/cuda.py): the whole
+            # chunk on the GPU with one embedding upload, the K/V rows
+            # written straight into the decode mirror and copied back to
+            # the host cache. None means unavailable or just failed -
+            # the body below recomputes the chunk correctly, and a
+            # failed prefill path never activates again; a 1-tuple is
+            # success even when no logits were wanted.
+            from . import cuda as _gpu
+            res = _gpu.chain_prefill(self, tokens, want_logits)
+            if res is not None:
+                self.n_past += len(tokens)
+                self.cached_ids.extend(tokens)
+                return res[0]
 
         hp = self.hp
         pos0 = self.n_past
