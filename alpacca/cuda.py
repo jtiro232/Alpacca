@@ -12,13 +12,29 @@ or with ``ALPACCA_GPU=0`` - nothing changes: the CPU tiers (kernels/NumPy/
 pure) remain the reference implementations and the fallback, and any error
 in this tier degrades to them rather than failing the engine.
 
-v1 placement: only weight matrices move to VRAM, and only whole matrices -
+Placement: weight matrices move to VRAM at load, and only whole matrices -
 per-matrix dispatch makes mixed GPU/CPU placement exact, so running out of
-VRAM mid-load just leaves the rest on the CPU tiers. Activations, the KV
-cache and attention stay host-side; each matvec uploads one activation
-vector and downloads one result (measured tax below). The token embedding
-never uploads: it is a row-gather workload, the one shape these kernels
-are wrong for, and it must stay gatherable on the host.
+VRAM mid-load just leaves the rest on the CPU tiers. The host KV cache
+stays authoritative (prefill's prefix reuse and truncation are untouched).
+On top of the v1 per-matvec/GEMM dispatch this file adds two stage-2
+paths; both degrade to the exact v1/CPU behavior on any failure:
+
+- attention_batch: prefill's batched causal GQA - the O(n^2) share that
+  made long prompts degrade with length - runs on the device with an
+  online softmax. The per-layer K/V slice re-uploads from the host cache
+  every chunk (measured tax in the wrapper docstring), far cheaper than
+  the einsum it replaces.
+- chain_forward: when EVERY chain matrix of a llama-class model is
+  resident, whole-token decode runs device-side (rmsnorm, rope, GQA over
+  a device K/V mirror, silu*up, residual adds) with ONE synchronization -
+  the logits download - per token, instead of a sync D2H per matvec. The
+  mirror uploads once after prefill; each decoded token's new K/V row is
+  written on the device and copied back inside the same sync, so the host
+  cache remains the source of truth, and Model._chain_invalidate re-syncs
+  exactly the rows any host path rewrites.
+
+The token embedding never uploads: it is a row-gather workload, the one
+shape these kernels are wrong for, and it must stay gatherable on the host.
 
 Pin policy: numba-cuda is locked to ``NUMBA_CUDA_PIN`` below, mirroring
 the kernels tier. The pin is never updated implicitly; a different
@@ -33,12 +49,13 @@ below therefore compiles and RUNS a real kernel, catches Exception
 broadly, and reports the cause through status() instead of activating a
 tier that cannot launch.
 
-Buffer reuse contract: the per-size pinned/device activation buffers are
-not synchronized for concurrent matvec callers - alpacca's own server
-serializes generation behind a lock, same caveat as the hot-weight cache
-in :mod:`alpacca.qmatrix`. Every matvec ends with a synchronous D2H on the
+Buffer reuse contract: the per-size pinned/device activation buffers (and
+the grow-only batched-matmul staging pair) are not synchronized for
+concurrent callers - alpacca's own server serializes generation behind a
+lock, same caveat as the hot-weight cache in :mod:`alpacca.qmatrix`.
+Every matvec and every batched matmul ends with a synchronous D2H on the
 legacy default stream, which drains the queued async H2D and kernel, so
-rewriting the staging buffer on the next call is safe.
+rewriting the staging buffers on the next call is safe.
 """
 
 from __future__ import annotations
@@ -60,33 +77,68 @@ GPU_RESERVE_MB = 512
 # reduction width, so it must stay a power of two.
 _TPB = 256
 
-# Wide-matmul tile shape: 32 batch lanes (one warp, coalesced activation
-# reads) x 8 rows per block.
-_MM_BATCH_TILE = 32
-_MM_ROW_TILE = 8
+# Tiled-GEMM block geometry for the batched matmul (prefill path). One
+# thread block computes a (_GEMM_ROWS x _GEMM_BT) output tile: threadIdx.x
+# walks rows (coalesced code loads and stores), threadIdx.y walks batch
+# lanes, and each thread keeps a 4-row x 2-batch-lane micro-tile in
+# registers. Both block shapes measured on the 8B layer set (RTX 4090,
+# batch 256, kernel time summed over wgu+wdown+wo+wqk+wv, best of 5):
+# 16x16 threads (64 rows x 32 batch tile) 12.00 ms, 32x8 threads (128
+# rows x 16 batch tile) 14.60 ms - the codes stream re-reads VRAM once
+# per batch tile, so the shape with the wider batch tile reads the
+# dominant stream half as often. 16x16 kept (10.0 TFLOP/s on the fused
+# ffn matrix).
+# This one kernel replaced the old wide-kernel/looped-matvec pair and the
+# ALPACCA_GPU_WIDE_MATMUL_ELEMS crossover knob that picked between them:
+# decoding each code tile into shared memory once removes the redundant
+# per-batch-lane unpack that made both old paths lose, at every size, so
+# the knob (and the env var, now silently ignored) had nothing left to
+# choose. Column tiles stage through shared memory padded by one float so
+# neither the batch-lane reads nor the row reads bank-conflict.
+_GEMM_TX = 16                     # row lanes per block (threadIdx.x)
+_GEMM_TY = 16                     # batch lanes per block (threadIdx.y)
+_GEMM_ROWS = 4 * _GEMM_TX         # output rows per block (4 row regs/thread)
+_GEMM_BT = 2 * _GEMM_TY           # output batch per block (2 lanes/thread)
+_GEMM_COLS = 64                   # staged column tile, float32 elements
+_GEMM_PAD = _GEMM_COLS + 1        # +1: shared.array shapes must be plain
+#                                   module constants (inline arithmetic in
+#                                   the shape tuple fails numba's typing)
+_GEMM_WORDS = _GEMM_COLS // 4     # same tile in packed int32 code words
+_GEMM_TPB = _GEMM_TX * _GEMM_TY
+
+# Batched-attention block geometry (prefill path). One block owns _ATT_R
+# (token, q-head) rows that all attend through one kv head and streams K/V
+# tiles of _ATT_TS positions through shared memory with an online
+# (rescaling) softmax, so no (t_q, t_kv) score matrix ever exists and any
+# context length fits. The layout requires _ATT_TPB == _ATT_R * _ATT_TS/2:
+# the score phase gives each thread two tile columns of one row (3 shared
+# loads feed 2 FMAs), the accumulate phase two rows of one dim column
+# (same ratio). Head widths above _ATT_HD (the Gemma family's 256) stay on
+# the NumPy path: the shared tiles are sized at compile time and four
+# 16x128-float tiles already fill ~35 KiB of the 48 KiB block budget.
+_ATT_HD = 128                 # widest head these tiles serve
+_ATT_HDP = _ATT_HD + 4        # padded stride keeps row and column reads
+#                               off the same shared-memory banks
+_ATT_R = 16                   # (token, q-head) rows per block
+_ATT_RH = _ATT_R // 2         # dual-row micro-tile, accumulate phase
+_ATT_TS = 16                  # K/V tile length along the sequence
+_ATT_TPB = 128                # _ATT_R * _ATT_TS // 2, see above
+
+# Decode-attention geometry (device chain): one block per (q head,
+# _DEC_SPLIT-position chunk of the context), each producing an online-
+# softmax partial (m, l, unnormalized acc) that a tiny combine kernel
+# merges per head. The split exists because one-block-per-head leaves
+# the card idle at depth: 32 blocks reading the 8B's K/V rows measured
+# 26.1 tok/s at a 4400-token context, the split form 53.0 - a bandwidth-
+# bound scan needs blocks proportional to the context, not the head
+# count. Only the score tile lives in shared memory; K/V rows are read
+# straight from the mirror, contiguous in both phases (per-thread in the
+# score phase, per-position across threads in the accumulate phase).
+_DEC_TS = 512
+_DEC_SPLIT = 512              # context rows per partial block
+_DEC_TPB = 128
 
 _state: dict | None = None  # lazy: {"ok": True, ...} or {} / {"error"} off
-
-
-# Batched matmul picks between two kernels by MATRIX size, not batch: the
-# looped matvec is Python-launch-bound at prefill batches (256 launches
-# make it a flat ~27 ms whatever the shape), while the 2-D wide kernel is
-# one launch but ALU-bound on the byte unpack (~830 GFLOP/s). Milliseconds
-# at batch 256 (RTX 4090):
-#     elements   1.0M  4.2M  16.8M  33.6M  58.7M
-#     looped     27.3  23.9   26.9   28.7   27.5
-#     wide        2.9   5.8   16.2   28.6   36.9
-# They cross at ~34M elements - VRAM streaming beats redundant decode only
-# once the codes dwarf the launch overhead. Below the big-matrix regime
-# the wide kernel also wins every batch >= 2 (fewer launches, same reads).
-# Default is just under the measured tie; a knob so different hardware can
-# re-measure rather than re-guess.
-def _wide_matmul_max_elems() -> int:
-    raw = os.environ.get("ALPACCA_GPU_WIDE_MATMUL_ELEMS", "")
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 32 << 20
 
 
 def _vram_cap_bytes() -> int:
@@ -223,19 +275,542 @@ def _init() -> dict:
             out[r] = sh[0]
 
     @cuda.jit(fastmath=True, cache=True)
-    def _matmul_codes_wide(qw, d, m, xt, out, shift, affine):
-        # xt (cols, batch) so the 32 batch lanes of a warp read
-        # consecutive floats; out (rows, batch) keeps the store coalesced
-        # and the host transposes after download (same trade the CPU wide
-        # kernel documents). Used below the _wide_matmul_max_elems
-        # crossover, where one launch beats one launch per batch row.
-        b = cuda.blockIdx.y * _MM_BATCH_TILE + cuda.threadIdx.x
-        r = cuda.blockIdx.x * _MM_ROW_TILE + cuda.threadIdx.y
-        if r >= out.shape[0] or b >= out.shape[1]:
-            return
+    def _matmul_codes_gemm(qw, d, m, X, out, shift, affine):
+        # out[b, r] = sum_c (d[r, c>>shift] * code + m[...]) * X[b, c]:
+        # one launch for ANY matrix and batch size. Classic shared-memory
+        # tiling, with the twist that the staged weight tile is DECODED
+        # once per block - each int32 word unpacks its four codes and
+        # applies the effective scale (and offset: folding m per element
+        # is the exact affine algebra, so no separate x-sub-sums term)
+        # straight into shared memory. The old wide kernel re-decoded
+        # every code once per batch lane; here the unpack cost is divided
+        # by the batch tile and the inner loop is pure f32 FMA on shared
+        # memory. Ragged edges (rows, batch, cols not multiples of the
+        # tile) zero-fill the staging tiles, which contribute nothing.
+        Xs = cuda.shared.array((_GEMM_BT, _GEMM_PAD), float32)
+        Ws = cuda.shared.array((_GEMM_ROWS, _GEMM_PAD), float32)
+        tx = cuda.threadIdx.x
+        ty = cuda.threadIdx.y
+        tid = ty * _GEMM_TX + tx
+        batch = out.shape[0]
+        rows = out.shape[1]
+        cols = X.shape[1]
+        cw = qw.shape[1]
+        r0 = cuda.blockIdx.x * _GEMM_ROWS
+        b0 = cuda.blockIdx.y * _GEMM_BT
+        acc0a = float32(0.0)
+        acc1a = float32(0.0)
+        acc2a = float32(0.0)
+        acc3a = float32(0.0)
+        acc0b = float32(0.0)
+        acc1b = float32(0.0)
+        acc2b = float32(0.0)
+        acc3b = float32(0.0)
+        w0 = 0
+        while w0 < cw:
+            # stage the activation tile: consecutive threads read
+            # consecutive columns of one X row - coalesced
+            i = tid
+            while i < _GEMM_BT * _GEMM_COLS:
+                bi = i // _GEMM_COLS
+                ci = i - bi * _GEMM_COLS
+                b = b0 + bi
+                c = (w0 << 2) + ci
+                v = float32(0.0)
+                if b < batch and c < cols:
+                    v = X[b, c]
+                Xs[bi, ci] = v
+                i += _GEMM_TPB
+            # decode the weight tile: consecutive threads read
+            # consecutive int32 words of one code row - coalesced, four
+            # codes per load (the matvec kernel's trick), decoded once
+            # per block instead of once per batch lane
+            i = tid
+            while i < _GEMM_ROWS * _GEMM_WORDS:
+                ri = i // _GEMM_WORDS
+                wi = i - ri * _GEMM_WORDS
+                r = r0 + ri
+                w = w0 + wi
+                ci = wi << 2
+                if r < rows and w < cw:
+                    v = qw[r, w]
+                    s = (w << 2) >> shift  # words never straddle a sub-block
+                    ds = d[r, s]
+                    e0 = float32(((v & int32(0xFF)) ^ int32(0x80))
+                                 - int32(0x80))
+                    e1 = float32((((v >> 8) & int32(0xFF)) ^ int32(0x80))
+                                 - int32(0x80))
+                    e2 = float32((((v >> 16) & int32(0xFF)) ^ int32(0x80))
+                                 - int32(0x80))
+                    e3 = float32((((v >> 24) & int32(0xFF)) ^ int32(0x80))
+                                 - int32(0x80))
+                    if affine:
+                        ms = m[r, s]
+                        Ws[ri, ci] = ds * e0 + ms
+                        Ws[ri, ci + 1] = ds * e1 + ms
+                        Ws[ri, ci + 2] = ds * e2 + ms
+                        Ws[ri, ci + 3] = ds * e3 + ms
+                    else:
+                        Ws[ri, ci] = ds * e0
+                        Ws[ri, ci + 1] = ds * e1
+                        Ws[ri, ci + 2] = ds * e2
+                        Ws[ri, ci + 3] = ds * e3
+                else:
+                    Ws[ri, ci] = float32(0.0)
+                    Ws[ri, ci + 1] = float32(0.0)
+                    Ws[ri, ci + 2] = float32(0.0)
+                    Ws[ri, ci + 3] = float32(0.0)
+                i += _GEMM_TPB
+            cuda.syncthreads()
+            # 4 rows x 2 batch lanes per thread: 6 shared loads feed 8
+            # FMAs, vs 5-for-4 with a single lane - the inner loop is
+            # shared-bandwidth-bound, so fewer loads per FMA is the win
+            for ci in range(_GEMM_COLS):
+                xa = Xs[ty, ci]
+                xb = Xs[ty + _GEMM_TY, ci]
+                wv = Ws[tx, ci]
+                acc0a += wv * xa
+                acc0b += wv * xb
+                wv = Ws[tx + _GEMM_TX, ci]
+                acc1a += wv * xa
+                acc1b += wv * xb
+                wv = Ws[tx + 2 * _GEMM_TX, ci]
+                acc2a += wv * xa
+                acc2b += wv * xb
+                wv = Ws[tx + 3 * _GEMM_TX, ci]
+                acc3a += wv * xa
+                acc3b += wv * xb
+            cuda.syncthreads()
+            w0 += _GEMM_WORDS
+        b = b0 + ty
+        if b < batch:
+            r = r0 + tx
+            if r < rows:
+                out[b, r] = acc0a
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc1a
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc2a
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc3a
+        b += _GEMM_TY
+        if b < batch:
+            r = r0 + tx
+            if r < rows:
+                out[b, r] = acc0b
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc1b
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc2b
+            r += _GEMM_TX
+            if r < rows:
+                out[b, r] = acc3b
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _attention_batch_gqa(Q, K, V, positions, out, group, inv_sqrt,
+                             window, kv_start):
+        # Batched causal grouped-query attention: the exact math of
+        # model._attention_batch_np / _batch_window_np, with an online
+        # softmax so no (t_q, t_kv) score matrix is ever materialized.
+        # Per K/V tile each row keeps a running max m and weight sum l,
+        # rescales its partial output by exp(m_old - m_new), and masked
+        # entries carry weight exactly 0.0 - the same weight the
+        # reference's -1e30 fill produces once its max-subtracted exp
+        # underflows. -3.4e38 is the mask sentinel; real scores sit tens
+        # of orders of magnitude above it. blockIdx.y picks the kv head,
+        # blockIdx.x a tile of _ATT_R (token, q-head) rows attending
+        # through it, so every staged K/V tile is reused _ATT_R times.
+        Qs = cuda.shared.array((_ATT_R, _ATT_HDP), float32)
+        Ks = cuda.shared.array((_ATT_TS, _ATT_HDP), float32)
+        Vs = cuda.shared.array((_ATT_TS, _ATT_HDP), float32)
+        Os = cuda.shared.array((_ATT_R, _ATT_HDP), float32)
+        Ss = cuda.shared.array((_ATT_R, _ATT_TS), float32)
+        mrow = cuda.shared.array(_ATT_R, float32)
+        lrow = cuda.shared.array(_ATT_R, float32)
+        arow = cuda.shared.array(_ATT_R, float32)
+        prow = cuda.shared.array(_ATT_R, int32)
+        pmax = cuda.shared.array(1, int32)
+        tid = cuda.threadIdx.x
+        kh = cuda.blockIdx.y
+        r0 = cuda.blockIdx.x * _ATT_R
+        t_q = Q.shape[0]
+        hd = Q.shape[2]
+        t_kv = K.shape[0]
+        nrows = t_q * group
+        scale = float32(inv_sqrt)
+
+        i = tid
+        while i < _ATT_R * hd:
+            j = i // hd
+            dd = i - j * hd
+            gr = r0 + j
+            qv = float32(0.0)
+            if gr < nrows:
+                ti = gr // group
+                qv = Q[ti, kh * group + (gr - ti * group), dd]
+            Qs[j, dd] = qv
+            Os[j, dd] = float32(0.0)
+            i += _ATT_TPB
+        if tid < _ATT_R:
+            gr = r0 + tid
+            p = -1
+            if gr < nrows:
+                p = positions[gr // group]
+            prow[tid] = p
+            mrow[tid] = float32(-3.4e38)
+            lrow[tid] = float32(0.0)
+        cuda.syncthreads()
+        if tid == 0:
+            pm = -1
+            for j in range(_ATT_R):
+                if prow[j] > pm:
+                    pm = prow[j]
+            pmax[0] = pm
+        cuda.syncthreads()
+
+        s0 = 0
+        while s0 < t_kv:
+            if kv_start + s0 > pmax[0]:
+                break  # causal: nothing right of the newest row's position
+            i = tid
+            while i < _ATT_TS * hd:
+                ss = i // hd
+                dd = i - ss * hd
+                s = s0 + ss
+                kv = float32(0.0)
+                vv = float32(0.0)
+                if s < t_kv:
+                    kv = K[s, kh, dd]
+                    vv = V[s, kh, dd]
+                Ks[ss, dd] = kv
+                Vs[ss, dd] = vv
+                i += _ATT_TPB
+            cuda.syncthreads()
+            # score phase: two tile columns per thread, one shared q-row
+            # load feeding both dots
+            j = tid >> 3
+            c0 = tid & 7
+            acc0 = float32(0.0)
+            acc1 = float32(0.0)
+            for dd in range(hd):
+                qv = Qs[j, dd]
+                acc0 += qv * Ks[c0, dd]
+                acc1 += qv * Ks[c0 + 8, dd]
+            pj = prow[j]
+            sc0 = float32(-3.4e38)
+            sc1 = float32(-3.4e38)
+            sa = kv_start + s0 + c0
+            if pj >= 0 and s0 + c0 < t_kv and sa <= pj and \
+                    (window <= 0 or sa > pj - window):
+                sc0 = acc0 * scale
+            sa = kv_start + s0 + c0 + 8
+            if pj >= 0 and s0 + c0 + 8 < t_kv and sa <= pj and \
+                    (window <= 0 or sa > pj - window):
+                sc1 = acc1 * scale
+            Ss[j, c0] = sc0
+            Ss[j, c0 + 8] = sc1
+            cuda.syncthreads()
+            if tid < _ATT_R:
+                m_old = mrow[tid]
+                mt = m_old
+                for ss in range(_ATT_TS):
+                    if Ss[tid, ss] > mt:
+                        mt = Ss[tid, ss]
+                # all-masked tile: mt stays m_old, alpha is exp(0) = 1
+                # and every weight below is 0 - an exact no-op
+                alpha = math.exp(m_old - mt)
+                psum = float32(0.0)
+                for ss in range(_ATT_TS):
+                    p2 = float32(0.0)
+                    if Ss[tid, ss] > float32(-1.0e37):
+                        p2 = math.exp(Ss[tid, ss] - mt)
+                    Ss[tid, ss] = p2
+                    psum += p2
+                mrow[tid] = mt
+                lrow[tid] = lrow[tid] * alpha + psum
+                arow[tid] = alpha
+            cuda.syncthreads()
+            # accumulate phase: two rows per thread, one shared V load
+            # feeding both FMAs
+            i = tid
+            while i < _ATT_RH * hd:
+                j0 = i // hd
+                dd = i - j0 * hd
+                j1 = j0 + _ATT_RH
+                a0 = Os[j0, dd] * arow[j0]
+                a1 = Os[j1, dd] * arow[j1]
+                for ss in range(_ATT_TS):
+                    vv = Vs[ss, dd]
+                    a0 += Ss[j0, ss] * vv
+                    a1 += Ss[j1, ss] * vv
+                Os[j0, dd] = a0
+                Os[j1, dd] = a1
+                i += _ATT_TPB
+            cuda.syncthreads()
+            s0 += _ATT_TS
+
+        i = tid
+        while i < _ATT_R * hd:
+            j = i // hd
+            dd = i - j * hd
+            gr = r0 + j
+            if gr < nrows:
+                ov = float32(0.0)
+                if lrow[j] > float32(0.0):
+                    ov = Os[j, dd] / lrow[j]
+                ti = gr // group
+                out[ti, kh * group + (gr - ti * group), dd] = ov
+            i += _ATT_TPB
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _attention_decode_part(q, Kl, Vl, pm, pl, pacc, t, group, inv_sqrt):
+        # Single-token GQA over the device K/V mirror, one online-softmax
+        # PARTIAL per block: blockIdx.x is the q head, blockIdx.y a
+        # _DEC_SPLIT-row chunk of the context (see the geometry comment).
+        # Score phase: each thread dots q (shared) against whole K rows -
+        # per-thread contiguous reads. Accumulate phase: threads own
+        # output dims, so each tile position is one coalesced V-row read.
+        # No mask: decode attends to every cached position, exactly like
+        # the CPU decode attention. Emits (m, l, unnormalized acc).
+        Ss = cuda.shared.array(_DEC_TS, float32)
+        red = cuda.shared.array(_DEC_TPB, float32)
+        qs = cuda.shared.array(_ATT_HD, float32)
+        tid = cuda.threadIdx.x
+        hh = cuda.blockIdx.x
+        hd = Kl.shape[2]
+        kvh = hh // group
+        scale = float32(inv_sqrt)
+        c0 = cuda.blockIdx.y * _DEC_SPLIT
+        c1 = t
+        if c1 > c0 + _DEC_SPLIT:
+            c1 = c0 + _DEC_SPLIT
+        i = tid
+        while i < hd:
+            qs[i] = q[hh * hd + i]
+            i += _DEC_TPB
+        cuda.syncthreads()
+        m = float32(-3.4e38)
+        l = float32(0.0)
+        acc = float32(0.0)
+        t0 = c0
+        while t0 < c1:
+            ts_len = c1 - t0
+            if ts_len > _DEC_TS:
+                ts_len = _DEC_TS
+            tt = tid
+            while tt < ts_len:
+                dot = float32(0.0)
+                for dd in range(hd):
+                    dot += qs[dd] * Kl[t0 + tt, kvh, dd]
+                Ss[tt] = dot * scale
+                tt += _DEC_TPB
+            cuda.syncthreads()
+            mt = float32(-3.4e38)
+            tt = tid
+            while tt < ts_len:
+                if Ss[tt] > mt:
+                    mt = Ss[tt]
+                tt += _DEC_TPB
+            red[tid] = mt
+            cuda.syncthreads()
+            i = _DEC_TPB // 2
+            while i > 0:
+                if tid < i and red[tid + i] > red[tid]:
+                    red[tid] = red[tid + i]
+                cuda.syncthreads()
+                i >>= 1
+            mt = red[0]
+            m_new = m
+            if mt > m_new:
+                m_new = mt
+            alpha = math.exp(m - m_new)
+            cuda.syncthreads()  # everyone has read red[0]; reuse for sums
+            psum = float32(0.0)
+            tt = tid
+            while tt < ts_len:
+                p = math.exp(Ss[tt] - m_new)
+                Ss[tt] = p
+                psum += p
+                tt += _DEC_TPB
+            red[tid] = psum
+            cuda.syncthreads()
+            i = _DEC_TPB // 2
+            while i > 0:
+                if tid < i:
+                    red[tid] += red[tid + i]
+                cuda.syncthreads()
+                i >>= 1
+            l = l * alpha + red[0]
+            m = m_new
+            if tid < hd:
+                a = acc * alpha
+                for tt in range(ts_len):
+                    a += Ss[tt] * Vl[t0 + tt, kvh, tid]
+                acc = a
+            t0 += _DEC_TS
+            cuda.syncthreads()  # Ss and red are rewritten by the next tile
+        ck = cuda.blockIdx.y
+        if tid == 0:
+            pm[hh, ck] = m
+            pl[hh, ck] = l
+        if tid < hd:
+            pacc[hh, ck, tid] = acc
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _attention_decode_combine(pm, pl, pacc, out, n_chunks):
+        # merge one head's chunk partials: the launch grid guarantees
+        # every chunk saw real rows, so every pm entry is a real max
+        hh = cuda.blockIdx.x
+        tid = cuda.threadIdx.x
+        hd = pacc.shape[2]
+        M = float32(-3.4e38)
+        for c in range(n_chunks):
+            if pm[hh, c] > M:
+                M = pm[hh, c]
+        L = float32(0.0)
+        for c in range(n_chunks):
+            L += pl[hh, c] * math.exp(pm[hh, c] - M)
+        d = tid
+        while d < hd:
+            a = float32(0.0)
+            for c in range(n_chunks):
+                a += pacc[hh, c, d] * math.exp(pm[hh, c] - M)
+            out[hh * hd + d] = a / L
+            d += _DEC_TPB
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _rmsnorm_dev(x, w, out, eps):
+        # tensor.rmsnorm's decode algebra: out = x / sqrt(mean(x^2) +
+        # eps) * w. One block; the tree reduction is deterministic.
+        sh = cuda.shared.array(_TPB, float32)
+        t = cuda.threadIdx.x
+        n = x.shape[0]
+        acc = float32(0.0)
+        i = t
+        while i < n:
+            v = x[i]
+            acc += v * v
+            i += _TPB
+        sh[t] = acc
+        cuda.syncthreads()
+        i = _TPB // 2
+        while i > 0:
+            if t < i:
+                sh[t] += sh[t + i]
+            cuda.syncthreads()
+            i >>= 1
+        inv = float32(1.0) / math.sqrt(sh[0] / float32(n) + float32(eps))
+        i = t
+        while i < n:
+            out[i] = x[i] * inv * w[i]
+            i += _TPB
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _rope_store_decode(qk, v, cos_tab, sin_tab, bqk, bv, has_bqk,
+                           has_bv, n_head, n_rot, neox, Kl, Vl, pos):
+        # One launch finishes the whole qkv stage of a decoded token:
+        # bias adds, both rope styles on q and k, and the new K/V rows
+        # written straight into the device mirror at their absolute
+        # position. Thread jobs: rotation pairs for the n_head q heads
+        # then the n_kv k heads, pass-through dims (n_rot < hd), then the
+        # v row. q rotates in place in the qk buffer; the callers pass qk
+        # and v themselves as the bias placeholders when a model has no
+        # biases, so the flags alone decide.
+        i = cuda.grid(1)
+        hd = Kl.shape[2]
+        n_kv = Kl.shape[1]
+        half = n_rot >> 1
+        nheads = n_head + n_kv
+        npair = nheads * half
+        ntail = nheads * (hd - n_rot)
+        if i < npair:
+            hh = i // half
+            j = i - hh * half
+            base = hh * hd
+            if neox:
+                a = base + j
+                b = base + half + j
+            else:
+                a = base + 2 * j
+                b = base + 2 * j + 1
+            x0 = qk[a]
+            x1 = qk[b]
+            if has_bqk:
+                x0 += bqk[a]
+                x1 += bqk[b]
+            c = cos_tab[pos, j]
+            s = sin_tab[pos, j]
+            y0 = x0 * c - x1 * s
+            y1 = x0 * s + x1 * c
+            if hh < n_head:
+                qk[a] = y0
+                qk[b] = y1
+            else:
+                Kl[pos, hh - n_head, a - base] = y0
+                Kl[pos, hh - n_head, b - base] = y1
+        elif i < npair + ntail:
+            k = i - npair
+            w2 = hd - n_rot
+            hh = k // w2
+            dd = n_rot + (k - hh * w2)
+            idx = hh * hd + dd
+            x0 = qk[idx]
+            if has_bqk:
+                x0 += bqk[idx]
+            if hh < n_head:
+                qk[idx] = x0
+            else:
+                Kl[pos, hh - n_head, dd] = x0
+        elif i < npair + ntail + n_kv * hd:
+            k = i - npair - ntail
+            kvh = k // hd
+            dd = k - kvh * hd
+            x0 = v[k]
+            if has_bv:
+                x0 += bv[k]
+            Vl[pos, kvh, dd] = x0
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _silu_mul_dev(gu, out):
+        # act = gate / (1 + exp(-gate)) * up over the fused gate|up
+        # buffer - the llama-class MLP's exact CPU algebra
+        n_ff = out.shape[0]
+        i = cuda.grid(1)
+        if i < n_ff:
+            g = gu[i]
+            out[i] = g / (float32(1.0) + math.exp(-g)) * gu[n_ff + i]
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _silu_mul_batch(gu, out):
+        # the same algebra over a (batch, 2*n_ff) fused-GEMM result;
+        # sits between the two prefill GEMMs of ffn_swiglu_batch so the
+        # 3x-larger gate|up block never travels to the host
+        n_ff = out.shape[1]
+        n = out.shape[0] * n_ff
+        i = cuda.grid(1)
+        if i < n:
+            b = i // n_ff
+            j = i - b * n_ff
+            g = gu[b, j]
+            out[b, j] = g / (float32(1.0) + math.exp(-g)) * gu[b, n_ff + j]
+
+    @cuda.jit(fastmath=True, cache=True)
+    def _matvec_codes_res(qw, d, m, x, res, out, shift, affine):
+        # _matvec_codes with the residual add fused: out[r] = res[r] +
+        # row dot. res and out may alias (the chain adds in place); each
+        # row's slot is read once, by the thread that then writes it.
+        sh = cuda.shared.array(_TPB, float32)
+        r = cuda.blockIdx.x
+        t = cuda.threadIdx.x
         cw = qw.shape[1]
         acc = float32(0.0)
-        for c in range(cw):
+        c = t
+        while c < cw:
             v = qw[r, c]
             c0 = c << 2
             s = c0 >> shift
@@ -249,14 +824,24 @@ def _init() -> dict:
             ds = d[r, s]
             if affine:
                 ms = m[r, s]
-                acc += (ds * b0 + ms) * xt[c0, b]
-                acc += (ds * b1 + ms) * xt[c0 + 1, b]
-                acc += (ds * b2 + ms) * xt[c0 + 2, b]
-                acc += (ds * b3 + ms) * xt[c0 + 3, b]
+                acc += (ds * b0 + ms) * x[c0]
+                acc += (ds * b1 + ms) * x[c0 + 1]
+                acc += (ds * b2 + ms) * x[c0 + 2]
+                acc += (ds * b3 + ms) * x[c0 + 3]
             else:
-                acc += ds * (b0 * xt[c0, b] + b1 * xt[c0 + 1, b]
-                             + b2 * xt[c0 + 2, b] + b3 * xt[c0 + 3, b])
-        out[r, b] = acc
+                acc += ds * (b0 * x[c0] + b1 * x[c0 + 1]
+                             + b2 * x[c0 + 2] + b3 * x[c0 + 3])
+            c += _TPB
+        sh[t] = acc
+        cuda.syncthreads()
+        i = _TPB // 2
+        while i > 0:
+            if t < i:
+                sh[t] += sh[t + i]
+            cuda.syncthreads()
+            i >>= 1
+        if t == 0:
+            out[r] = res[r] + sh[0]
 
     _state = {
         "ok": True, "np": np, "cuda": cuda, "rt": rt,
@@ -264,10 +849,18 @@ def _init() -> dict:
         "D2H": rt.cudaMemcpyKind.cudaMemcpyDeviceToHost,
         "version": numba_cuda.__version__,
         "name": name, "free_mb": free_b >> 20, "total_mb": total_b >> 20,
-        "matvec": _matvec_codes, "matmul_wide": _matmul_codes_wide,
+        "matvec": _matvec_codes, "gemm": _matmul_codes_gemm,
+        "att_batch": _attention_batch_gqa,
+        "att_part": _attention_decode_part,
+        "att_combine": _attention_decode_combine,
+        "rmsnorm": _rmsnorm_dev, "rope_store": _rope_store_decode,
+        "silu_mul": _silu_mul_dev, "silu_mul_batch": _silu_mul_batch,
+        "matvec_res": _matvec_codes_res,
         # per-size activation buffers, reused across calls (a cudaMalloc
-        # per matvec costs more than the transfer it serves)
+        # per matvec costs more than the transfer it serves), plus the
+        # grow-only pinned/device staging pairs for batched matmul
         "dx": {}, "hx": {}, "hout": {}, "dout": {},
+        "hX2": None, "dX2": None, "hO2": None, "dO2": None,
         "matrices": 0, "uploaded_bytes": 0, "skipped": 0,
     }
     return _state
@@ -301,6 +894,9 @@ def vram_stats() -> dict[str, int]:
     st = _init()
     return {"matrices": st.get("matrices", 0),
             "uploaded_bytes": st.get("uploaded_bytes", 0),
+            # decode-chain K/V mirrors: device-resident but not weight
+            # uploads, so reported separately from the capped figure
+            "chain_bytes": st.get("chain_bytes", 0),
             "skipped": st.get("skipped", 0)}
 
 
@@ -326,6 +922,27 @@ def _memcpy_d2h(st, pinned, dev, nbytes: int) -> None:
         nbytes, st["D2H"])
     if int(err):
         raise RuntimeError(f"cudaMemcpy D2H: {err}")
+
+
+# Raw-pointer variants for the decode chain: the K/V mirror rows live at
+# computed offsets inside whole-context device arrays, and building a
+# DeviceNDArray view per row per layer per token costs more Python time
+# than the 4 KiB copy it would describe. Plain integer pointer arithmetic
+# instead; the arrays the pointers came from are held alive by the chain.
+
+def _memcpy_h2d_ptr(st, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Synchronous H2D (mirror re-sync: once per prefill, not per token)."""
+    err, = st["rt"].cudaMemcpy(dst_ptr, src_ptr, nbytes, st["H2D"])
+    if int(err):
+        raise RuntimeError(f"cudaMemcpy H2D: {err}")
+
+
+def _memcpy_d2h_ptr_async(st, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Async D2H into pinned memory (per-token K/V row copy-back; the
+    token's one sync drains it before the host reads)."""
+    err, = st["rt"].cudaMemcpyAsync(dst_ptr, src_ptr, nbytes, st["D2H"], 0)
+    if int(err):
+        raise RuntimeError(f"cudaMemcpyAsync D2H: {err}")
 
 
 def _upload_x(st, x):
@@ -368,6 +985,189 @@ def _download_out(st, dout, rows: int):
         st["hout"][rows] = hout
     _memcpy_d2h(st, hout, dout, rows * 4)
     return np_.array(hout)  # fresh array: callers keep results across calls
+
+
+# Batched staging (the GEMM path): grow-only 1-D pinned/device pairs,
+# viewed to each call's (batch, cols)/(batch, rows) shape, instead of the
+# matvec path's per-size dicts - prefill tail chunks make batch a free
+# variable, and keying buffers on every (batch, cols) pair seen would
+# accumulate hundreds of MiB of dead pinned pages over a long run. One
+# async H2D per matmul_t call, one sync D2H; the D2H drains the legacy
+# default stream, so the reuse contract is the same as the matvec buffers.
+
+def _grown(st, key, n):
+    """The 1-D staging buffer for `key`, grown to at least n float32s."""
+    buf = st.get(key)
+    if buf is None or buf.size < n:
+        mk = (st["cuda"].pinned_array if key.startswith("h")
+              else st["cuda"].device_array)
+        buf = mk(n, st["np"].float32)
+        st[key] = buf
+    return buf
+
+
+def _upload_batch(st, X):
+    """Stage one (batch, cols) activation block; one async H2D."""
+    n = X.shape[0] * X.shape[1]
+    hX = _grown(st, "hX2", n)[:n].reshape(X.shape)
+    hX[...] = X
+    dX = _grown(st, "dX2", n)[:n].reshape(X.shape)
+    _memcpy_h2d_async(st, dX, hX, n * 4)
+    return dX
+
+
+def _download_batch(st, dout, batch: int, rows: int):
+    """Bring one (batch, rows) GEMM result home; one sync D2H."""
+    np_ = st["np"]
+    n = batch * rows
+    hO = _grown(st, "hO2", n)[:n].reshape(batch, rows)
+    _memcpy_d2h(st, hO, dout, n * 4)
+    return np_.array(hO)  # fresh array, same contract as _download_out
+
+
+# ---- batched attention (prefill path) --------------------------------------
+
+def _att_stage(st, key, arr):
+    """Grow-only pinned/device pair for one attention operand, keyed by
+    name (each key keeps one dtype); one async H2D. Same drain-based
+    reuse contract as the GEMM staging."""
+    n = arr.size
+    hk, dk = "hAtt" + key, "dAtt" + key
+    h = st.get(hk)
+    if h is None or h.size < n:
+        h = st["cuda"].pinned_array(n, arr.dtype)
+        st[hk] = h
+    hv = h[:n].reshape(arr.shape)
+    hv[...] = arr
+    d = st.get(dk)
+    if d is None or d.size < n:
+        d = st["cuda"].device_array(n, arr.dtype)
+        st[dk] = d
+    dv = d[:n].reshape(arr.shape)
+    _memcpy_h2d_async(st, dv, hv, n * arr.dtype.itemsize)
+    return dv
+
+
+def attention_batch(q, K, V, positions, group: int, inv_sqrt: float,
+                    window: int = 0, kv_start: int = 0):
+    """Batched causal GQA for the prefill path.
+
+    q (t_q, n_head, hd), K/V (t_kv, n_kv, hd) host float32 (the model's
+    KV-cache slices), positions absolute int32; optional sliding window
+    and kv_start carry the Gemma 3 variant's semantics. Returns
+    (t_q, n_head*hd) float32, or None when the tier is off, the geometry
+    is out of range (head_dim > _ATT_HD), or a previous failure parked
+    the path - callers keep their exact NumPy einsum either way, and it
+    remains the reference. The K/V slice re-uploads every call because
+    the cache is host-authoritative between chunks: on the 8B's full
+    4096-token prefill that is 10.5 GiB of H2D over the run, measured
+    (sync-instrumented) at 1.2 s / ~39% of the 3.1 s GPU attention stage
+    - a bandwidth tax worth paying against the 147 s the NumPy einsum
+    was heading for at that length.
+    """
+    st = _init()
+    if not st.get("ok") or st.get("att_dead"):
+        return None
+    np_ = st["np"]
+    try:
+        q = np_.ascontiguousarray(q, dtype=np_.float32)
+        K = np_.ascontiguousarray(K, dtype=np_.float32)
+        V = np_.ascontiguousarray(V, dtype=np_.float32)
+        if q.ndim != 3 or K.ndim != 3 or K.shape != V.shape:
+            return None
+        t_q, n_head, hd = q.shape
+        t_kv, n_kv, hd_k = K.shape
+        pos = np_.ascontiguousarray(positions, dtype=np_.int32)
+        if (hd != hd_k or hd > _ATT_HD or t_q == 0 or t_kv == 0
+                or group < 1 or n_kv * group != n_head
+                or pos.shape != (t_q,)):
+            return None
+    except Exception:
+        return None
+    try:
+        dq = _att_stage(st, "q", q)
+        dK = _att_stage(st, "k", K)
+        dV = _att_stage(st, "v", V)
+        dp = _att_stage(st, "p", pos)
+        n_out = t_q * n_head * hd
+        dO = _grown(st, "dAtto", n_out)[:n_out].reshape(t_q, n_head, hd)
+        gx = (t_q * group + _ATT_R - 1) // _ATT_R
+        st["att_batch"][(gx, n_kv), _ATT_TPB](
+            dq, dK, dV, dp, dO, group, float(inv_sqrt),
+            int(window), int(kv_start))
+        hO = _grown(st, "hAtto", n_out)[:n_out]
+        _memcpy_d2h(st, hO, dO, n_out * 4)
+        return np_.array(hO).reshape(t_q, n_head * hd)
+    except Exception as e:
+        # parked, not degraded per-matrix: attention holds no weights, so
+        # the NumPy path recomputes losslessly from the host cache
+        st["att_dead"] = True
+        print(f"alpacca-gpu: batch attention degraded to NumPy "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+        return None
+
+
+# ---- fused prefill FFN -----------------------------------------------------
+
+def _launch_gemm(st, gmat, dX, dout, batch: int) -> None:
+    """Queue the tiled GEMM for a resident matrix, device in/out."""
+    gx = (gmat.rows + _GEMM_ROWS - 1) // _GEMM_ROWS
+    gy = (batch + _GEMM_BT - 1) // _GEMM_BT
+    st["gemm"][(gx, gy), (_GEMM_TX, _GEMM_TY)](
+        gmat._dq, gmat._dd, gmat._dd if gmat._dm is None else gmat._dm,
+        dX, dout, gmat._shift, gmat._dm is not None)
+
+
+def ffn_swiglu_batch(wgu, wdown, X):
+    """The llama-class prefill FFN fused on the device: X @ wgu.T, then
+    silu(gate) * up, then @ wdown.T - one activation upload, one result
+    download. `wgu` is the fused gate|up matrix (2*n_ff rows), `wdown`
+    the down projection. Returns (batch, n_embd) float32, or None when
+    either matrix is not device-resident (mixed placement, degraded) or
+    batch < 2 - callers keep the exact three-step host path, and batch 1
+    keeps the matvec kernel's bit-identity with decode. Measured
+    motivation: at the 8B's chunk shapes the host silu line alone costs
+    13.2 ms per layer-chunk (np.exp over 256x14336) and the gate|up
+    download plus act re-upload another ~42 MiB of PCIe; this path
+    removes all three.
+    """
+    st = _init()
+    if not st.get("ok"):
+        return None
+    if not (getattr(wgu, "is_gpu_matrix", False)
+            and getattr(wdown, "is_gpu_matrix", False)):
+        return None
+    if wgu._dead or wdown._dead:
+        return None
+    n_ff = wdown.cols
+    if wgu.rows != 2 * n_ff:
+        return None
+    np_ = st["np"]
+    X = np_.ascontiguousarray(X, dtype=np_.float32)
+    if X.ndim != 2 or X.shape[1] != wgu.cols:
+        return None
+    batch = X.shape[0]
+    if batch < 2:
+        return None
+    try:
+        dX = _upload_batch(st, X)
+        n_gu = batch * wgu.rows
+        dgu = _grown(st, "dFgu", n_gu)[:n_gu].reshape(batch, wgu.rows)
+        _launch_gemm(st, wgu, dX, dgu, batch)
+        n_act = batch * n_ff
+        dact = _grown(st, "dFact", n_act)[:n_act].reshape(batch, n_ff)
+        blocks = (n_act + _TPB - 1) // _TPB
+        st["silu_mul_batch"][blocks, _TPB](dgu, dact)
+        n_out = batch * wdown.rows
+        dout = _grown(st, "dO2", n_out)[:n_out].reshape(batch, wdown.rows)
+        _launch_gemm(st, wdown, dact, dout, batch)
+        return _download_batch(st, dout, batch, wdown.rows)
+    except Exception as e:
+        # degrade the pair like any other runtime failure; the caller
+        # recomputes on the host from the downloaded weights
+        wgu._degrade(e)
+        wdown._degrade(e)
+        return None
 
 
 class _VramBudget(Exception):
@@ -575,7 +1375,12 @@ class GpuMatrix:
     # ---- batched matmul (prefill path) -------------------------------------
 
     def matmul_t(self, X):
-        """X (batch x cols) @ self.T -> (batch x rows) float32."""
+        """X (batch x cols) @ self.T -> (batch x rows) float32.
+
+        Batch 1 is the decode path and rides the matvec kernel unchanged
+        (bit-identical either way - same kernel, same buffers); every
+        larger batch takes the tiled GEMM, one launch at any size.
+        """
         st = _init()
         np_ = st["np"]
         X = np_.ascontiguousarray(X, dtype=np_.float32)
@@ -585,30 +1390,22 @@ class GpuMatrix:
         if self._dead:
             return self._matmul_host(X)
         batch = X.shape[0]
+        if batch == 0:
+            return np_.empty((0, self.rows), dtype=np_.float32)
+        if batch == 1:
+            return self.matvec(X[0]).reshape(1, self.rows)
         try:
-            cuda = st["cuda"]
-            if batch > 1 and self.rows * self.cols <= _wide_matmul_max_elems():
-                xt = cuda.to_device(np_.ascontiguousarray(X.T))
-                dout = cuda.device_array((self.rows, batch), np_.float32)
-                gx = (self.rows + _MM_ROW_TILE - 1) // _MM_ROW_TILE
-                gy = (batch + _MM_BATCH_TILE - 1) // _MM_BATCH_TILE
-                st["matmul_wide"][(gx, gy), (_MM_BATCH_TILE, _MM_ROW_TILE)](
-                    self._dq, self._dd,
-                    self._dd if self._dm is None else self._dm,
-                    xt, dout, self._shift, self._dm is not None)
-                return np_.ascontiguousarray(dout.copy_to_host().T)
-            # looped matvec: codes re-stream from VRAM per batch row, and
-            # still win every prefill-chunk batch (table above); results
-            # land directly in (batch, rows) with one download
-            dX = cuda.to_device(X)
-            dO = cuda.device_array((batch, self.rows), np_.float32)
-            kern = st["matvec"]
-            dm = self._dd if self._dm is None else self._dm
-            affine = self._dm is not None
-            for i in range(batch):
-                kern[self.rows, _TPB](self._dq, self._dd, dm, dX[i], dO[i],
-                                      self._shift, affine)
-            return dO.copy_to_host()
+            dX = _upload_batch(st, X)
+            dout = _grown(st, "dO2",
+                          batch * self.rows)[:batch * self.rows]
+            dout = dout.reshape(batch, self.rows)
+            gx = (self.rows + _GEMM_ROWS - 1) // _GEMM_ROWS
+            gy = (batch + _GEMM_BT - 1) // _GEMM_BT
+            st["gemm"][(gx, gy), (_GEMM_TX, _GEMM_TY)](
+                self._dq, self._dd,
+                self._dd if self._dm is None else self._dm,
+                dX, dout, self._shift, self._dm is not None)
+            return _download_batch(st, dout, batch, self.rows)
         except Exception as e:
             self._degrade(e)
             return self._matmul_host(X)
@@ -682,6 +1479,375 @@ def gpu_matrix(data, dtype: str, rows: int, cols: int):
         return None
 
 
+# ---- device-resident decode chain ------------------------------------------
+
+class _ChainUnsupported(Exception):
+    """This model or geometry cannot ride the decode chain. Not an error:
+    the existing per-matvec path simply keeps decoding."""
+
+
+def _chain_env_off() -> bool:
+    return os.environ.get("ALPACCA_GPU_CHAIN", "").strip().lower() in (
+        "0", "off", "no")
+
+
+def _launch_mv(st, gmat, dx, dout) -> None:
+    """Queue the matvec kernel on a resident matrix, device in/out."""
+    if gmat._dead:
+        raise RuntimeError("matrix degraded mid-chain")
+    st["matvec"][gmat.rows, _TPB](
+        gmat._dq, gmat._dd, gmat._dd if gmat._dm is None else gmat._dm,
+        dx, dout, gmat._shift, gmat._dm is not None)
+
+
+def _launch_mv_res(st, gmat, dx, dres) -> None:
+    """Queue the fused matvec+residual kernel: dres += gmat @ dx."""
+    if gmat._dead:
+        raise RuntimeError("matrix degraded mid-chain")
+    st["matvec_res"][gmat.rows, _TPB](
+        gmat._dq, gmat._dd, gmat._dd if gmat._dm is None else gmat._dm,
+        dx, dres, dres, gmat._shift, gmat._dm is not None)
+
+
+class DecodeChain:
+    """Device-resident single-token decode for one llama-class model.
+
+    Everything between the token-embedding gather (host, ~16 KiB upload)
+    and the logits download runs on the device: rmsnorm, the fused qkv
+    matvecs, rope + K/V-mirror row store, GQA attention over the mirror,
+    the residual-fused output/down projections and silu*up - one queued
+    launch each, ONE synchronization per token. The host KV cache stays
+    authoritative: the token's new K/V rows are async-copied back inside
+    that same sync, and every host mutation path (prefill's batch writes,
+    truncation, reset, CPU decode) reports through Model._chain_invalidate
+    so the mirror re-uploads exactly the rows the host changed before the
+    next chained token.
+
+    Built lazily on the first decoded token (mirror allocation + upload);
+    construction raises _ChainUnsupported for anything it cannot serve
+    bit-for-bit honestly - gemma-family forward passes (extra norms,
+    GELU, softcap, scaled embeddings), heads wider than _ATT_HD, degraded
+    or CPU-resident chain matrices - and chain_forward then parks the
+    chain permanently for that model instance. A TIED output head is not
+    a refusal: the final hidden vector downloads (that D2H is the one
+    sync) and the host computes the logits, since the tied embedding
+    never uploads. ANY runtime failure also parks the chain; the token
+    that failed is recomputed by the unchanged per-matvec path.
+    """
+
+    def __init__(self, model):
+        st = _init()
+        if not st.get("ok"):
+            raise _ChainUnsupported("gpu tier inactive")
+        hp = model.hp
+        if hp.arch in ("gemma", "gemma3"):
+            raise _ChainUnsupported("gemma-family forward pass")
+        if hp.embed_scale != 1.0 or hp.final_logit_softcap > 0.0:
+            raise _ChainUnsupported("scaled embedding / softcap")
+        if hp.rope_style not in ("norm", "neox"):
+            raise _ChainUnsupported(f"rope style {hp.rope_style}")
+        hd = hp.head_dim
+        if hd > _ATT_HD or hp.n_rot % 2 or not 0 < hp.n_rot <= hd:
+            raise _ChainUnsupported("head geometry")
+        if hp.n_kv <= 0 or hp.n_head % hp.n_kv:
+            raise _ChainUnsupported("head grouping")
+        if getattr(model, "_rope_cos", None) is None:
+            raise _ChainUnsupported("no rope tables")
+        np_ = st["np"]
+        cuda = st["cuda"]
+
+        def gm(W, role):
+            if W is None or not getattr(W, "is_gpu_matrix", False) or W._dead:
+                raise _ChainUnsupported(f"{role} not device-resident")
+            return W
+
+        qd = hp.n_head * hd
+        kvd = hp.n_kv * hd
+        picked = []
+        for ly in model.layers:
+            if ly.q_norm is not None or ly.post_attn_norm is not None:
+                raise _ChainUnsupported("extra per-layer norms")
+            wqk = None if ly.wqk is None else gm(ly.wqk, "wqk")
+            wq = wk = None
+            if wqk is None:
+                wq = gm(ly.wq, "attn_q")
+                wk = gm(ly.wk, "attn_k")
+            wgu = None if ly.wgu is None else gm(ly.wgu, "wgu")
+            wg = wu = None
+            if wgu is None:
+                wg = gm(ly.w_gate, "ffn_gate")
+                wu = gm(ly.w_up, "ffn_up")
+            picked.append((ly, wqk, wq, wk, gm(ly.wv, "attn_v"),
+                           gm(ly.wo, "attn_output"), wgu, wg, wu,
+                           gm(ly.w_down, "ffn_down")))
+
+        n_ctx = model.n_ctx
+        mirror = 2 * hp.n_layer * n_ctx * kvd * 4
+        err, free_b, _total = st["rt"].cudaMemGetInfo()
+        if int(err):
+            raise RuntimeError(f"cudaMemGetInfo: {err}")
+        if mirror + (GPU_RESERVE_MB << 20) > free_b:
+            raise _ChainUnsupported(
+                f"K/V mirror needs {mirror >> 20} MiB, {free_b >> 20} free")
+        # visibility, not budget: the mirror is chain scratch, deliberately
+        # outside the ALPACCA_GPU_VRAM_MB weight cap (which the docs define
+        # as uploaded weight bytes), but vram_stats/doctor must not
+        # under-report device residency by a gigabyte (review finding)
+        st["chain_bytes"] = st.get("chain_bytes", 0) + mirror
+        self._mirror_bytes = mirror
+
+        self.n_layer = hp.n_layer
+        self.n_ctx = n_ctx
+        self.n_head = hp.n_head
+        self.n_kv = hp.n_kv
+        self.hd = hd
+        self.qd = qd
+        self.kvd = kvd
+        self.n_embd = hp.n_embd
+        self.n_ff = hp.n_ff
+        self.n_rot = hp.n_rot
+        self.neox = hp.rope_style == "neox"
+        self.group = hp.n_head // hp.n_kv
+        self.eps = float(hp.rms_eps)
+        self.inv_sqrt = 1.0 / math.sqrt(hd)
+        self.rowb = kvd * 4
+
+        self.dK = [cuda.device_array((n_ctx, hp.n_kv, hd), np_.float32)
+                   for _ in range(hp.n_layer)]
+        self.dV = [cuda.device_array((n_ctx, hp.n_kv, hd), np_.float32)
+                   for _ in range(hp.n_layer)]
+        self.kdev = [a.__cuda_array_interface__["data"][0] for a in self.dK]
+        self.vdev = [a.__cuda_array_interface__["data"][0] for a in self.dV]
+        self.dcos = cuda.to_device(
+            np_.ascontiguousarray(model._rope_cos, dtype=np_.float32))
+        self.dsin = cuda.to_device(
+            np_.ascontiguousarray(model._rope_sin, dtype=np_.float32))
+
+        def dev_vec(v, size, role):
+            if v is None:
+                raise _ChainUnsupported(f"missing {role}")
+            arr = np_.ascontiguousarray(v, dtype=np_.float32)
+            if arr.shape != (size,):
+                raise _ChainUnsupported(f"{role} shape {arr.shape}")
+            return cuda.to_device(arr)
+
+        self.layers = []
+        for ly, wqk, wq, wk, wv, wo, wgu, wg, wu, wdown in picked:
+            has_bqk = ly.bq is not None or ly.bk is not None
+            dbqk = None
+            if has_bqk:
+                bq = ly.bq if ly.bq is not None else np_.zeros(qd, np_.float32)
+                bk = ly.bk if ly.bk is not None else np_.zeros(kvd, np_.float32)
+                dbqk = cuda.to_device(np_.ascontiguousarray(
+                    np_.concatenate([bq, bk]), dtype=np_.float32))
+            has_bv = ly.bv is not None
+            dbv = None
+            if has_bv:
+                dbv = dev_vec(ly.bv, kvd, "attn_v bias")
+            self.layers.append((
+                dev_vec(ly.attn_norm, hp.n_embd, "attn_norm"),
+                wqk, wq, wk, wv, wo,
+                dev_vec(ly.ffn_norm, hp.n_embd, "ffn_norm"),
+                wgu, wg, wu, wdown, dbqk, has_bqk, dbv, has_bv))
+        self.dnorm_out = dev_vec(model.out_norm, hp.n_embd, "output_norm")
+
+        self.dx = cuda.device_array(hp.n_embd, np_.float32)
+        self.dh = cuda.device_array(hp.n_embd, np_.float32)
+        self.dqk = cuda.device_array(qd + kvd, np_.float32)
+        self.dvt = cuda.device_array(kvd, np_.float32)
+        self.datt = cuda.device_array(qd, np_.float32)
+        max_ck = (n_ctx + _DEC_SPLIT - 1) // _DEC_SPLIT
+        self.dpm = cuda.device_array((hp.n_head, max_ck), np_.float32)
+        self.dpl = cuda.device_array((hp.n_head, max_ck), np_.float32)
+        self.dpacc = cuda.device_array((hp.n_head, max_ck, hd), np_.float32)
+        self.dgu = cuda.device_array(2 * hp.n_ff, np_.float32)
+        self.dact = cuda.device_array(hp.n_ff, np_.float32)
+        self.dq_view = self.dqk[:qd]
+        self.dk_view = self.dqk[qd:]
+        self.dg_view = self.dgu[:hp.n_ff]
+        self.du_view = self.dgu[hp.n_ff:]
+
+        self.out_gm = (model.output if getattr(model.output, "is_gpu_matrix",
+                                               False) else None)
+        if self.out_gm is not None and self.out_gm._dead:
+            self.out_gm = None  # degraded head computes host-side anyway
+        self.n_vocab = (self.out_gm.rows if self.out_gm is not None else 0)
+        self.hemb = cuda.pinned_array(hp.n_embd, np_.float32)
+        self.hkv = cuda.pinned_array((hp.n_layer, 2, kvd), np_.float32)
+        hkv_base = self.hkv.ctypes.data
+        self.hk_ptr = [hkv_base + (li * 2) * self.rowb
+                       for li in range(hp.n_layer)]
+        self.hv_ptr = [hkv_base + (li * 2 + 1) * self.rowb
+                       for li in range(hp.n_layer)]
+        # hxout is allocated unconditionally: a VRAM-resident head can
+        # degrade AFTER the chain builds (any launch failure in its own
+        # matvec), and step() then takes the hidden-download branch - which
+        # would AttributeError on a build-time-conditional buffer and park
+        # the chain forever (review finding, stage 2)
+        self.hxout = cuda.pinned_array(hp.n_embd, np_.float32)
+        if self.out_gm is not None:
+            self.dlogits = cuda.device_array(self.n_vocab, np_.float32)
+            self.hlog = cuda.pinned_array(self.n_vocab, np_.float32)
+        else:
+            self.dlogits = None
+
+        half = hp.n_rot // 2
+        rope_jobs = ((hp.n_head + hp.n_kv) * half
+                     + (hp.n_head + hp.n_kv) * (hd - hp.n_rot) + kvd)
+        self.rope_blocks = (rope_jobs + _TPB - 1) // _TPB
+        self.silu_blocks = (hp.n_ff + _TPB - 1) // _TPB
+        self.valid_upto = 0  # device-mirror rows in sync with the host
+
+    def __del__(self):
+        try:
+            st = _state
+            if st and getattr(self, "_mirror_bytes", 0):
+                st["chain_bytes"] = max(
+                    0, st.get("chain_bytes", 0) - self._mirror_bytes)
+                self._mirror_bytes = 0
+        except Exception:
+            pass  # interpreter teardown: module globals may already be gone
+
+    def invalidate(self, pos: int) -> None:
+        """A host-cache mutation touched rows from `pos` on: forget them.
+        Reported by Model._chain_invalidate from every mutation path."""
+        if pos < self.valid_upto:
+            self.valid_upto = max(0, int(pos))
+
+    def _sync_mirror(self, st, model, a: int, b: int) -> None:
+        """Upload host K/V rows [a, b) of every layer to the mirror.
+
+        Synchronous copies through one grow-only pinned staging block
+        (reuse is safe because each copy completes before the restage);
+        this runs once after each prefill or truncation, not per token."""
+        rows = b - a
+        n = rows * self.kvd
+        stage = _grown(st, "hMirror", n)
+        hv = stage[:n].reshape(rows, self.n_kv, self.hd)
+        for li in range(self.n_layer):
+            hv[...] = model.cache_k[li][a:b]
+            _memcpy_h2d_ptr(st, self.kdev[li] + a * self.rowb,
+                            stage.ctypes.data, n * 4)
+            hv[...] = model.cache_v[li][a:b]
+            _memcpy_h2d_ptr(st, self.vdev[li] + a * self.rowb,
+                            stage.ctypes.data, n * 4)
+
+    def step(self, model, token: int):
+        """Decode one token fully on the device; returns logits. The
+        caller (Model._forward_np) advances n_past on success, exactly as
+        the CPU body would have."""
+        st = _init()
+        np_ = st["np"]
+        pos = model.n_past
+        if pos >= self.n_ctx:
+            raise RuntimeError("device K/V mirror full")
+        if self.valid_upto < pos:
+            self._sync_mirror(st, model, self.valid_upto, pos)
+            self.valid_upto = pos
+        from . import tensor as T
+        self.hemb[:] = T.matrix_row(model.tok_embd, token)
+        _memcpy_h2d_async(st, self.dx, self.hemb, self.n_embd * 4)
+        rms = st["rmsnorm"]
+        rope = st["rope_store"]
+        attp = st["att_part"]
+        attc = st["att_combine"]
+        smul = st["silu_mul"]
+        dx, dh, dqk, dvt = self.dx, self.dh, self.dqk, self.dvt
+        datt, dgu, dact = self.datt, self.dgu, self.dact
+        dpm, dpl, dpacc = self.dpm, self.dpl, self.dpacc
+        eps = self.eps
+        t = pos + 1
+        nck = (t + _DEC_SPLIT - 1) // _DEC_SPLIT
+        off = pos * self.rowb
+        for li, (dn1, wqk, wq, wk, wv, wo, dn2, wgu, wg, wu, wdown,
+                 dbqk, has_bqk, dbv, has_bv) in enumerate(self.layers):
+            rms[1, _TPB](dx, dn1, dh, eps)
+            if wqk is not None:
+                _launch_mv(st, wqk, dh, dqk)
+            else:
+                _launch_mv(st, wq, dh, self.dq_view)
+                _launch_mv(st, wk, dh, self.dk_view)
+            _launch_mv(st, wv, dh, dvt)
+            rope[self.rope_blocks, _TPB](
+                dqk, dvt, self.dcos, self.dsin,
+                dqk if dbqk is None else dbqk,
+                dvt if dbv is None else dbv,
+                has_bqk, has_bv, self.n_head, self.n_rot, self.neox,
+                self.dK[li], self.dV[li], pos)
+            attp[(self.n_head, nck), _DEC_TPB](
+                dqk, self.dK[li], self.dV[li], dpm, dpl, dpacc, t,
+                self.group, self.inv_sqrt)
+            attc[self.n_head, _DEC_TPB](dpm, dpl, dpacc, datt, nck)
+            _launch_mv_res(st, wo, datt, dx)
+            _memcpy_d2h_ptr_async(st, self.hk_ptr[li], self.kdev[li] + off,
+                                  self.rowb)
+            _memcpy_d2h_ptr_async(st, self.hv_ptr[li], self.vdev[li] + off,
+                                  self.rowb)
+            rms[1, _TPB](dx, dn2, dh, eps)
+            if wgu is not None:
+                _launch_mv(st, wgu, dh, dgu)
+            else:
+                _launch_mv(st, wg, dh, self.dg_view)
+                _launch_mv(st, wu, dh, self.du_view)
+            smul[self.silu_blocks, _TPB](dgu, dact)
+            _launch_mv_res(st, wdown, dact, dx)
+        rms[1, _TPB](dx, self.dnorm_out, dh, eps)
+        if self.out_gm is not None and not self.out_gm._dead:
+            _launch_mv(st, self.out_gm, dh, self.dlogits)
+            _memcpy_d2h(st, self.hlog, self.dlogits, self.n_vocab * 4)
+            logits = np_.array(self.hlog)
+        else:
+            # tied (or degraded) head: the hidden vector comes home in
+            # the one sync and the host projects the logits, exactly as
+            # the existing path does for a never-uploaded embedding
+            _memcpy_d2h(st, self.hxout, dh, self.n_embd * 4)
+            logits = T.matvec(model.output, np_.array(self.hxout))
+        # that sync drained the queued row copies: scatter them into the
+        # authoritative host cache before anyone can observe this token
+        hkv = self.hkv
+        for li in range(self.n_layer):
+            model.cache_k[li][pos] = hkv[li, 0].reshape(self.n_kv, self.hd)
+            model.cache_v[li][pos] = hkv[li, 1].reshape(self.n_kv, self.hd)
+        self.valid_upto = pos + 1
+        return logits
+
+
+def chain_forward(model, token: int):
+    """One device-resident decode step for `model`, or None when the
+    chain is unavailable - the caller then runs the existing path, which
+    is always correct. The chain builds lazily on the first decoded token
+    (mirror allocation and upload); ANY failure, build or runtime, parks
+    it permanently for this model instance (never the tier), and
+    ALPACCA_GPU_CHAIN=0 refuses it outright."""
+    st = _init()
+    if not st.get("ok"):
+        return None
+    ch = model._gpu_chain
+    if ch is None:
+        if model._gpu_chain_dead or _chain_env_off():
+            return None
+        try:
+            ch = DecodeChain(model)
+        except _ChainUnsupported:
+            model._gpu_chain_dead = True
+            return None
+        except Exception as e:
+            model._gpu_chain_dead = True
+            print(f"alpacca-gpu: decode chain unavailable "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
+            return None
+        model._gpu_chain = ch
+    try:
+        return ch.step(model, token)
+    except Exception as e:
+        model._gpu_chain = None
+        model._gpu_chain_dead = True
+        print(f"alpacca-gpu: decode chain disabled ({type(e).__name__}: "
+              f"{e}); decoding continues on the per-matvec path",
+              file=sys.stderr)
+        return None
+
+
 def warmup() -> None:
     """Trigger JIT compilation once (cached on disk afterwards)."""
     st = _init()
@@ -696,10 +1862,44 @@ def warmup() -> None:
         out = cuda.device_array(2, np_.float32)
         st["matvec"][2, _TPB](qw, d, d, x, out, 5, False)
         st["matvec"][2, _TPB](qw, d, d, x, out, 5, True)
-        xt = cuda.to_device(np_.zeros((32, 2), np_.float32))
+        dX = cuda.to_device(np_.zeros((2, 32), np_.float32))
         o2 = cuda.device_array((2, 2), np_.float32)
-        st["matmul_wide"][(1, 1), (_MM_BATCH_TILE, _MM_ROW_TILE)](
-            qw, d, d, xt, o2, 5, True)
+        st["gemm"][(1, 1), (_GEMM_TX, _GEMM_TY)](qw, d, d, dX, o2, 5, False)
+        st["gemm"][(1, 1), (_GEMM_TX, _GEMM_TY)](qw, d, d, dX, o2, 5, True)
+        # stage-2 kernels: batch attention plus the decode-chain set, so
+        # neither the first prefill chunk nor the first decoded token
+        # pays a JIT compile
+        dq3 = cuda.to_device(np_.zeros((2, 2, 8), np_.float32))
+        dkv3 = cuda.to_device(np_.zeros((2, 1, 8), np_.float32))
+        dpos = cuda.to_device(np_.zeros(2, np_.int32))
+        do3 = cuda.device_array((2, 2, 8), np_.float32)
+        st["att_batch"][(1, 1), _ATT_TPB](dq3, dkv3, dkv3, dpos, do3, 2,
+                                          1.0, 0, 0)
+        vec = cuda.to_device(np_.zeros(32, np_.float32))
+        vout = cuda.device_array(32, np_.float32)
+        st["rmsnorm"][1, _TPB](vec, vec, vout, 1e-5)
+        st["matvec_res"][2, _TPB](qw, d, d, x, out, out, 5, False)
+        st["matvec_res"][2, _TPB](qw, d, d, x, out, out, 5, True)
+        gu = cuda.to_device(np_.zeros(16, np_.float32))
+        act = cuda.device_array(8, np_.float32)
+        st["silu_mul"][1, _TPB](gu, act)
+        gu2 = cuda.to_device(np_.zeros((2, 16), np_.float32))
+        act2 = cuda.device_array((2, 8), np_.float32)
+        st["silu_mul_batch"][1, _TPB](gu2, act2)
+        ctab = cuda.to_device(np_.zeros((4, 2), np_.float32))
+        Kl = cuda.device_array((4, 1, 4), np_.float32)
+        Vl = cuda.device_array((4, 1, 4), np_.float32)
+        qk8 = cuda.to_device(np_.zeros(8, np_.float32))
+        v4 = cuda.to_device(np_.zeros(4, np_.float32))
+        for neox in (False, True):
+            st["rope_store"][1, _TPB](qk8, v4, ctab, ctab, qk8, v4,
+                                      False, False, 1, 4, neox, Kl, Vl, 0)
+        adec = cuda.device_array(4, np_.float32)
+        pm = cuda.device_array((1, 1), np_.float32)
+        pl = cuda.device_array((1, 1), np_.float32)
+        pacc = cuda.device_array((1, 1, 4), np_.float32)
+        st["att_part"][(1, 1), _DEC_TPB](v4, Kl, Vl, pm, pl, pacc, 2, 1, 1.0)
+        st["att_combine"][1, _DEC_TPB](pm, pl, pacc, adec, 1)
         cuda.synchronize()
     except Exception as e:
         # warn, but do NOT clear _state: matrices already resident hold
@@ -710,6 +1910,6 @@ def warmup() -> None:
               file=sys.stderr)
 
 
-__all__ = ["GpuMatrix", "NUMBA_CUDA_PIN", "available", "status",
-           "doctor_line", "gpu_matrix", "upload_vector", "vram_stats",
-           "warmup"]
+__all__ = ["DecodeChain", "GpuMatrix", "NUMBA_CUDA_PIN", "attention_batch",
+           "available", "chain_forward", "doctor_line", "ffn_swiglu_batch",
+           "gpu_matrix", "status", "upload_vector", "vram_stats", "warmup"]

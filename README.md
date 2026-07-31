@@ -525,11 +525,16 @@ different installed version deactivates the tier rather than running
 unvalidated; `ALPACCA_GPU=force` overrides at your own risk). Weight
 matrices upload once at load in the same int8-codes + float32-scales
 layout the NumPy backend unpacks and stay quantized in VRAM (~1.25
-bytes/weight); activations, the KV cache and attention stay on the CPU,
-so every other tier keeps working unchanged and `ALPACCA_GPU=0` restores
-them exactly. Like everything else here the wheels install once and run
-offline; keep copies (`pip download ".[gpu]"`) if the machine will be
-air-gapped later.
+bytes/weight). The KV cache stays host-side and authoritative - prefix
+reuse and truncation are untouched - but the hot math now runs on the
+device: prefill's batched causal attention and its fused
+GEMM-silu-GEMM FFN, and (when every chain matrix of a llama-class model
+is resident) whole-token decode as a device-resident chain with one
+synchronization per token. Every piece degrades per call or per
+instance to the exact CPU paths, so every other tier keeps working
+unchanged and `ALPACCA_GPU=0` restores them exactly. Like everything
+else here the wheels install once and run offline; keep copies
+(`pip download ".[gpu]"`) if the machine will be air-gapped later.
 
 Measured on this machine (RTX 4090 24 GB, driver 591.86, Windows 11)
 with `tests/bench.py` (512-token prefill, greedy decode), GPU tier vs
@@ -537,49 +542,92 @@ the CPU kernels tier:
 
 | Model | tier | prefill tok/s | decode tok/s |
 | --- | --- | ---: | ---: |
-| llama3.2:1b Q8_0 | cpu kernels | 86.4 | 34.0 |
-| llama3.2:1b Q8_0 | **gpu** | **128.5** | **52.5-56.5** |
-| Hermes-3 8B Q4_K_M | cpu kernels | 6.1 | 9.4 |
-| Hermes-3 8B Q4_K_M | **gpu** | **39.9** | **27.8** |
+| llama3.2:1b Q8_0 | cpu kernels | 84.5 | 33.2 |
+| llama3.2:1b Q8_0 | **gpu** | **1250** | **85.6** (87.8 steady) |
+| Hermes-3 8B Q4_K_M | cpu kernels | 7.7 | 9.3 |
+| Hermes-3 8B Q4_K_M | **gpu** | **279.8** | **52.1** (64.5 steady) |
 
-The 8B keeps 8.7 GiB resident in VRAM (161 of its 226 matrices; the
+The bench decode column includes the decode chain's one-time lazy build
+(K/V-mirror allocation and upload) on the first token, amortized over
+only 29-43 tokens before the model hits end-of-generation; "steady" is
+the same greedy loop measured over 100 tokens after warmup.
+
+Prefill: the tiled shared-memory GEMM from v1 (10.0 TFLOP/s on the 8B's
+fused FFN matrix, batch 256) plus two stage-2 device paths - the batched
+causal GQA attention that used to be an O(n^2) NumPy einsum, and a fused
+GEMM-silu-GEMM FFN that keeps the (batch, 2*n_ff) gate|up block in VRAM.
+The einsum was why prefill *degraded with length*; the 8B ladder, same
+machine, end to end:
+
+| prompt tokens | v1 (einsum attention) | stage 2 |
+| ---: | ---: | ---: |
+| 512 | 11.67 s | 2.08 s |
+| 1024 | 27.0 s | 3.70 s |
+| 2048 | 71.2 s | 7.64 s |
+| 4096 | 210.6 s | 16.21 s |
+
+At 4096 the remaining 16.2 s split into ~2.8 s of GPU attention (of
+which 1.2 s is re-uploading the host-authoritative K/V slices - 10.5
+GiB over the run at 8.6 GiB/s), ~2.8 s of GEMM calls, and ~10.6 s of
+host-side batch work (rope, rmsnorm, residuals) that still runs on
+NumPy between kernels. A 4,400-token prompt (`-c 6144`) prefills in
+17.8 s.
+
+Decode runs as a device-resident chain when every chain matrix of a
+llama-class model is in VRAM: rmsnorm, the fused qkv matvecs, rope,
+single-token GQA over a device K/V mirror (split across
+512-position-chunk blocks - one block per head measured 26.1 tok/s at a
+4400-token context, the split form 53.0), silu*up and the
+residual-fused projections, ~354 queued launches and ONE
+synchronization per token, the logits download. The host cache stays
+authoritative: each token's new K/V rows are async-copied back inside
+that same sync, and every host mutation path (prefill writes,
+truncation, reset, CPU decode) invalidates the mirror so it re-uploads
+exactly the changed rows. Any failure - build or runtime - parks the
+chain for that model instance and the token is recomputed on the
+existing per-matvec path. Where a steady-state 8B token goes now
+(15.5 ms, 64.5 tok/s, up from 27.5-31 in v1): 9.9 ms of Python launch
+queueing overlapped under 15.4 ms of GPU work (the sync waits the 5.5 ms
+difference), 0.1 ms of host tail. The tied-embedding 1b pays its
+128256-row output head on the CPU inside the chain's one sync (5.1 of
+its 11.4 ms), because the token embedding still never uploads.
+
+The 8B keeps 8.7 GiB of weights resident in VRAM (161 of its 226
+matrices) plus a 1.1 GiB K/V mirror at the default 4096 context; the
 token embedding never uploads - row gathers are the one workload these
-kernels are wrong for, which is also why the tied-embedding 1b gains
-less: its 128256-row output head stays on the CPU). Placement is
-per-matrix, so running out of VRAM mid-load just leaves the remaining
-matrices on the CPU tiers with one warning line - a capped run
-(`ALPACCA_GPU_VRAM_MB=500` on the 1b: 44 matrices on GPU, the rest on
-CPU) decodes token-identically to the uncapped one.
+kernels are wrong for. Placement is per-matrix, so running out of VRAM
+mid-load just leaves the remaining matrices on the CPU tiers with one
+warning line - a capped run (`ALPACCA_GPU_VRAM_MB=500` on the 1b: 44
+matrices on GPU, the rest on CPU) decodes token-identically to the
+uncapped one, with the chain declining mixed placement.
 
-Correctness, measured: GpuMatrix matches QuantMatrix within 9.8e-7
+Correctness, measured: GpuMatrix matches QuantMatrix within 9.9e-7
 worst relative error across all ten quant formats (bar 2e-5), row access
-is bit-exact, and 48-token greedy decode is token-identical to the exact
-f32 reference path on both test models (llama3.2:1b vs the CPU tiers
-directly, 48/48; the 8B vs `ALPACCA_INT_DOT=0`, 48/48, final logits
-within 1.6e-6 relative - the int-dot CPU tier is approximate by design,
-so greedy text can drift from *it* after ~25 tokens on Q4_K_M while both
-stay glued to the reference).
-
-Where a decoded 8B token goes (instrumented with `cuda.synchronize`
-timing, ~31-36 ms/token): 12.2 ms of GPU kernels streaming the 9.4 GB of
-resident codes at 772 GB/s (a plain saxpy measures 918 on this card),
-~13 ms of Python-side numba launch machinery across 161 kernel launches,
-2.2 ms of activation uploads, ~1.6 ms of result downloads, ~1 ms of CPU
-attention. The launch machinery is the honest next target; device-
-resident activation chaining would remove most of it and is deliberately
-not in v1.
+is bit-exact, and the batch attention kernel matches the NumPy einsum
+within 1.9e-6 worst relative error over randomized ragged shapes
+(batch==t, batch<t continuation, GQA groups 1-8, sliding windows).
+48-token greedy decode through the full chain is token-identical to the
+exact f32 reference path on both test models (llama3.2:1b vs the CPU
+tiers directly, 48/48; the 8B vs `ALPACCA_INT_DOT=0`, 48/48 - the
+int-dot CPU tier is approximate by design, so greedy text can drift
+from *it* on Q4_K_M while both stay glued to the reference), and a
+two-prompt shared-prefix sequence (prefill, decode, re-prefill with a
+different suffix, decode - the truncation/mirror-invalidation path) is
+token-identical chain-on vs chain-off.
 
 GPU knobs:
 
 - `ALPACCA_GPU=0`: disable the tier; `ALPACCA_GPU=force` accepts a
   non-pinned numba-cuda at your own risk.
+- `ALPACCA_GPU_CHAIN=0`: keep the tier but disable the device-resident
+  decode chain (decode falls back to the v1 per-matvec dispatch).
 - `ALPACCA_GPU_VRAM_MB=N`: cap uploaded weight bytes (the
   mixed-placement test hook; free VRAM minus a 512 MiB reserve decides
   otherwise).
-- `ALPACCA_GPU_WIDE_MATMUL_ELEMS=N`: matrices at or below `N` elements
-  use the one-launch wide matmul kernel for prefill, larger ones loop
-  the matvec kernel per batch row. Default 32M, just under the measured
-  ~34M-element crossover. Re-measure, do not re-guess.
+- `ALPACCA_GPU_WIDE_MATMUL_ELEMS` is retired: the tiled GEMM handles
+  every matrix size in one launch, so there are no longer two batched
+  kernels to choose between. The variable is accepted and silently
+  ignored so existing environments keep working.
 
 One installation trap the `[gpu]` pins exist to prevent: with
 `nvidia-nvjitlink` missing, cuda.core's DLL search can silently find a

@@ -180,9 +180,16 @@ class Layer:
 
 
 class Model:
-    # class default so instances built without load() (tests use __new__)
-    # take the reference attention path; load() sets the real value
+    # class defaults so instances built without load() (tests use __new__)
+    # take the reference paths; load() sets the real values. The two gpu
+    # flags flip together when the load put matrices in VRAM, which is
+    # exactly the condition ALPACCA_GPU=0 prevents - so both stage-2 gpu
+    # paths honor the same off switch as the tier itself.
     _use_kernel_attention = False
+    _use_gpu_batch_attention = False
+    _use_gpu_chain = False
+    _gpu_chain = None          # built lazily by cuda.chain_forward
+    _gpu_chain_dead = False    # any chain failure parks it for good
 
     def __init__(self, hp: Hyperparams, tokenizer: Tokenizer):
         self.hp = hp
@@ -682,6 +689,12 @@ class Model:
                     m._use_kernel_attention = True
             if gpu_matrices and _gpu is not None:
                 _gpu.warmup()  # same rule: JIT compile counts as load time
+                # stage-2 gpu paths: prefill batch attention and the
+                # device decode chain. Both fall back per call / per
+                # instance to the exact paths below, so flipping the
+                # flags is safe even for geometries the kernels decline.
+                m._use_gpu_batch_attention = True
+                m._use_gpu_chain = True
             m.load_seconds = time.time() - t0
             return m
         finally:
@@ -729,6 +742,7 @@ class Model:
         self.n_past = 0
         self.cached_ids = []
         self.last_prefill_forwarded = 0
+        self._chain_invalidate(0)  # fresh arrays: nothing mirrored survives
 
     def reset(self):
         self._init_cache()
@@ -744,6 +758,21 @@ class Model:
                 del self.cache_v[li][n_tokens:]
             self.n_past = n_tokens
         del self.cached_ids[n_tokens:]
+        self._chain_invalidate(n_tokens)  # rows past here will be rewritten
+
+    def _chain_invalidate(self, pos: int) -> None:
+        """Report a host KV-cache mutation from row `pos` on, so the gpu
+        decode chain's device mirror re-uploads exactly what changed.
+
+        The complete mutation set, each of which calls here: _init_cache
+        (load and reset), _truncate_cache (prefill's prefix restart),
+        forward_batch and _forward_np's cache-row writes, and their
+        gemma3 twins. The pure-Python paths append to list caches and
+        cannot coexist with a chain: no NumPy means no gpu tier at all.
+        A no-op until cuda.chain_forward builds a chain."""
+        ch = self._gpu_chain
+        if ch is not None:
+            ch.invalidate(pos)
 
     # ---- rotary embeddings ----------------------------------------------
 
@@ -859,6 +888,14 @@ class Model:
 
     def _attention_batch_np(self, q, K, V, positions, group: int, inv_sqrt: float):
         hp = self.hp
+        if self._use_gpu_batch_attention:
+            # gpu batch attention (alpacca/cuda.py): same math with an
+            # online softmax. None (unsupported geometry, tier parked)
+            # falls through - the einsum below stays the reference.
+            from . import cuda as _gpu
+            out = _gpu.attention_batch(q, K, V, positions, group, inv_sqrt)
+            if out is not None:
+                return out
         qg = q.reshape(len(q), hp.n_kv, group, hp.head_dim)
         scores = np.einsum("tkgh,skh->tkgs", qg, K, optimize=True) * inv_sqrt
         allowed = np.arange(K.shape[0], dtype=np.int32)[None, :] <= positions[:, None]
@@ -885,6 +922,7 @@ class Model:
 
         hp = self.hp
         pos0 = self.n_past
+        self._chain_invalidate(pos0)  # this batch rewrites rows from pos0
         positions = np.arange(pos0, pos0 + len(tokens), dtype=np.int32)
         # matrix_rows returns a fresh float32 array for dense and quantized
         x = T.matrix_rows(self.tok_embd, tokens)
@@ -924,16 +962,28 @@ class Model:
             x = x + T.matmul_t(att_out, ly.wo)
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            if ly.wgu is not None:
-                gu = T.matmul_t(h, ly.wgu)
-                gate = gu[:, :hp.n_ff]
-                up = gu[:, hp.n_ff:]
+            ffn = None
+            if (ly.wgu is not None and self._use_gpu_batch_attention
+                    and hp.arch not in _GEMMA_ARCHES):
+                # fused device FFN (alpacca/cuda.py): both GEMMs plus the
+                # silu*up between them in VRAM, so the (batch, 2*n_ff)
+                # gate|up block never travels. None (mixed placement,
+                # batch 1, degraded) falls through to the exact host path.
+                from . import cuda as _gpu
+                ffn = _gpu.ffn_swiglu_batch(ly.wgu, ly.w_down, h)
+            if ffn is not None:
+                x = x + ffn
             else:
-                gate = T.matmul_t(h, ly.w_gate)
-                up = T.matmul_t(h, ly.w_up)
-            act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
-                   else gate / (1.0 + np.exp(-gate))) * up
-            x = x + T.matmul_t(act, ly.w_down)
+                if ly.wgu is not None:
+                    gu = T.matmul_t(h, ly.wgu)
+                    gate = gu[:, :hp.n_ff]
+                    up = gu[:, hp.n_ff:]
+                else:
+                    gate = T.matmul_t(h, ly.w_gate)
+                    up = T.matmul_t(h, ly.w_up)
+                act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
+                       else gate / (1.0 + np.exp(-gate))) * up
+                x = x + T.matmul_t(act, ly.w_down)
 
         self.n_past += len(tokens)
         self.cached_ids.extend(tokens)
@@ -942,8 +992,19 @@ class Model:
         return T.matvec(self.output, T.rmsnorm(x[-1], self.out_norm, hp.rms_eps))
 
     def _forward_np(self, token: int):
+        if self._use_gpu_chain:
+            # device-resident decode chain (alpacca/cuda.py): the whole
+            # token on the GPU, one sync. None means unavailable or just
+            # failed - either way the body below recomputes the token
+            # correctly, and a failed chain never activates again.
+            from . import cuda as _gpu
+            logits = _gpu.chain_forward(self, token)
+            if logits is not None:
+                self.n_past += 1
+                return logits
         hp = self.hp
         pos = self.n_past
+        self._chain_invalidate(pos)  # the cache writes below are host-side
         x = T.matrix_row(self.tok_embd, token)  # fresh float32 copy
         if hp.embed_scale != 1.0:
             x = x * hp.embed_scale
@@ -1071,6 +1132,16 @@ class Model:
                                    inv_sqrt: float, window: int = 0,
                                    kv_start: int = 0):
         hp = self.hp
+        if self._use_gpu_batch_attention:
+            # same gpu path as _attention_batch_np; the kernel carries
+            # the window mask and kv_start natively. Today's gemma3
+            # models decline it anyway (head_dim 256 > the kernel's 128)
+            # and keep this exact NumPy path - see cuda._ATT_HD.
+            from . import cuda as _gpu
+            out = _gpu.attention_batch(q, K, V, positions, group, inv_sqrt,
+                                       window, kv_start)
+            if out is not None:
+                return out
         qg = q.reshape(len(q), hp.n_kv, group, hp.head_dim)
         scores = np.einsum("tkgh,skh->tkgs", qg, K, optimize=True) * inv_sqrt
         kv_pos = np.arange(kv_start, kv_start + K.shape[0], dtype=np.int32)
@@ -1100,6 +1171,7 @@ class Model:
 
         hp = self.hp
         pos0 = self.n_past
+        self._chain_invalidate(pos0)  # same contract as forward_batch
         positions = np.arange(pos0, pos0 + len(tokens), dtype=np.int32)
         x = T.matrix_rows(self.tok_embd, tokens) * hp.embed_scale
         inv_sqrt = hp.attention_scale
@@ -1165,6 +1237,7 @@ class Model:
     def _forward_gemma3_np(self, token: int):
         hp = self.hp
         pos = self.n_past
+        self._chain_invalidate(pos)  # same contract as _forward_np
         x = T.matrix_row(self.tok_embd, token) * hp.embed_scale
         inv_sqrt = hp.attention_scale
         group = hp.n_head // hp.n_kv
