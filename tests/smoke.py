@@ -3104,6 +3104,170 @@ def main() -> None:
             check("vram-capped mixed placement stays token-identical",
                   gpu_cap_ids == gpu_cpu_ids,
                   f"{gpu_cap_ids} vs {gpu_cpu_ids}")
+
+            # ---- device prefill chain legs + the prefix cache on the chain
+            # In-process on the tiny model. Within one path the chain is
+            # byte-deterministic: chunk boundaries (want_logits=False on
+            # every chunk but the last), live prefix reuse, and a prefix-
+            # cache restore all reproduce the one-chunk logits bytes.
+            # Across paths (chain vs host recompute) the contract is
+            # token-identity, exercised via the failure legs: a mid-chunk
+            # failure falls back to the host recompute for that chunk, and
+            # only _PREFILL_PARK_AFTER consecutive failures park the path.
+            import alpacca.model as _amodel
+
+            def _chain_load():
+                return _amodel.Model.load(str(gpu_gguf), progress=False)
+
+            def _greedy16(m, lg):
+                outg = []
+                for _ in range(16):
+                    t = int(np.argmax(lg))
+                    outg.append(t)
+                    lg = m.forward(t)
+                return outg
+
+            try:
+                cm = _chain_load()
+                chain_prompt = cm.tok.encode(
+                    "hello world the quick brown fox jumps over the lazy dog"
+                    " and the crow watches from the wall at dusk",
+                    add_bos=True)
+                os.environ["ALPACCA_PREFILL_CHUNK"] = "4096"
+                chain_ref = np.asarray(cm.prefill(chain_prompt))
+                chain_ref_ids = _greedy16(cm, chain_ref)
+                check("device prefill chain engages on the tiny model",
+                      cm._gpu_chain is not None and not cm._gpu_prefill_dead)
+
+                cm2 = _chain_load()
+                os.environ["ALPACCA_PREFILL_CHUNK"] = "5"
+                lg = np.asarray(cm2.prefill(chain_prompt))
+                check("chain chunk boundaries are byte-invariant "
+                      "(want_logits=False legs included)",
+                      np.array_equal(chain_ref, lg))
+
+                cm3 = _chain_load()
+                real_chunk = AG.DecodeChain.prefill_chunk
+                boom_calls = {"n": 0}
+
+                def _boom(self, model, toks, want_logits):
+                    boom_calls["n"] += 1
+                    raise RuntimeError("synthetic mid-chunk failure")
+
+                AG.DecodeChain.prefill_chunk = _boom
+                try:
+                    lg = cm3.prefill(chain_prompt)
+                finally:
+                    AG.DecodeChain.prefill_chunk = real_chunk
+                check("mid-chunk failures fall back token-identically",
+                      _greedy16(cm3, lg) == chain_ref_ids)
+                check("only a failure streak parks the device prefill path",
+                      cm3._gpu_prefill_dead
+                      and boom_calls["n"] == AG._PREFILL_PARK_AFTER
+                      and cm3._gpu_prefill_fails == AG._PREFILL_PARK_AFTER)
+
+                cm4 = _chain_load()
+                flaky = {"left": 1}
+
+                def _flaky(self, model, toks, want_logits):
+                    if flaky["left"] > 0:
+                        flaky["left"] -= 1
+                        raise RuntimeError("transient vram spike")
+                    return real_chunk(self, model, toks, want_logits)
+
+                AG.DecodeChain.prefill_chunk = _flaky
+                try:
+                    lg = np.asarray(cm4.prefill(chain_prompt))
+                finally:
+                    AG.DecodeChain.prefill_chunk = real_chunk
+                check("a transient chunk failure neither parks nor drifts",
+                      np.array_equal(chain_ref, lg)
+                      and not cm4._gpu_prefill_dead
+                      and cm4._gpu_prefill_fails == 0)
+
+                cm5 = _chain_load()
+                os.environ["ALPACCA_PREFILL_CHUNK"] = "256"
+                cm5.prefill(chain_prompt[:11])
+                lg = np.asarray(cm5.prefill(chain_prompt))
+                check("live prefix reuse onto the chain is byte-identical",
+                      np.array_equal(chain_ref, lg)
+                      and cm5.last_prefill_forwarded
+                      == len(chain_prompt) - 11)
+
+                # prefix cache on the chain: a restore truncates to 0 and
+                # the mirror re-uploads through its gap-fill, so the warm
+                # prefill must equal a cold one byte-for-byte. MIN_MATCH is
+                # shrunk so tiny-model prompts exercise the mechanism.
+                min_match = _amodel._PREFIX_CACHE_MIN_MATCH
+                _amodel._PREFIX_CACHE_MIN_MATCH = 4
+                try:
+                    cm6 = _chain_load()
+                    conv_b = [chain_prompt[0]] + cm6.tok.encode(
+                        "ships in the harbor waited for the tide to turn"
+                        " while gulls argued over scraps", add_bos=False)
+                    warm_prompt = chain_prompt + cm6.tok.encode(
+                        " and the night came down", add_bos=False)
+                    cm6.prefill(chain_prompt)
+                    cm6.prefill(conv_b)          # context switch: saves A
+                    st1 = cm6.prefix_cache_stats()
+                    lg = np.asarray(cm6.prefill(warm_prompt))  # restores A
+                    st2 = cm6.prefix_cache_stats()
+                    cm7 = _chain_load()
+                    cold = np.asarray(cm7.prefill(warm_prompt))
+                    check("prefix cache saves on switch, restores on the "
+                          "chain", st1["saves"] == 1 and st1["slots"] == 1
+                          and st2["hits"] == 1 and st2["saves"] == 2)
+                    check("restored prefill is byte-identical to cold",
+                          np.array_equal(lg, cold))
+
+                    # mid-run budget shrink: the next route call drains the
+                    # store to the new cap, oldest-first, keeping the MRU
+                    # slot (the just-restored conversation)
+                    slot_a = st1["bytes"]
+                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = (
+                        f"{slot_a * 1.1 / 1048576:.6f}")
+                    cm6.prefill(warm_prompt)     # no save, no restore: drain
+                    st3 = cm6.prefix_cache_stats()
+                    check("mid-run budget shrink drains the store to cap",
+                          st3["slots"] == 1 and st3["bytes"] == slot_a
+                          and st3["evictions"] == 1)
+                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = "0"
+                    cm6.prefill(conv_b)
+                    st4 = cm6.prefix_cache_stats()
+                    check("disable clears the store",
+                          st4["slots"] == 0 and st4["bytes"] == 0)
+
+                    # protected-slot edge: budget fits one slot; switching
+                    # back to the saved conversation must skip the pre-
+                    # restore save rather than evict the slot being restored
+                    cm8 = _chain_load()
+                    os.environ.pop("ALPACCA_PREFIX_CACHE_MB", None)
+                    cm8.prefill(chain_prompt)
+                    cm8.prefill(conv_b)          # saves A
+                    sa = cm8.prefix_cache_stats()
+                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = (
+                        f"{sa['bytes'] * 1.1 / 1048576:.6f}")
+                    cm8.prefill(chain_prompt)    # restore A; B-save loses
+                    sb = cm8.prefix_cache_stats()
+                    check("pre-restore save loses to the protected slot",
+                          sb["hits"] == 1 and sb["saves"] == sa["saves"]
+                          and sb["evictions"] == 0 and sb["slots"] == 1
+                          and cm8.last_prefill_forwarded == 1)
+                finally:
+                    _amodel._PREFIX_CACHE_MIN_MATCH = min_match
+                    os.environ.pop("ALPACCA_PREFIX_CACHE_MB", None)
+
+                # the pure-python gate: without numpy the route is inert
+                has_np = _amodel.T.HAS_NUMPY
+                _amodel.T.HAS_NUMPY = False
+                try:
+                    routed = cm7._prefix_cache_route(list(chain_prompt), 0)
+                finally:
+                    _amodel.T.HAS_NUMPY = has_np
+                check("pure-python tier keeps the single-cache behavior",
+                      routed == 0 and not cm7._prefix_slots)
+            finally:
+                os.environ.pop("ALPACCA_PREFILL_CHUNK", None)
         os.environ["ALPACCA_GPU"] = "0"  # back to the suite-wide host pin
 
         print("== removal ==")

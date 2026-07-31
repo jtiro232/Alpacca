@@ -487,7 +487,9 @@ Rules of thumb:
 - **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow. Good
   for air-gapped checks, not long conversations.
 - **chat/server reuse**: repeated turns or requests with a shared prompt prefix
-  skip already-cached K/V work automatically.
+  skip already-cached K/V work automatically, and interleaved conversations
+  restore each other's discarded contexts through the multi-slot prefix
+  cache (`ALPACCA_PREFIX_CACHE_MB` below) instead of re-prefilling.
 
 Useful environment knobs:
 
@@ -502,6 +504,19 @@ Useful environment knobs:
 - `ALPACCA_F32=1`: force the NumPy loader to expand all quantized matrices
   to float32, useful for A/B checks and small models where BLAS wins.
 - `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
+- `ALPACCA_PREFIX_CACHE_MB=N`: MiB budget (default 1024, `0` disables) for
+  the multi-slot prefix cache. When `prefill` switches away from a live
+  context about to lose 256+ tokens of K/V work, those rows are
+  snapshotted, keyed by their exact token ids; switching back restores
+  the slot instead of re-prefilling, so interleaved conversations - even
+  behind a long shared system prompt - each pay their unique prefill once.
+  Slots are LRU-evicted against the budget, a mid-run shrink drains the
+  store on the next call, and a restore copies every shared row, so a
+  warm prefill is byte-identical to a cold one on the same tier path.
+  `0` is exactly the pre-feature single-cache behavior; the stdlib tier
+  never uses slots. `Model.prefix_cache_stats()` counts
+  slots/bytes/hits/misses/saves/evictions and `describe()` shows a
+  `prefix cache` segment while slots exist.
 - `ALPACCA_SMALL_MATVEC_ELEMS=N`: matrices below `N` elements use the
   batched-matmul quantized matvec instead of the einsum one. Default 0 (off) -
   einsum measured faster at every shape a llama- or Gemma-class model uses, on

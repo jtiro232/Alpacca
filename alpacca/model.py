@@ -73,6 +73,44 @@ def _dense_budget_bytes() -> int:
         return 0
 
 
+# ALPACCA_PREFIX_CACHE_MB: byte budget for the multi-slot prefix cache -
+# saved KV snapshots that let `prefill` switch between interleaved
+# conversations without re-prefilling each one from scratch. Unset, blank
+# or unparseable means the 1024 MiB default; zero or negative disables the
+# feature entirely, which is exactly the pre-feature single-cache behavior.
+_PREFIX_CACHE_DEFAULT_MB = 1024.0
+# _PREFIX_CACHE_MIN_MATCH is the feature's one significance threshold, in
+# tokens: a slot that diverges from the incoming prompt must share at least
+# this much to be considered, a restore must beat the live cache's prefix
+# by at least this much (every lcp row is copied - and re-uploaded on the
+# gpu tier - so a few tokens of gain never pays for it), and a context
+# switch must be discarding at least this much live tail to be worth a
+# snapshot.
+_PREFIX_CACHE_MIN_MATCH = 256
+
+
+def _prefix_cache_budget_bytes() -> int:
+    raw = os.environ.get("ALPACCA_PREFIX_CACHE_MB")
+    if raw is None or not raw.strip():
+        mb = _PREFIX_CACHE_DEFAULT_MB
+    else:
+        try:
+            mb = float(raw.strip())
+        except ValueError:
+            mb = _PREFIX_CACHE_DEFAULT_MB
+        if not math.isfinite(mb):
+            mb = _PREFIX_CACHE_DEFAULT_MB
+    if mb <= 0.0:
+        return 0
+    try:
+        return int(mb * 1024 * 1024)
+    except OverflowError:
+        # a finite mb so large the float product overflows: the user asked
+        # for effectively unlimited, which must not collapse into the =0
+        # disable-and-drop-all-slots sentinel
+        return 2 ** 63
+
+
 def auto_budget_fit_mb(path: str, n_ctx: int = 0):
     """Exact sizing inputs for the CLI's auto dense budget, from the GGUF
     header alone: (eligible_mb, fixed_mb) where eligible_mb is the dense
@@ -190,9 +228,21 @@ class Model:
     _use_gpu_chain = False
     _gpu_chain = None          # built lazily by cuda.chain_prefill/_forward
     _gpu_chain_dead = False    # any chain failure parks it for good
-    _gpu_prefill_dead = False  # ...and any prefill-chunk failure parks
-    #                            the device prefill path (decode chain
-    #                            keeps its own verdict)
+    _gpu_prefill_dead = False  # ...while the device prefill path parks
+    #                            only after _PREFILL_PARK_AFTER chunk
+    #                            failures IN A ROW (decode chain keeps
+    #                            its own verdict): one transient VRAM
+    #                            spike costs one chunk, not the path
+    _gpu_prefill_fails = 0     # the consecutive-failure streak
+    # multi-slot prefix cache (see the "prefix cache" section): the store
+    # is created lazily so __new__-built instances get a fresh dict, never
+    # a class-shared one; the counters read as class zeros until touched
+    _prefix_slots = None       # tuple(ids) -> (k_rows, v_rows, nbytes)
+    _prefix_bytes = 0
+    _prefix_hits = 0
+    _prefix_misses = 0
+    _prefix_saves = 0
+    _prefix_evictions = 0
 
     def __init__(self, hp: Hyperparams, tokenizer: Tokenizer):
         self.hp = hp
@@ -776,6 +826,148 @@ class Model:
         ch = self._gpu_chain
         if ch is not None:
             ch.invalidate(pos)
+
+    # ---- prefix cache (saved KV snapshots) ------------------------------
+
+    def _prefix_cache_route(self, tokens: list[int], n: int) -> int:
+        """Multi-slot prefix reuse for `prefill`: `n` is the incoming
+        prompt's longest common prefix (LCP) with the LIVE cache. When a
+        saved snapshot shares a sufficiently longer prefix (at least
+        _PREFIX_CACHE_MIN_MATCH tokens past the live cache's - the copy
+        has to be worth it), snapshot the live context if
+        it is worth keeping, restore the winning slot, and return the new
+        (longer) trusted prefix; otherwise return `n` unchanged. Either
+        way `prefill` proceeds with its normal suffix logic.
+
+        Gated on NumPy: the pure-Python tier keeps list caches, and the
+        byte-parity argument here rests on float32 array row copies - so
+        that tier keeps the exact single-cache behavior it has today, the
+        same guarantee as ALPACCA_PREFIX_CACHE_MB=0."""
+        budget = _prefix_cache_budget_bytes()
+        if budget <= 0 or not T.HAS_NUMPY:
+            if self._prefix_slots:
+                # the budget dropped to zero mid-run: release the RAM now
+                self._prefix_slots.clear()
+                self._prefix_bytes = 0
+            return n
+        store = self._prefix_slots
+        if store is None:
+            store = self._prefix_slots = {}
+        while store and self._prefix_bytes > budget:
+            # the budget shrank mid-run: honor the new cap before serving
+            # from the store (dict order IS the LRU order: drop the front)
+            self._prefix_bytes -= store.pop(next(iter(store)))[2]
+            self._prefix_evictions += 1
+
+        # best saved slot: usable when its ids are a full prefix of the
+        # incoming prompt or share at least _PREFIX_CACHE_MIN_MATCH tokens,
+        # and a restore must beat the live cache's prefix by a full
+        # _PREFIX_CACHE_MIN_MATCH to be worth the all-rows copy. Ties and
+        # near-ties keep the live cache (no copy beats a copy).
+        ids = tuple(tokens)
+        best_key = None
+        best_lcp = n + _PREFIX_CACHE_MIN_MATCH - 1
+        for key in store:
+            m = min(len(key), len(ids))
+            if key[:m] == ids[:m]:
+                lcp = m       # one side is a prefix of the other
+            else:
+                lcp = 0
+                while lcp < m and key[lcp] == ids[lcp]:
+                    lcp += 1
+                if lcp < _PREFIX_CACHE_MIN_MATCH:
+                    continue  # diverges too early to be worth the copy
+            if lcp > best_lcp:
+                best_key, best_lcp = key, lcp
+
+        # context-switch detection: a restore - or the heavy truncate that
+        # `prefill` is about to do anyway - is about to discard a live tail
+        # worth keeping. The test is the ABSOLUTE size of the discarded
+        # tail, not its share of the context: interleaved conversations
+        # behind a long shared system prompt discard only their unique
+        # tails, and those are exactly what the slots exist to bring back.
+        # Same-conversation turns extend their own prefix (n == live) and
+        # never pass this test, so the hot path stays copy-free; this is
+        # the ONLY place snapshots are taken.
+        live = len(self.cached_ids)
+        if live - n >= _PREFIX_CACHE_MIN_MATCH:
+            self._prefix_cache_save(budget, protect=best_key)
+
+        if best_key is None:
+            if n < live and n < len(ids):
+                # a genuine divergence from the live context that no slot
+                # could serve; live-cache extensions and prompts the live
+                # cache already fully contains are neither hit nor miss
+                self._prefix_misses += 1
+            return n
+        self._prefix_hits += 1
+        slot = store.pop(best_key)
+        store[best_key] = slot  # LRU: most recently used moves to the back
+        self._prefix_cache_restore(best_key, slot, best_lcp)
+        return best_lcp
+
+    def _prefix_cache_save(self, budget: int, protect: tuple | None = None) -> None:
+        """Snapshot the live rows [0:n_past) of every layer as float32
+        copies, keyed by the exact token ids they were computed from.
+        Called only at context-switch time (_prefix_cache_route). `protect`
+        is the slot the caller is about to restore: eviction must never
+        take it, and when even evicting every OTHER slot cannot make room,
+        the save loses - the restore is the prompt actually being served."""
+        store = self._prefix_slots
+        key = tuple(self.cached_ids)
+        if key in store:
+            store[key] = store.pop(key)  # same ids, same rows: touch LRU
+            return
+        n_rows = self.n_past
+        if n_rows <= 0 or len(key) != n_rows:
+            return  # nothing to keep / caches out of step: save nothing
+        row_bytes = sum(self.cache_k[li][:n_rows].nbytes +
+                        self.cache_v[li][:n_rows].nbytes
+                        for li in range(self.hp.n_layer))
+        if row_bytes > budget:
+            return  # one snapshot larger than the whole budget: never saved
+        while self._prefix_bytes + row_bytes > budget:
+            # dict order IS the LRU order: evict from the front
+            oldest = next((k for k in store if k != protect), None)
+            if oldest is None:
+                return  # only the protected slot is left: skip the save
+            self._prefix_bytes -= store.pop(oldest)[2]
+            self._prefix_evictions += 1
+        ks = [self.cache_k[li][:n_rows].copy() for li in range(self.hp.n_layer)]
+        vs = [self.cache_v[li][:n_rows].copy() for li in range(self.hp.n_layer)]
+        store[key] = (ks, vs, row_bytes)
+        self._prefix_bytes += row_bytes
+        self._prefix_saves += 1
+
+    def _prefix_cache_restore(self, key: tuple, slot: tuple, lcp: int) -> None:
+        """Copy a saved slot's rows [0:lcp) back into the live cache.
+
+        Goes through _truncate_cache(0) first so every invalidation hook
+        fires exactly as it does for any host mutation - the gpu decode
+        chain's mirror sees a truncation followed by rewritten rows
+        (invalidate-before-write, the same contract as forward_batch) and
+        lazily re-uploads them on its next use. All lcp rows are copied,
+        never just the part past the live LCP: the slot's rows are the
+        bytes a prefill of these ids produced, and re-using live rows
+        computed under different chunk boundaries would break the
+        byte-parity guarantee."""
+        ks, vs, _ = slot
+        self._truncate_cache(0)
+        for li in range(self.hp.n_layer):
+            self.cache_k[li][:lcp] = ks[li][:lcp]
+            self.cache_v[li][:lcp] = vs[li][:lcp]
+        self.n_past = lcp
+        self.cached_ids.extend(key[:lcp])
+
+    def prefix_cache_stats(self) -> dict:
+        """Counters for the multi-slot prefix cache: hits are restores,
+        misses are context switches no slot could serve."""
+        return {"slots": len(self._prefix_slots or ()),
+                "bytes": self._prefix_bytes,
+                "hits": self._prefix_hits,
+                "misses": self._prefix_misses,
+                "saves": self._prefix_saves,
+                "evictions": self._prefix_evictions}
 
     # ---- rotary embeddings ----------------------------------------------
 
@@ -1434,6 +1626,11 @@ class Model:
         max_prefix = min(len(tokens), len(self.cached_ids))
         while n < max_prefix and tokens[n] == self.cached_ids[n]:
             n += 1
+        # multi-slot prefix cache: a saved snapshot sharing a longer prefix
+        # than the live cache restores here (snapshotting the live context
+        # first when it is worth keeping), and `n` grows to match; with the
+        # feature disabled this returns `n` untouched
+        n = self._prefix_cache_route(tokens, n)
         if n == len(tokens):
             n = max(0, len(tokens) - 1)
         if n != self.n_past:
@@ -1482,10 +1679,15 @@ class Model:
             attn = (f" | swa {hp.sliding_window} ({layout}, {hp.swa_rule}) | "
                     f"attn scale {hp.attention_scale:.4g}"
                     f"{' (metadata)' if hp.attention_scale_from_metadata else ''}")
+        # only when snapshots exist: an idle store is invisible
+        prefix = ""
+        if self._prefix_slots:
+            prefix = (f" | prefix cache {len(self._prefix_slots)} slots "
+                      f"({self._size(self._prefix_bytes)})")
         return (f"{hp.arch} | {hp.n_layer} layers | embd {hp.n_embd} | "
                 f"heads {hp.n_head}/{hp.n_kv} | ff {hp.n_ff} | vocab {hp.n_vocab} | "
                 f"~{params / 1e6:.0f}M params | {ctx}{attn} | "
-                f"backend {T.backend_name()} | {storage}")
+                f"backend {T.backend_name()} | {storage}{prefix}")
 
     @staticmethod
     def _size(nbytes: float) -> str:

@@ -1908,6 +1908,25 @@ class DecodeChain:
             self._hpx = buf
         return buf
 
+    def _prefill_scratch_growth(self, batch: int) -> int:
+        """Bytes of NEW device scratch a `batch`-token chunk would
+        allocate - the grow-only buffers' existing capacity is free. The
+        key/size table mirrors prefill_chunk's _pbuf calls exactly."""
+        need = 0
+        for key, n in (("x", batch * self.n_embd),
+                       ("h", batch * self.n_embd),
+                       ("o", batch * self.n_embd),
+                       ("qk", batch * (self.qd + self.kvd)),
+                       ("v", batch * self.kvd),
+                       ("q3", batch * self.qd),
+                       ("att", batch * self.qd),
+                       ("gu", batch * 2 * self.n_ff),
+                       ("act", batch * self.n_ff)):
+            buf = self._pdev.get(key)
+            if buf is None or buf.size < n:
+                need += (n - (buf.size if buf is not None else 0)) * 4
+        return need
+
     def prefill_chunk(self, model, tokens: list[int], want_logits: bool):
         """One prefill chunk fully on the device; returns the last row's
         logits, or None when want_logits is False. The caller
@@ -2148,6 +2167,11 @@ def chain_forward(model, token: int):
         return None
 
 
+# consecutive prefill-chunk failures before the device prefill path is
+# parked for the model instance; a success resets the streak
+_PREFILL_PARK_AFTER = 3
+
+
 def chain_prefill(model, tokens, want_logits: bool):
     """One device-resident prefill chunk for `model`, or None when the
     path is unavailable - the caller (Model.forward_batch) then runs its
@@ -2162,11 +2186,17 @@ def chain_prefill(model, tokens, want_logits: bool):
     K/V rows land in the mirror as they are computed and the decode
     chain's bulk mirror upload becomes a no-op. Batch 1 stays on the
     existing path (GEMM batch 1 rides the matvec kernel there,
-    bit-identical with decode - see GpuMatrix.matmul_t). ANY runtime
-    failure parks the prefill path for this model instance with one
-    line, and the caller recomputes the failed chunk; the decode chain
-    keeps its own verdict (though a chain that failed on ITS side also
-    takes this path down, since the mirror dies with the instance)."""
+    bit-identical with decode - see GpuMatrix.matmul_t).
+
+    Failure policy: a chunk whose scratch growth would not fit in free
+    VRAM (minus the reserve) is refused BEFORE any allocation, and a
+    runtime failure only counts toward a consecutive-failure streak -
+    the path parks for good at _PREFILL_PARK_AFTER in a row, so one
+    transient VRAM spike from another process costs one chunk, not the
+    device prefill path for the life of the serve. Either way the
+    caller recomputes the refused chunk; the decode chain keeps its own
+    verdict (though a chain that failed on ITS side also takes this
+    path down, since the mirror dies with the instance)."""
     st = _init()
     if not st.get("ok") or len(tokens) < 2:
         return None
@@ -2187,14 +2217,28 @@ def chain_prefill(model, tokens, want_logits: bool):
                   f"({type(e).__name__}: {e})", file=sys.stderr)
             return None
         model._gpu_chain = ch
+    growth = ch._prefill_scratch_growth(len(tokens))
+    if growth > 0:
+        err, free_b, _total = st["rt"].cudaMemGetInfo()
+        if err == 0 and growth + (GPU_RESERVE_MB << 20) > free_b:
+            return None  # no room right now: not a failure, no streak
     try:
-        return (ch.prefill_chunk(model, tokens, want_logits),)
+        out = (ch.prefill_chunk(model, tokens, want_logits),)
     except Exception as e:
-        model._gpu_prefill_dead = True
-        print(f"alpacca-gpu: device prefill disabled ({type(e).__name__}: "
-              f"{e}); prefill continues on the existing path",
-              file=sys.stderr)
+        model._gpu_prefill_fails += 1
+        if model._gpu_prefill_fails >= _PREFILL_PARK_AFTER:
+            model._gpu_prefill_dead = True
+            print(f"alpacca-gpu: device prefill disabled "
+                  f"({type(e).__name__}: {e}); prefill continues on the "
+                  f"existing path", file=sys.stderr)
+        else:
+            print(f"alpacca-gpu: device prefill chunk failed "
+                  f"({type(e).__name__}: {e}); the caller recomputes it "
+                  f"(streak {model._gpu_prefill_fails}/{_PREFILL_PARK_AFTER})",
+                  file=sys.stderr)
         return None
+    model._gpu_prefill_fails = 0
+    return out
 
 
 def warmup() -> None:
