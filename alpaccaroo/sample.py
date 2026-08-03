@@ -103,8 +103,89 @@ class Sampler:
                 prof.add("sampler", _perf() - t0)
         return self._sample(logits, banned)
 
+    def _greedy_fast(self, arr):
+        """argmax of the repeat-penalized logits without ever building the
+        penalized vector, or None to fall through to the general path.
+
+        PERFORMANCE_PLAN Track 1. The general path converts the whole
+        logits vector to float64 (1.2 MB on a 151936-token vocabulary),
+        scans it for NaN, penalizes it and scans it again. Greedy decoding
+        needs one index out of all that, and the repeat penalty can only
+        touch `repeat_last_n` entries - 64 by default.
+
+        Exact, not approximate:
+
+        * float32 -> float64 is exact and order-preserving, so an argmax
+          taken over the float32 values is the argmax of the float64 copy.
+        * the <= 64 penalized entries are still evaluated in float64,
+          because ``v / 1.1`` generally is not a float32.
+        * the winner is the better of "best penalized entry" and "best
+          untouched entry", ties broken by lower index - which is what
+          np.argmax does on the materialized vector.
+        * the untouched maximum is found among the top ``k+1`` values (at
+          most k entries can outrank it), then resolved to the FIRST index
+          holding that value, so a tie with a lower index outside the
+          partition cannot be missed.
+
+        Returns None whenever the general path's finiteness gate would have
+        sent this vector to the list implementation, so the NaN behaviour
+        the tests pin down is unchanged.
+        """
+        p = self.params
+        if not arr.size:
+            return None
+        # ONE pass over the vocabulary, and it does double duty. np.argmax
+        # returns the first index of the maximum; NaN compares greater than
+        # everything for it, so a NaN anywhere and an infinite maximum both
+        # surface as a non-finite value here - exactly the two conditions
+        # the general path's gate tests. An earlier version reached for
+        # argpartition to find the runner-up and measured 2x SLOWER than the
+        # path it was replacing: a quickselect over 151936 entries costs
+        # more than the float64 copy it saves.
+        top = int(_np.argmax(arr))
+        top_v = float(arr[top])
+        if not math.isfinite(top_v):
+            return None
+        if not p.repeat_penalty or p.repeat_penalty == 1.0 or not self.recent:
+            return top
+
+        touched = set(self.recent)
+        idx = _np.fromiter(sorted(touched), dtype=_np.int64)
+        vals = arr[idx].astype(_np.float64)
+        pen = _np.where(vals > 0.0, vals / p.repeat_penalty,
+                        vals * p.repeat_penalty)
+        if not bool(_np.isfinite(pen).all()):
+            # a degenerate penalty minted a NaN or an infinity the raw
+            # logits never had; the general path's gate would have caught it
+            return None
+        j = int(_np.argmax(pen))          # first max, so lower index wins
+        best_pen_i, best_pen_v = int(idx[j]), float(pen[j])
+
+        if top in touched:
+            # The best untouched entry is the runner-up behind up to 64
+            # penalized ones, and finding it costs another selection pass.
+            # Hand this rare shape to the general path instead of paying for
+            # the machinery on every token - the fallback IS the reference.
+            return None
+        # `top` is the first index of the global maximum and it was not
+        # penalized, so it is also the first index of the untouched maximum
+        if best_pen_v > top_v:
+            return best_pen_i
+        if best_pen_v < top_v:
+            return top
+        return min(best_pen_i, top)
+
     def _sample(self, logits, banned=None) -> int:
         p = self.params
+        if (T.HAS_NUMPY and not banned and p.temperature <= 0
+                and not math.isnan(p.temperature)
+                and isinstance(logits, _np.ndarray)
+                and logits.dtype == _np.float32):
+            # float32 only: converting a Python-float list to float32 would
+            # ROUND it, and the rounded argmax is not always the float64 one
+            hit = self._greedy_fast(logits)
+            if hit is not None:
+                return hit
         if T.HAS_NUMPY:
             # np.array always copies, so the penalty below cannot mutate the
             # caller's logits; float64 matches the Python-float arithmetic of

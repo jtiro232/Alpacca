@@ -810,6 +810,27 @@ def main() -> None:
                       and qm_f32.path_label() in ("numba-codes-f32",
                                                   "numpy-quant-einsum"),
                       f"{qm.path_label()} / {qm_f32.path_label()}")
+                # Package E: narrowing a dispatch to one thread changes who
+                # computes each row, never what the row computes. prange
+                # splits the ROW loop and every row's accumulation order is
+                # fixed, so this must be bit-identical, not merely close.
+                os.environ["ALPACCAROO_SERIAL_MATVEC_ELEMS"] = "0"
+                try:
+                    pooled = np.asarray(qm.matvec(x)).copy()
+                    pool_n = AK.dispatch_threads(_rows * _cols)
+                finally:
+                    os.environ.pop("ALPACCAROO_SERIAL_MATVEC_ELEMS", None)
+                os.environ["ALPACCAROO_SERIAL_MATVEC_ELEMS"] = str(1 << 40)
+                try:
+                    serial = np.asarray(qm.matvec(x)).copy()
+                    ser_n = AK.dispatch_threads(_rows * _cols)
+                finally:
+                    os.environ.pop("ALPACCAROO_SERIAL_MATVEC_ELEMS", None)
+                check(f"{_dt} narrow dispatch is bit-identical to the pool",
+                      np.array_equal(pooled, serial) and ser_n == 1
+                      and np.any(pooled != 0),
+                      f"threads {pool_n}->{ser_n}, "
+                      f"maxdiff {np.abs(pooled - serial).max():.3e}")
                 os.environ["ALPACCAROO_INT_MATMUL_MAX_BATCH"] = "0"
                 try:
                     X = rng.standard_normal((3, _cols)).astype(np.float32)
@@ -836,6 +857,141 @@ def main() -> None:
                       _fused_matmul_max_batch() == 0)
             finally:
                 os.environ.pop("ALPACCAROO_FUSED_MATMUL_MAX_BATCH", None)
+
+            # ---- grouped Q4_K+Q6_K kernel (Package D) --------------------
+            # A Q4_K_M file quantizes attn_q/attn_k to Q4_K and attn_v to
+            # Q6_K, so the decode group holds one of each and load-time row
+            # fusion cannot join them. The grouped kernel runs both in one
+            # parallel region; the per-row math is the per-matrix kernels'
+            # own, so this is pinned as bit-identical, not merely close.
+            g4 = QuantMatrix(q4_k_bytes(9 * 512), "Q4_K", 9, 512)
+            g6 = QuantMatrix(q6_k_bytes(5 * 512), "Q6_K", 5, 512)
+            gx = rng.standard_normal(512).astype(np.float32)
+            os.environ["ALPACCAROO_GROUP_KERNEL"] = "0"
+            try:
+                sep = [np.asarray(v).copy() for v in T.matvec_group([g4, g6], gx)]
+            finally:
+                os.environ.pop("ALPACCAROO_GROUP_KERNEL", None)
+            grp = [np.asarray(v).copy() for v in T.matvec_group([g4, g6], gx)]
+            check("grouped Q4_K+Q6_K kernel matches the per-matrix path exactly",
+                  all(np.array_equal(a, b) for a, b in zip(sep, grp))
+                  and np.any(sep[0] != 0) and np.any(sep[1] != 0),
+                  f"maxdiff {max(float(np.abs(a - b).max()) for a, b in zip(sep, grp)):.3e}")
+            check("ALPACCAROO_GROUP_KERNEL=0 falls back to per-matrix dispatch",
+                  AK.group_kernel_enabled(), "default should be on")
+            os.environ["ALPACCAROO_GROUP_KERNEL"] = "0"
+            try:
+                check("the group kernel flag is honoured",
+                      not AK.group_kernel_enabled())
+            finally:
+                os.environ.pop("ALPACCAROO_GROUP_KERNEL", None)
+            # shape gating: a pairing the kernel was not compiled for must
+            # take the per-matrix path rather than be forced into it
+            g5 = QuantMatrix(q5_k_bytes(5 * 512), "Q5_K", 5, 512)
+            check("only the compiled dtype pairing takes the grouped kernel",
+                  T._pair_indices([g4, g6], [True, True]) == (0, 1)
+                  and T._pair_indices([g4, g5], [True, True]) is None
+                  and T._pair_indices([g4, g6, g6], [True] * 3) is None
+                  and T._pair_indices([g4], [True]) is None)
+            wide6 = QuantMatrix(q6_k_bytes(5 * 1024), "Q6_K", 5, 1024)
+            check("a width mismatch never reaches the grouped kernel",
+                  T._pair_indices([g4, wide6], [True, True]) is None)
+
+            # ---- narrow-matrix dispatch + autotuning (Packages E, F) -----
+            from alpaccaroo import tuning as ATune
+            from alpaccaroo.model import Model as _TuneModel
+            pool = AK.threads()
+            default_thr = AK.SERIAL_MATVEC_ELEMS_DEFAULT
+            check("dispatch threshold splits at the documented boundary",
+                  AK.serial_matvec_elems() == default_thr
+                  and AK.dispatch_threads(default_thr) == (1 if pool > 1 else pool)
+                  and AK.dispatch_threads(default_thr + 1) == pool,
+                  f"pool={pool} default={default_thr} "
+                  f"at={AK.dispatch_threads(default_thr)} "
+                  f"over={AK.dispatch_threads(default_thr + 1)}")
+            os.environ["ALPACCAROO_SERIAL_MATVEC_ELEMS"] = "4096"
+            try:
+                check("ALPACCAROO_SERIAL_MATVEC_ELEMS overrides the default",
+                      AK.serial_matvec_elems() == 4096)
+                AK.set_tuned_serial_elems(999999)
+                check("a pinned threshold still beats a tuned one",
+                      AK.serial_matvec_elems() == 4096)
+            finally:
+                os.environ.pop("ALPACCAROO_SERIAL_MATVEC_ELEMS", None)
+                AK.set_tuned_serial_elems(None)
+            check("clearing the tuned threshold restores the default",
+                  AK.serial_matvec_elems() == default_thr)
+            check("the pool is left at its configured size after dispatching",
+                  AK.threads() == pool)
+
+            # probe matrices must be usable as matrices, not just as bytes:
+            # a scale written at the wrong offset decodes to zero, and every
+            # correctness check run against them then compares zeros
+            for _pdt in ("Q4_K", "Q5_K", "Q6_K"):
+                pm = ATune.make_probe_matrix(_pdt, 8, 512)
+                pv = np.asarray(pm.matvec(np.ones(512, dtype=np.float32)))
+                check(f"{_pdt} tuning probe decodes to finite, non-zero values",
+                      bool(np.all(np.isfinite(pv))) and bool(np.any(pv != 0)),
+                      f"{pv[:4]}")
+            sw = ATune.sweep([("probe", "Q4_K", 64, 512, 1)], [1],
+                             reps=2, budget_seconds=10.0)
+            check("the tuner scores a shape set and picks a thread count",
+                  sw.get("threads") == 1
+                  and sw["per_token_matvec_seconds"][1] > 0,
+                  str(sw.get("error", ""))[:200])
+
+            old_home = os.environ.get("ALPACCAROO_HOME")
+            os.environ["ALPACCAROO_HOME"] = str(tmp / "tunehome")
+            try:
+                shapes = [("probe", "Q4_K", 64, 512, 1)]
+                check("no cached tuning exists for a fresh home",
+                      ATune.load_cached(shapes) is None)
+                ATune.save_cached(shapes, {"threads": 3},
+                                  crossover={"threshold_elements": 4321})
+                got = ATune.load_cached(shapes)
+                check("a cached tuning round-trips both measurements",
+                      bool(got) and got["threads"] == 3
+                      and got["serial_matvec_elements"] == 4321,
+                      json.dumps(got or {})[:300])
+                # a crossover run must not erase a thread-count run, or the
+                # reverse: they write the same file
+                ATune.save_cached(shapes, {"threads": 2})
+                got = ATune.load_cached(shapes)
+                check("re-tuning threads keeps the measured threshold",
+                      bool(got) and got["threads"] == 2
+                      and got["serial_matvec_elements"] == 4321,
+                      json.dumps(got or {})[:300])
+                check("a different shape class is a different cache entry",
+                      ATune.load_cached([("probe", "Q4_K", 65, 512, 1)]) is None)
+                key = ATune.cache_key()
+                check("the invalidation key covers the toolchain and the host",
+                      {"numba", "numpy", "llvmlite", "python", "cpu",
+                       "physical_cores", "kernels_sha256"} <= set(key),
+                      json.dumps(key)[:300])
+                stale = dict(key, numba="0.0.0-not-installed")
+                check("a toolchain change maps to a different cache file",
+                      ATune.cache_path(stale, ATune.shape_tag(shapes))
+                      != ATune.cache_path(key, ATune.shape_tag(shapes)))
+                # autotuning must never benchmark implicitly
+                check("autotune is inert unless asked for",
+                      not ATune.autotune_enabled()
+                      and ATune.apply_cached_threads(
+                          _TuneModel.__new__(_TuneModel)) is None)
+                os.environ["ALPACCAROO_AUTOTUNE"] = "1"
+                os.environ["ALPACCAROO_THREADS"] = "2"
+                try:
+                    check("ALPACCAROO_THREADS wins over a cached tuning",
+                          ATune.apply_cached_threads(
+                              _TuneModel.__new__(_TuneModel)) is None
+                          and AK.threads() == pool)
+                finally:
+                    os.environ.pop("ALPACCAROO_AUTOTUNE", None)
+                    os.environ.pop("ALPACCAROO_THREADS", None)
+            finally:
+                if old_home is None:
+                    os.environ.pop("ALPACCAROO_HOME", None)
+                else:
+                    os.environ["ALPACCAROO_HOME"] = old_home
 
         if T.HAS_NUMPY:
             import numpy as np
@@ -981,6 +1137,92 @@ def main() -> None:
             [1.0] * 99 + [float("nan")])
         check("sampling a NaN logit vector does not raise",
               isinstance(nan_sampled, int))
+
+        # ---- fused greedy sampling (Package C) ---------------------------
+        # The optimized greedy path must select the SAME token id as the
+        # general float64 path on every input, including the shapes that
+        # break a naive implementation: ties whose lowest index sits far
+        # from the maximum, penalized entries that are themselves the
+        # maxima, wholly penalized vectors, and penalties that mint
+        # non-finite values out of finite logits.
+        if T.HAS_NUMPY:
+            import numpy as np
+
+            def greedy_ref(sampler, logits):
+                """Same call with the fused path disabled."""
+                saved = sampler._greedy_fast
+                sampler._greedy_fast = lambda arr: None
+                try:
+                    return sampler._sample(logits)
+                finally:
+                    sampler._greedy_fast = saved
+
+            grng = np.random.default_rng(17)
+            greedy_bad = []
+            greedy_n = 0
+            N = 2048
+            cases = []
+            for _ in range(40):
+                cases.append((grng.standard_normal(N).astype(np.float32) * 5.0,
+                              grng.integers(0, N,
+                                            size=int(grng.integers(0, 64))).tolist()))
+            cases.append((np.full(N, 2.5, dtype=np.float32), list(range(64))))
+            tie = np.full(N, -9.0, dtype=np.float32)
+            tie[3] = tie[N - 1] = 7.0
+            cases.append((tie, [N - 1]))          # first max is untouched
+            cases.append((tie, [3]))              # first max IS penalized
+            peak = grng.standard_normal(N).astype(np.float32)
+            cases.append((peak, np.argsort(peak)[-40:].tolist()))
+            cases.append((grng.standard_normal(70).astype(np.float32),
+                          list(range(70))))       # every entry penalized
+            for vec in ([1.0, float("nan"), 3.0] * 20,
+                        [1.0, float("inf"), 3.0] * 20,
+                        [1.0, float("-inf"), 3.0] * 20,
+                        [0.0, 1e38, -1e38] * 20):
+                cases.append((np.asarray(vec, dtype=np.float32), [0, 1, 2]))
+            for arr, recent in cases:
+                for pen in (1.0, 1.1, 0.7, 1e-40, float("nan")):
+                    s = Sampler(SamplerParams(temperature=0.0,
+                                              repeat_penalty=pen,
+                                              repeat_last_n=64, seed=1))
+                    for t in recent:
+                        s.accept(int(t))
+                    greedy_n += 1
+                    if s._sample(arr) != greedy_ref(s, arr):
+                        greedy_bad.append((pen, len(recent), float(arr.max())))
+            check(f"fused greedy picks the reference token ({greedy_n} vectors)",
+                  not greedy_bad, str(greedy_bad[:3]))
+            # a Python-float list must NOT take the float32 fast path: the
+            # conversion would round, and a rounded argmax is not always the
+            # float64 one
+            s = Sampler(SamplerParams(temperature=0.0, repeat_penalty=1.0))
+            listed = [1.0, 1.0 + 2 ** -30, 0.5]
+            check("a float64 list keeps the reference path",
+                  s._sample(listed) == 1 and s._sample(
+                      np.asarray(listed, dtype=np.float32)) == 0,
+                  f"{s._sample(listed)} / "
+                  f"{s._sample(np.asarray(listed, dtype=np.float32))}")
+            # the fusion is conditional on sampler settings: temperature > 0
+            # and constrained decoding both stay on the general path
+            hot = grng.standard_normal(256).astype(np.float32)
+            hot_top = int(np.argmax(hot))
+            reached = []
+            warm = Sampler(SamplerParams(temperature=0.8, seed=3))
+            warm._greedy_fast = lambda arr: reached.append("warm")
+            warm._sample(hot)
+            cold = Sampler(SamplerParams(temperature=0.0, seed=3))
+            cold_inner = cold._greedy_fast
+            cold._greedy_fast = lambda arr: (reached.append("cold"),
+                                             cold_inner(arr))[1]
+            cold_tok = cold._sample(hot)
+            banned_probe = Sampler(SamplerParams(temperature=0.0, seed=3))
+            banned_probe._greedy_fast = lambda arr: reached.append("banned")
+            banned_tok = banned_probe._sample(hot, banned={hot_top})
+            check("the fused path is conditional on sampler settings",
+                  reached == ["cold"] and cold_tok == hot_top
+                  and banned_tok != hot_top,
+                  f"{reached} greedy={cold_tok} banned={banned_tok} "
+                  f"top={hot_top}")
         # degenerate PARAMS (reachable from the serve API: json accepts the
         # NaN/Infinity literals unclamped) must not crash and must pick the
         # same token as the reference list path - the penalty can mint
@@ -2496,6 +2738,30 @@ def main() -> None:
               "unknown shape" in (r.stdout + r.stderr)
               and "long-long" in (r.stdout + r.stderr),
               (r.stdout + r.stderr)[-300:])
+        stab_json = tmp / "stability.json"
+        r = run_cli("bench", "--model", "tiny", "--prefill", "8", "--decode", "2",
+                    "--stability", "--stability-seconds", "3",
+                    "--json", str(stab_json), env=env)
+        srep = json.loads(stab_json.read_text(encoding="utf-8"))["stability"]
+        check("bench records whether this machine holds its clocks",
+              ("spread" in srep and srep["spread"] >= 1.0
+               and "stable" in srep) if srep.get("supported")
+              else bool(srep.get("reason")),
+              json.dumps(srep)[:400])
+
+        # ---- autotuner CLI (Package F) ------------------------------------
+        # opt-in means opt-in: with the kernels off there is nothing to
+        # tune and `tune` must say so rather than benchmark anyway
+        r = run_cli("tune", env={**env, "ALPACCAROO_KERNELS": "0"}, expect=1)
+        check("tune declines when there are no kernels to tune",
+              "nothing to tune" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-300:])
+        # a normal run must never trigger a benchmark, even with autotune on
+        r = run_cli("run", "tiny", "hi", "-n", "2", "--temp", "0",
+                    env={**env, "ALPACCAROO_AUTOTUNE": "1"})
+        check("ALPACCAROO_AUTOTUNE=1 never benchmarks during a normal run",
+              "tokens," in r.stderr and "per-token matvec cost" not in r.stderr,
+              r.stderr[-400:])
 
         from alpaccaroo import profiling as _profiling
         check("every reported path label is a known one",

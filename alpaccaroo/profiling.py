@@ -691,6 +691,18 @@ def format_report(snap: dict, width: int = 78) -> str:
         tps = snap.get("decode_tok_per_s")
         L.append(f"decode           {_fmt_s(dec)}  {n} tokens"
                  + (f"  = {tps:.2f} tok/s" if tps else ""))
+    # sampling and stream-decoding sit OUTSIDE model.forward, so they are
+    # not part of the decode wall clock and would vanish from the report if
+    # only the buckets inside it were printed
+    timers = snap.get("timers_seconds") or {}
+    counts = snap.get("call_counts") or {}
+    for key, label in (("sampler", "sampler"),
+                       ("tokenizer_stream", "tokenizer")):
+        if timers.get(key):
+            v = timers[key]
+            L.append(f"{label:<17}{_fmt_s(v)}  {counts.get(key, 0)} calls"
+                     f"  = {_fmt_s(v / max(counts.get(key, 1), 1))} each"
+                     + (f"  ({100.0 * v / dec:.1f}% of decode)" if dec else ""))
     lat = snap.get("token_latency_seconds") or {}
     if lat:
         L.append("token latency    "

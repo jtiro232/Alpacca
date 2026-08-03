@@ -202,6 +202,14 @@ renders such a conversation instead of rejecting it.
 
 ### Honest performance expectations
 
+> **Measuring your own machine:** `docs/PERFORMANCE.md` is the reference for
+> the profiler (`alpaccaroo run <model> --profile`), the benchmark harness
+> (`alpaccaroo bench`), the opt-in autotuner (`alpaccaroo tune`), every
+> environment knob, and the measured results behind them. Start there
+> before changing anything - it also documents *why* two separate timing
+> runs on a power-limited laptop cannot be compared, which is the mistake
+> that costs the most time.
+
 This engine values clarity, auditability, and zero dependencies over raw
 speed. The NumPy path batches prompt prefill, reuses the KV cache for shared
 prompt prefixes, and keeps Q2_K, Q3_K, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K,

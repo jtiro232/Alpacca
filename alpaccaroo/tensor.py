@@ -137,6 +137,30 @@ def _is_native_quant(W) -> bool:
             and W._dense_cache is None)
 
 
+def _pair_indices(Ws, native):
+    """(index of the Q4_K matrix, index of the Q6_K matrix) when the group
+    holds exactly one of each in native mode and they agree on width, else
+    None. Shape-gated on purpose: the grouped kernel is compiled for this
+    one dtype pairing, and everything else must fall through unchanged."""
+    i4 = i6 = None
+    for i, (W, f) in enumerate(zip(Ws, native)):
+        if not f:
+            continue
+        if W._mode == "q4k_int":
+            if i4 is not None:
+                return None      # two Q4_Ks are already fused at load
+            i4 = i
+        elif W._mode == "q6k_int":
+            if i6 is not None:
+                return None
+            i6 = i
+        else:
+            return None          # a Q5_K in the group: no compiled pairing
+    if i4 is None or i6 is None or Ws[i4].cols != Ws[i6].cols:
+        return None
+    return i4, i6
+
+
 def matvec_group(Ws, x):
     """Matvec several matrices against the SAME input vector.
 
@@ -170,8 +194,24 @@ def matvec_group(Ws, x):
             p = _profiling.ACTIVE
             t0 = _perf() if p is not None else 0.0
             pre = _k.quantize_acts(x)
-            out = [W.matvec(x, pre) if f else matvec(W, x)
-                   for W, f in zip(Ws, native)]
+            pair = _pair_indices(Ws, native)
+            if pair is not None and _k.group_kernel_enabled():
+                # Package D: the whole group in one parallel region. Only
+                # the exact Q4_K+Q6_K shape a Q4_K_M file produces (q/k
+                # quantized to Q4_K beside a Q6_K v); everything else keeps
+                # the per-matrix dispatches below.
+                i4, i6 = pair
+                out = [None] * len(Ws)
+                out[i4], out[i6] = _k.matvec_q4k_q6k_pair(Ws[i4], Ws[i6],
+                                                          x, pre)
+                for i, (W, f) in enumerate(zip(Ws, native)):
+                    if out[i] is None:
+                        out[i] = W.matvec(x, pre) if f else matvec(W, x)
+                if p is not None:
+                    p.bump("matvec_group_kernel")
+            else:
+                out = [W.matvec(x, pre) if f else matvec(W, x)
+                       for W, f in zip(Ws, native)]
             if p is not None:
                 p.add("matvec_grouped", _perf() - t0)
                 p.bump("matvec_grouped_matrices", sum(native))

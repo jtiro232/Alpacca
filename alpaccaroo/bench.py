@@ -221,6 +221,119 @@ def run_case(model, prefill_tokens: int, decode_tokens: int, seed: int) -> dict:
     }
 
 
+# ---- clock stability ---------------------------------------------------------
+
+def stability_probe(seconds: float = 12.0, bucket: float = 1.5) -> dict:
+    """Does this machine hold its throughput while it works?
+
+    Runs one fixed kernel continuously and reports per-bucket throughput.
+    A desktop that sustains its clocks returns spread ~1.0; a thin laptop
+    cycling between its short and long power limits returns 2x or more, and
+    every single-shot number taken on it is worth only as much as that
+    spread allows.
+
+    This exists because it is the difference between "this change made
+    decode 30% faster" and "this run happened to land in a turbo window".
+    Any A/B on a machine with a spread above ~1.3 needs
+    :func:`paired_compare`, not two separate runs.
+    """
+    from . import kernels as _kernels
+    if not _kernels.available():
+        return {"supported": False,
+                "reason": "kernels inactive: no fixed-cost probe to run"}
+    try:
+        import numpy as np
+
+        from .tuning import make_probe_matrix
+    except Exception as e:
+        return {"supported": False, "reason": str(e)}
+
+    # big enough to be memory-bound (so it measures the thing decode is
+    # limited by) and small enough to fit any machine that runs a 1B model
+    W = make_probe_matrix("Q4_K", 4096, 2048)
+    nbytes = W.storage_nbytes()
+    x = np.random.default_rng(5).standard_normal(2048).astype(np.float32)
+    W.matvec(x)
+
+    rates: list[float] = []
+    t0 = time.perf_counter()
+    b_start, calls = t0, 0
+    while True:
+        W.matvec(x)
+        calls += 1
+        now = time.perf_counter()
+        if now - b_start >= bucket:
+            rates.append(nbytes * calls / (now - b_start) / 1e9)
+            b_start, calls = now, 0
+        if now - t0 >= seconds:
+            break
+    if len(rates) < 2:
+        return {"supported": False, "reason": "probe too short to bucket"}
+    lo, hi = min(rates), max(rates)
+    ordered = sorted(rates)
+    return {
+        "supported": True,
+        "seconds": seconds,
+        "bucket_seconds": bucket,
+        "gb_per_s_buckets": [round(r, 3) for r in rates],
+        "gb_per_s_min": round(lo, 3),
+        "gb_per_s_median": round(ordered[len(ordered) // 2], 3),
+        "gb_per_s_max": round(hi, 3),
+        "spread": round(hi / lo, 3) if lo > 0 else None,
+        # the first bucket is the burst window on a laptop that has just
+        # been idle; the last is what it can hold
+        "first_over_last": round(rates[0] / rates[-1], 3) if rates[-1] else None,
+        "stable": bool(lo > 0 and hi / lo < 1.3),
+    }
+
+
+def paired_compare(variants, rounds: int = 12, warmup: int = 2) -> dict:
+    """Alternate between variants round-robin and compare them pairwise.
+
+    Two separate benchmark runs cannot be compared on a machine whose clock
+    wanders - the earlier run may simply have been cooler. Interleaving
+    them puts every variant in the same thermal window, so the per-round
+    RATIO is meaningful even when the absolute numbers are not.
+
+    `variants` is a sequence of (label, callable) where the callable runs
+    one unit of work. Returns per-variant statistics plus, for each variant
+    after the first, the median of the per-round ratio against the first -
+    which is the number to quote.
+    """
+    labels = [lbl for lbl, _ in variants]
+    fns = [fn for _, fn in variants]
+    for fn in fns:
+        for _ in range(max(0, warmup)):
+            fn()
+    samples: dict[str, list] = {lbl: [] for lbl in labels}
+    for _ in range(max(1, rounds)):
+        for lbl, fn in zip(labels, fns):
+            t = time.perf_counter()
+            fn()
+            samples[lbl].append(time.perf_counter() - t)
+
+    def stats(xs):
+        s = sorted(xs)
+        return {"min": s[0], "median": s[len(s) // 2], "max": s[-1],
+                "mean": sum(s) / len(s)}
+
+    out = {"rounds": rounds,
+           "variants": {lbl: stats(samples[lbl]) for lbl in labels}}
+    base = labels[0]
+    out["baseline"] = base
+    ratios = {}
+    for lbl in labels[1:]:
+        per_round = sorted(b / a if a > 0 else float("inf")
+                           for a, b in zip(samples[base], samples[lbl]))
+        ratios[lbl] = {
+            "median_vs_baseline": per_round[len(per_round) // 2],
+            "best_vs_baseline": per_round[0],
+            "worst_vs_baseline": per_round[-1],
+        }
+    out["ratios"] = ratios
+    return out
+
+
 # ---- the sweep --------------------------------------------------------------
 
 def _flat_env(runtime: dict) -> dict:
@@ -486,6 +599,10 @@ def build_parser(prog: str = "alpaccaroo bench") -> argparse.ArgumentParser:
                     help="suppress the progress lines, keep the table")
     ap.add_argument("--bench-lines", action="store_true",
                     help="also print one greppable BENCH key=value line per row")
+    ap.add_argument("--stability", action="store_true",
+                    help="probe whether this machine holds its clocks, and "
+                         "record the spread alongside the results")
+    ap.add_argument("--stability-seconds", type=float, default=12.0)
     return ap
 
 
@@ -514,12 +631,37 @@ def main(argv: "list[str] | None" = None) -> int:
               f"decode {rec['decode_tok_per_s'] or 0:.2f} tok/s",
               file=sys.stderr, flush=True)
 
+    stability = None
+    if args.stability:
+        # before the sweep: it needs the machine in whatever state the user
+        # started it in, not the state a full model load leaves it in
+        if not args.quiet:
+            print(f"probing clock stability for {args.stability_seconds:.0f}s...",
+                  file=sys.stderr, flush=True)
+        stability = stability_probe(args.stability_seconds)
+
     want_profile = bool(args.profile or args.profile_json)
     report = sweep(args.model, shapes, ctxs, args.repeat, args.seed,
                    args.allow_pull, args.warm_only, args.cold_only,
                    want_profile, on_record=progress)
+    if stability is not None:
+        report["stability"] = stability
 
     print(format_table(report["records"]))
+    if stability is not None:
+        if stability.get("supported"):
+            print(f"\nclock stability: {stability['gb_per_s_min']:.2f}-"
+                  f"{stability['gb_per_s_max']:.2f} GB/s over "
+                  f"{stability['seconds']:.0f}s "
+                  f"(spread {stability['spread']:.2f}x) - "
+                  + ("steady, single runs are comparable"
+                     if stability["stable"] else
+                     "UNSTEADY: single runs on this machine are not "
+                     "comparable; alternate configurations within one "
+                     "process (bench.paired_compare) before believing "
+                     "any A/B"))
+        else:
+            print(f"\nclock stability: not probed ({stability.get('reason')})")
     if args.bench_lines:
         for line in bench_lines(report["records"]):
             print(line)

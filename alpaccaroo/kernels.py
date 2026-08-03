@@ -34,7 +34,75 @@ NUMBA_PIN = "0.65.1"
 # which dominates once there are many. They cross between 8 and 16.
 NARROW_BATCH = 8
 
+# ---- narrow-matrix dispatch (PERFORMANCE_PLAN Package E) --------------------
+#
+# Fanning a matvec across the thread pool is not free: entering the parallel
+# region, chunking the row loop, and having several threads write into one
+# small output array all cost. Below some amount of work that cost exceeds
+# what the extra threads save, and running the SAME kernel on one thread is
+# faster. Measured with bench.paired_compare (round-robin between thread
+# counts, so a machine whose clock wanders cannot fake the result) on a
+# 4-core Tiger Lake, microseconds per matvec:
+#
+#     shape                elems    t=1     t=2     t=4    best
+#     Q4_K   64x2048     131072    49.0    49.5    63.9   1   (1.30x)
+#     Q4_K  128x2048     262144    76.3    69.8    67.7   4
+#     Q4_K  256x2048     524288   157.6   114.0   102.7   4   (1.53x)
+#     Q6_K  256x2048     524288   220.6   327.0   420.2   1   (1.90x)
+#     Q4_K  512x2048    1048576   307.0   202.4   270.4   2
+#     Q4_K 2048x2048    4194304  2443.5  1849.3  1755.6   4
+#
+# The crossover is real but shape- AND dtype-dependent, so the default is
+# set at the smallest size where every measured dtype agreed (131072) - it
+# can only help shapes that were losing and cannot regress a larger one.
+# `alpaccaroo tune --crossover` measures the real threshold for a given
+# machine and caches it; ALPACCAROO_SERIAL_MATVEC_ELEMS overrides both.
+#
+# Note the same table taken WITHOUT paired comparison reported the opposite
+# winner for Q4_K 256x2048. On a laptop that cycles its power limits, two
+# separate timing runs are not comparable. Re-measure this way, or not at
+# all.
+SERIAL_MATVEC_ELEMS_DEFAULT = 131072
+
+# Activation quantization is a parallel region over cols/256 blocks - eight
+# of them for a 2048-wide model, which is far too little work to repay a
+# fan-out. Same rule, its own knob, sized in columns.
+SERIAL_QUANTIZE_COLS_DEFAULT = 8192
+
+_tuned_serial_elems: int | None = None   # set by tuning.apply_cached_thresholds
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def serial_matvec_elems() -> int:
+    """Weight count at or below which a matvec runs on one thread."""
+    if os.environ.get("ALPACCAROO_SERIAL_MATVEC_ELEMS", "").strip():
+        return _env_int("ALPACCAROO_SERIAL_MATVEC_ELEMS",
+                        SERIAL_MATVEC_ELEMS_DEFAULT)
+    if _tuned_serial_elems is not None:
+        return _tuned_serial_elems
+    return SERIAL_MATVEC_ELEMS_DEFAULT
+
+
+def set_tuned_serial_elems(value: "int | None") -> None:
+    """Install a measured threshold (see alpaccaroo.tuning). The environment
+    variable still wins - a user who pinned a number keeps it."""
+    global _tuned_serial_elems
+    _tuned_serial_elems = None if value is None else max(0, int(value))
+
+
 _state: dict | None = None  # lazy: {"matvec": compiled fn} or {} if inactive
+_cur_threads = 0            # what we last asked numba for; avoids a call per
+#                             matvec just to read it back
+_max_threads = 0
 
 
 def int_dot_enabled() -> bool:
@@ -404,6 +472,112 @@ def _init() -> dict:
         return out
 
     @njit(parallel=True, fastmath=True, cache=True)
+    def _matvec_q4k_q6k_pair(qp, sc4, mn4, dh4, dmh4, q6, sc6, dh6,
+                             lut, xq, ascale, bsums, out4, out6):
+        # PERFORMANCE_PLAN Package D: two matrices that read the SAME input
+        # vector, computed in ONE parallel region.
+        #
+        # Same-dtype neighbours are already concatenated at load (see
+        # model.fused_mat), which is strictly better - one contiguous
+        # stream. What that cannot do is join a Q4_K to a Q6_K, and a
+        # Q4_K_M file produces exactly that pair: attn_q/attn_k are Q4_K
+        # while attn_v is Q6_K. This kernel joins them anyway, by ranging
+        # one prange over the COMBINED row space. Two wins, not one: a
+        # single fan-out instead of two, and the narrow matrix's rows are
+        # spread across the pool with the wide one's instead of being cut
+        # into slivers of its own.
+        #
+        # Each branch is the body of _matvec_q4k_int / _matvec_q6k_int
+        # unchanged, so a row's accumulation order is the same one the
+        # per-matrix kernels use.
+        rows4 = qp.shape[0]
+        rows6 = q6.shape[0]
+        nblk = ascale.shape[0]
+        for r in prange(rows4 + rows6):
+            if r < rows4:
+                acc = np.float32(0.0)
+                for b in range(nblk):
+                    p0 = b * 128
+                    x0 = b * 256
+                    s0 = np.int16(sc4[r, b, 0])
+                    s1 = np.int16(sc4[r, b, 1])
+                    s2 = np.int16(sc4[r, b, 2])
+                    s3 = np.int16(sc4[r, b, 3])
+                    s4 = np.int16(sc4[r, b, 4])
+                    s5 = np.int16(sc4[r, b, 5])
+                    s6 = np.int16(sc4[r, b, 6])
+                    s7 = np.int16(sc4[r, b, 7])
+                    blk_i = np.int32(0)
+                    for j in range(32):
+                        v0 = qp[r, p0 + j]
+                        v1 = qp[r, p0 + 32 + j]
+                        v2 = qp[r, p0 + 64 + j]
+                        v3 = qp[r, p0 + 96 + j]
+                        blk_i = np.int32(
+                            blk_i
+                            + np.int32(np.int16(s0 * np.int16(v0 & np.uint8(15)))) * np.int32(xq[x0 + j])
+                            + np.int32(np.int16(s1 * np.int16(v0 >> np.uint8(4)))) * np.int32(xq[x0 + 32 + j])
+                            + np.int32(np.int16(s2 * np.int16(v1 & np.uint8(15)))) * np.int32(xq[x0 + 64 + j])
+                            + np.int32(np.int16(s3 * np.int16(v1 >> np.uint8(4)))) * np.int32(xq[x0 + 96 + j])
+                            + np.int32(np.int16(s4 * np.int16(v2 & np.uint8(15)))) * np.int32(xq[x0 + 128 + j])
+                            + np.int32(np.int16(s5 * np.int16(v2 >> np.uint8(4)))) * np.int32(xq[x0 + 160 + j])
+                            + np.int32(np.int16(s6 * np.int16(v3 & np.uint8(15)))) * np.int32(xq[x0 + 192 + j])
+                            + np.int32(np.int16(s7 * np.int16(v3 >> np.uint8(4)))) * np.int32(xq[x0 + 224 + j]))
+                    min_i = np.int32(0)
+                    for t in range(8):
+                        min_i = np.int32(min_i + np.int32(mn4[r, b, t])
+                                         * bsums[b * 8 + t])
+                    acc += ascale[b] * (lut[dh4[r, b]] * np.float32(blk_i)
+                                        - lut[dmh4[r, b]] * np.float32(min_i))
+                out4[r] = acc
+            else:
+                rb = r - rows4
+                acc = np.float32(0.0)
+                for b in range(nblk):
+                    e0 = b * 256
+                    t0 = np.int16(sc6[rb, b * 16 + 0])
+                    t1 = np.int16(sc6[rb, b * 16 + 1])
+                    t2 = np.int16(sc6[rb, b * 16 + 2])
+                    t3 = np.int16(sc6[rb, b * 16 + 3])
+                    t4 = np.int16(sc6[rb, b * 16 + 4])
+                    t5 = np.int16(sc6[rb, b * 16 + 5])
+                    t6 = np.int16(sc6[rb, b * 16 + 6])
+                    t7 = np.int16(sc6[rb, b * 16 + 7])
+                    t8 = np.int16(sc6[rb, b * 16 + 8])
+                    t9 = np.int16(sc6[rb, b * 16 + 9])
+                    t10 = np.int16(sc6[rb, b * 16 + 10])
+                    t11 = np.int16(sc6[rb, b * 16 + 11])
+                    t12 = np.int16(sc6[rb, b * 16 + 12])
+                    t13 = np.int16(sc6[rb, b * 16 + 13])
+                    t14 = np.int16(sc6[rb, b * 16 + 14])
+                    t15 = np.int16(sc6[rb, b * 16 + 15])
+                    a0 = np.int32(0)
+                    a1 = np.int32(0)
+                    for j in range(16):
+                        a0 = np.int32(
+                            a0
+                            + np.int32(np.int16(t0 * np.int16(q6[rb, e0 + j]))) * np.int32(xq[e0 + j])
+                            + np.int32(np.int16(t1 * np.int16(q6[rb, e0 + 16 + j]))) * np.int32(xq[e0 + 16 + j])
+                            + np.int32(np.int16(t2 * np.int16(q6[rb, e0 + 32 + j]))) * np.int32(xq[e0 + 32 + j])
+                            + np.int32(np.int16(t3 * np.int16(q6[rb, e0 + 48 + j]))) * np.int32(xq[e0 + 48 + j])
+                            + np.int32(np.int16(t4 * np.int16(q6[rb, e0 + 64 + j]))) * np.int32(xq[e0 + 64 + j])
+                            + np.int32(np.int16(t5 * np.int16(q6[rb, e0 + 80 + j]))) * np.int32(xq[e0 + 80 + j])
+                            + np.int32(np.int16(t6 * np.int16(q6[rb, e0 + 96 + j]))) * np.int32(xq[e0 + 96 + j])
+                            + np.int32(np.int16(t7 * np.int16(q6[rb, e0 + 112 + j]))) * np.int32(xq[e0 + 112 + j]))
+                        a1 = np.int32(
+                            a1
+                            + np.int32(np.int16(t8 * np.int16(q6[rb, e0 + 128 + j]))) * np.int32(xq[e0 + 128 + j])
+                            + np.int32(np.int16(t9 * np.int16(q6[rb, e0 + 144 + j]))) * np.int32(xq[e0 + 144 + j])
+                            + np.int32(np.int16(t10 * np.int16(q6[rb, e0 + 160 + j]))) * np.int32(xq[e0 + 160 + j])
+                            + np.int32(np.int16(t11 * np.int16(q6[rb, e0 + 176 + j]))) * np.int32(xq[e0 + 176 + j])
+                            + np.int32(np.int16(t12 * np.int16(q6[rb, e0 + 192 + j]))) * np.int32(xq[e0 + 192 + j])
+                            + np.int32(np.int16(t13 * np.int16(q6[rb, e0 + 208 + j]))) * np.int32(xq[e0 + 208 + j])
+                            + np.int32(np.int16(t14 * np.int16(q6[rb, e0 + 224 + j]))) * np.int32(xq[e0 + 224 + j])
+                            + np.int32(np.int16(t15 * np.int16(q6[rb, e0 + 240 + j]))) * np.int32(xq[e0 + 240 + j]))
+                    acc += ascale[b] * lut[dh6[rb, b]] * np.float32(a0 + a1)
+                out6[rb] = acc
+
+    @njit(parallel=True, fastmath=True, cache=True)
     def _attention_decode(q3, K, V, scores, out, inv_sqrt):
         # Single-token grouped-query attention over the KV cache, one prange
         # worker per query head, softmax fused in. This exists because the
@@ -521,9 +695,14 @@ def _init() -> dict:
 
     lut = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32)
 
-    _state = {"np": np, "matvec": _matvec_codes, "matmul": _matmul_codes,
+    global _cur_threads, _max_threads
+    _cur_threads = _max_threads = int(numba.get_num_threads())
+
+    _state = {"np": np, "numba": numba,
+              "matvec": _matvec_codes, "matmul": _matmul_codes,
               "matmul_wide": _matmul_codes_wide,
               "quantize_acts": _quantize_acts,
+              "matvec_q4k_q6k_pair": _matvec_q4k_q6k_pair,
               "matvec_q4k_int": _matvec_q4k_int,
               "matvec_q5k_int": _matvec_q5k_int,
               "matvec_q6k_int": _matvec_q6k_int,
@@ -542,6 +721,77 @@ def available() -> bool:
     return bool(_init())
 
 
+# ---- per-dispatch thread scaling --------------------------------------------
+#
+# One compiled kernel, run on a chosen number of threads - NOT a second
+# hand-written serial copy of the same unrolled arithmetic. numba's prange
+# splits the ROW loop, and each row's accumulator is computed by the same
+# instruction sequence regardless of how many threads share the loop, so
+# narrowing the fan-out is bit-identical by construction. A duplicated
+# kernel would only be bit-identical by inspection, and would have to stay
+# that way through every future edit.
+
+def _set_threads(st: dict, n: int) -> None:
+    # numba.set_num_threads measured at 3.3 us on the reference machine -
+    # cheap, but not free against a 49 us matvec. Skipping the call when the
+    # pool is already the right size is what makes this affordable, and it
+    # is why the count is tracked here rather than read back per dispatch.
+    global _cur_threads
+    if n == _cur_threads:
+        return
+    try:
+        st["numba"].set_num_threads(n)
+        _cur_threads = n
+    except (ValueError, RuntimeError):
+        pass
+
+
+def _want(st: dict, work_elements: int) -> None:
+    """Size the pool for a dispatch touching `work_elements` weights.
+
+    Set-and-leave, not set-and-restore: restoring would double the number
+    of set_num_threads calls, and there is nothing to restore *to* - every
+    kernel entry point in this module declares what it needs before it
+    runs, so the pool is always right for the dispatch about to happen.
+    A model whose shapes all sit on one side of the threshold - the common
+    case - therefore pays nothing at all.
+    """
+    if _max_threads <= 1:
+        return
+    _set_threads(st, 1 if work_elements <= serial_matvec_elems()
+                 else _max_threads)
+
+
+def _want_full(st: dict) -> None:
+    """Full pool: for the kernels that are always worth fanning out (batched
+    matmul, prefill dequantize, decode attention over a long context)."""
+    if _max_threads > 1:
+        _set_threads(st, _max_threads)
+
+
+def set_threads(n: int) -> int:
+    """Resize the kernel thread pool, keeping the dispatch bookkeeping in
+    sync. Callers must use this rather than numba.set_num_threads directly,
+    or _want will believe the pool is a size it is not."""
+    global _max_threads
+    st = _init()
+    if not st:
+        return 0
+    _set_threads(st, max(1, int(n)))
+    _max_threads = _cur_threads
+    return _cur_threads
+
+
+def dispatch_threads(work_elements: int) -> int:
+    """How many threads a matvec of this size will use. For the profiler and
+    for tests that pin the dispatch DECISION rather than its timing."""
+    if not _init():
+        return 0
+    if _max_threads <= 1:
+        return _max_threads
+    return 1 if work_elements <= serial_matvec_elems() else _max_threads
+
+
 def kernel_version() -> str:
     """`numba==X` when the JIT is live, `off` otherwise - for backend labels."""
     st = _init()
@@ -549,15 +799,15 @@ def kernel_version() -> str:
 
 
 def threads() -> int:
-    """Threads the kernels' own pool will use, or 0 when they are inactive."""
-    st = _init()
-    if not st:
+    """The kernel pool's configured size, or 0 when the kernels are inactive.
+
+    The pool SIZE, not numba.get_num_threads(): per-dispatch scaling leaves
+    that at 1 whenever the last kernel to run was a narrow one, and a
+    profiler reporting "1 thread" for a machine tuned to 8 would be lying.
+    """
+    if not _init():
         return 0
-    try:
-        import numba
-        return int(numba.get_num_threads())
-    except Exception:
-        return 0
+    return _max_threads
 
 
 def status() -> str:
@@ -579,11 +829,14 @@ def matvec_codes(q3, d_eff, m_eff, x):
     np = st["np"]
     rows, nsub, sub_len = q3.shape
     xs = np.ascontiguousarray(x, dtype=np.float32).reshape(nsub, sub_len)
+    _want(st, rows * nsub * sub_len)
     if m_eff is None:
         xsums = xs[:1, :1].reshape(1)  # unused dummy
-        return st["matvec"](q3, d_eff, d_eff, xs, xsums, False)
-    xsums = xs.sum(axis=1)
-    return st["matvec"](q3, d_eff, m_eff, xs, xsums, True)
+        m_arg, affine = d_eff, False
+    else:
+        xsums = xs.sum(axis=1)
+        m_arg, affine = m_eff, True
+    return st["matvec"](q3, d_eff, m_arg, xs, xsums, affine)
 
 
 def matmul_codes(q3, d_eff, m_eff, X):
@@ -594,6 +847,7 @@ def matmul_codes(q3, d_eff, m_eff, X):
     """
     st = _init()
     np = st["np"]
+    _want_full(st)   # a batch always has enough work to repay the fan-out
     rows, nsub, sub_len = q3.shape
     batch = X.shape[0]
     Xs = np.ascontiguousarray(X, dtype=np.float32).reshape(batch, nsub, sub_len)
@@ -624,7 +878,17 @@ def quantize_acts(x):
     """
     st = _init()
     np = st["np"]
-    return st["quantize_acts"](np.ascontiguousarray(x, dtype=np.float32))
+    xc = np.ascontiguousarray(x, dtype=np.float32)
+    # a 2048-wide model gives this kernel eight 256-element blocks to
+    # divide; the fan-out costs more than the work. Same reasoning as
+    # _dispatch, sized in columns because that is what the loop trips on.
+    limit = _env_int("ALPACCAROO_SERIAL_QUANTIZE_COLS",
+                     SERIAL_QUANTIZE_COLS_DEFAULT)
+    # 0 forces the serial side of _want's test, 2**62 forces the pool side;
+    # this kernel's threshold is in columns, not weights, so it cannot share
+    # the matvec knob
+    _want(st, 0 if xc.shape[0] <= limit else (1 << 62))
+    return st["quantize_acts"](xc)
 
 
 def matvec_q4k_int(qp, sc, mn, dh, dmh, x, pre=None):
@@ -635,6 +899,7 @@ def matvec_q4k_int(qp, sc, mn, dh, dmh, x, pre=None):
     input (attn qk and v read the same normed vector) quantize it once."""
     st = _init()
     xq, ascale, bsums = pre if pre is not None else quantize_acts(x)
+    _want(st, qp.shape[0] * qp.shape[1] * 2)   # two 4-bit codes per byte
     return st["matvec_q4k_int"](qp, sc, mn, dh, dmh, st["f16_lut"],
                                 xq, ascale, bsums)
 
@@ -645,14 +910,49 @@ def matvec_q5k_int(qp, qh, sc, mn, dh, dmh, x, pre=None):
     (rows, nblk, 8), dh/dmh u16 f16-bits (rows, nblk)."""
     st = _init()
     xq, ascale, bsums = pre if pre is not None else quantize_acts(x)
+    _want(st, qp.shape[0] * qp.shape[1] * 2)
     return st["matvec_q5k_int"](qp, qh, sc, mn, dh, dmh, st["f16_lut"],
                                 xq, ascale, bsums)
+
+
+def group_kernel_enabled() -> bool:
+    """Whether the grouped Q4_K+Q6_K kernel is used (Package D).
+
+    Default on; ALPACCAROO_GROUP_KERNEL=0 reverts to one dispatch per
+    matrix. It is a flag rather than a permanent choice because the win is
+    a saved fan-out plus a better row split, and both depend on the pool
+    size and the shapes - a machine where it does not pay must be able to
+    turn it off without turning off the kernels.
+    """
+    return (os.environ.get("ALPACCAROO_GROUP_KERNEL", "").strip().lower()
+            not in ("0", "off", "no"))
+
+
+def matvec_q4k_q6k_pair(a, b, x, pre=None):
+    """One dispatch for a native Q4_K matrix `a` and a native Q6_K matrix
+    `b` that share the input `x`.
+
+    Returns (out_a, out_b) float32. Both must have the same column count -
+    they are reading the same vector - which the caller has already checked.
+    """
+    st = _init()
+    np = st["np"]
+    xq, ascale, bsums = pre if pre is not None else quantize_acts(x)
+    rows_a, rows_b = a.rows, b.rows
+    _want(st, rows_a * a.cols + rows_b * b.cols)
+    out_a = np.empty(rows_a, np.float32)
+    out_b = np.empty(rows_b, np.float32)
+    st["matvec_q4k_q6k_pair"](a._qp, a._sci, a._mni, a._dh, a._dmh,
+                              b._q3.reshape(rows_b, -1), b._sci, b._dh,
+                              st["f16_lut"], xq, ascale, bsums, out_a, out_b)
+    return out_a, out_b
 
 
 def dequant_q5k_tile(qp, qh, sc, mn, dh, dmh, out=None):
     """Expand native Q5_K rows to a float32 (nr, cols) tile."""
     st = _init()
     np = st["np"]
+    _want_full(st)   # prefill tiles are large by construction
     if out is None:
         out = np.empty((qp.shape[0], qp.shape[1] * 2), np.float32)
     st["dequant_q5k"](qp, qh, sc, mn, dh, dmh, st["f16_lut"], out)
@@ -665,6 +965,7 @@ def matvec_q6k_int(q3, sc, dh, x, pre=None):
     st = _init()
     xq, ascale, _bsums = pre if pre is not None else quantize_acts(x)
     qf = q3.reshape(q3.shape[0], -1)  # contiguous flat view, no copy
+    _want(st, qf.shape[0] * qf.shape[1])
     return st["matvec_q6k_int"](qf, sc, dh, st["f16_lut"], xq, ascale)
 
 
@@ -688,6 +989,9 @@ def attention_decode(q, K, V, group, inv_sqrt):
     """
     st = _init()
     np = st["np"]
+    # this kernel exists to keep attention off OpenBLAS's pool; it must not
+    # inherit a narrow count from whichever matvec ran last
+    _want_full(st)
     t, n_kv, hd = K.shape
     q3 = np.ascontiguousarray(q, dtype=np.float32).reshape(n_kv, group, hd)
     scores = np.empty((n_kv * group, t), np.float32)
@@ -704,6 +1008,7 @@ def dequant_q4k_tile(qp, sc, mn, dh, dmh, out=None):
     """
     st = _init()
     np = st["np"]
+    _want_full(st)   # prefill tiles are large by construction
     if out is None:
         out = np.empty((qp.shape[0], qp.shape[1] * 2), np.float32)
     st["dequant_q4k"](qp, sc, mn, dh, dmh, st["f16_lut"], out)
@@ -714,6 +1019,7 @@ def dequant_q6k_tile(q3, sc, dh, out=None):
     """Expand native Q6_K rows to a float32 (nr, cols) tile."""
     st = _init()
     np = st["np"]
+    _want_full(st)
     qf = q3.reshape(q3.shape[0], -1)
     if out is None:
         out = np.empty(qf.shape, np.float32)
@@ -768,6 +1074,11 @@ def warmup() -> None:
                      np.zeros((3, 2, 4), dtype=np.float32),
                      np.zeros((3, 2, 4), dtype=np.float32), 1, 0.5)
     for style in ("norm", "neox"):
+        # rope's kernels are njit without parallel=True, so the pool size
+        # does not reach them and _want has nothing to say here
         rope_decode(np.zeros(8, dtype=np.float32),
                     np.zeros(2, dtype=np.float32),
                     np.zeros(2, dtype=np.float32), 2, 4, 4, style)
+    # every warmup shape above is tiny, so _want left the pool at one
+    # thread; hand it back sized for real work
+    _want_full(st)

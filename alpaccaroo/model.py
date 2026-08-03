@@ -742,6 +742,14 @@ class Model:
                 if kernels.available():
                     kernels.warmup()  # JIT compile/cache-load counts as load
                     m._use_kernel_attention = True
+                    # opt-in only, and a cache READ only: `alpaccaroo tune`
+                    # is the sole place a benchmark runs, so a normal load
+                    # never pays for one. Env-gated so the import itself
+                    # costs nothing when the feature is off.
+                    if os.environ.get("ALPACCAROO_AUTOTUNE"):
+                        from . import tuning
+                        tuning.apply_cached_threads(
+                            m, log=lambda s: print(s, file=sys.stderr))
             if gpu_matrices and _gpu is not None:
                 _gpu.warmup()  # same rule: JIT compile counts as load time
                 # stage-2 gpu paths: prefill batch attention and the

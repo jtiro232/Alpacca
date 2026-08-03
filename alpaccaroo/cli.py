@@ -422,6 +422,110 @@ def cmd_bench(args) -> int:
     return bench_main(args.bench_args)
 
 
+def cmd_tune(args) -> int:
+    """Measure this machine's best kernel thread count and cache it.
+
+    Explicit by design: this is the only place a benchmark runs, and
+    `ALPACCAROO_AUTOTUNE=1` only ever *reads* what it wrote.
+    """
+    import json
+
+    from . import kernels, tuning
+    if not kernels.available():
+        print(f"alpaccaroo tune: {kernels.status()} - there is nothing to "
+              f"tune. Install the pinned JIT "
+              f"(pip install \"numba=={kernels.NUMBA_PIN}\") first.",
+              file=sys.stderr)
+        return 1
+
+    if args.model:
+        local, display = _resolve_or_pull(args.model, auto_pull=False)
+        shapes = tuning.gguf_matvec_shapes(str(local.model_path))
+        if not shapes:
+            print(f"alpaccaroo tune: could not read matvec shapes from "
+                  f"{display}; tuning the generic size ladder instead",
+                  file=sys.stderr)
+            shapes = [(l, d, r, c, 1) for l, d, r, c
+                      in tuning.DEFAULT_PROBE_SHAPES]
+            source = "generic ladder"
+        else:
+            source = display
+    else:
+        shapes = [(l, d, r, c, 1) for l, d, r, c in tuning.DEFAULT_PROBE_SHAPES]
+        source = "generic ladder (pass -m MODEL to tune its exact shapes)"
+
+    threads = ([max(1, n) for n in args.threads] if args.threads
+               else tuning.candidate_thread_counts())
+    cached = None if args.force else tuning.load_cached(shapes)
+    if cached is not None and not args.crossover:
+        print(f"cached tuning for this machine and shape class: "
+              f"{cached['threads']} threads "
+              f"(measured {cached.get('created_at', 'earlier')})")
+        if cached.get("serial_matvec_elements") is not None:
+            print(f"  narrow-matrix threshold: "
+                  f"{cached['serial_matvec_elements']} weights")
+        print("re-run with --force to measure again")
+        return 0
+
+    if args.crossover:
+        print("measuring the serial/parallel crossover "
+              "(paired, round-robin - see kernels.SERIAL_MATVEC_ELEMS_DEFAULT)")
+        cross = tuning.measure_crossover(
+            log=lambda s: print(s, file=sys.stderr, flush=True))
+        if "error" in cross:
+            print(f"alpaccaroo tune: {cross['error']}", file=sys.stderr)
+            return 1
+        thr = cross["threshold_elements"]
+        print(f"\nmeasured threshold: {thr} weights "
+              f"(built-in default {cross['builtin_default']})")
+        print("  a matvec at or below it runs on one thread; above it, "
+              "the whole pool")
+        base = cached or {}
+        path = tuning.save_cached(
+            shapes, {"threads": base.get("threads"),
+                     "per_token_matvec_seconds":
+                         base.get("per_token_matvec_seconds"),
+                     "speedup_vs_default": base.get("speedup_vs_default")},
+            crossover=cross)
+        print(f"cached in {path}")
+        if args.json:
+            Path(args.json).write_text(
+                json.dumps(cross, indent=2, default=str), encoding="utf-8")
+            print(f"wrote {args.json}")
+        return 0
+
+    print(f"tuning against {source}")
+    print(f"shapes ({len(shapes)} distinct, weighted by calls per token):")
+    for label, dt, r, c, w in shapes:
+        print(f"  {label:<14} {dt:<5} {r:>7} x {c:<6} x{w}")
+    print(f"thread counts: {', '.join(str(n) for n in threads)}")
+    result = tuning.sweep(shapes, threads, reps=args.reps,
+                          budget_seconds=args.budget,
+                          log=lambda s: print(s, file=sys.stderr, flush=True))
+    if "error" in result:
+        print(f"alpaccaroo tune: {result['error']}", file=sys.stderr)
+        return 1
+
+    print("\nper-token matvec cost by thread count:")
+    for n in sorted(result["per_token_matvec_seconds"]):
+        secs = result["per_token_matvec_seconds"][n]
+        mark = "  <- selected" if n == result["threads"] else ""
+        print(f"  {n:>3} threads   {secs * 1e3:8.2f} ms/token{mark}")
+    path = tuning.save_cached(shapes, result)
+    speedup = result.get("speedup_vs_default")
+    print(f"\nselected {result['threads']} threads"
+          + (f" ({speedup:.2f}x the {result['default_threads']}-thread default)"
+             if speedup else ""))
+    print(f"cached in {path}")
+    print("set ALPACCAROO_AUTOTUNE=1 to have run/serve apply it; "
+          "ALPACCAROO_THREADS always wins over both.")
+    if args.json:
+        Path(args.json).write_text(json.dumps(result, indent=2, default=str),
+                                   encoding="utf-8")
+        print(f"wrote {args.json}")
+    return 0
+
+
 def cmd_tokenize(args) -> int:
     local, _model_name = _resolve_or_pull(args.model, auto_pull=False)
     from .gguf import GGUFFile
@@ -723,6 +827,12 @@ def _print_controls() -> None:
     print("  alpaccaroo rm <model> [more models...]")
     print("  alpaccaroo tokenize -m <model> -p \"text\"")
     print("  alpaccaroo doctor")
+    print("\nPerformance:")
+    print("  alpaccaroo run <model> --profile        # where each token's time goes")
+    print("  alpaccaroo run <model> --profile-json p.json")
+    print("  alpaccaroo bench --model <model>        # cold/warm prefill+decode")
+    print("  alpaccaroo bench --model <model> --json b.json --csv b.csv")
+    print("  alpaccaroo tune -m <model>              # measure this machine once")
     print("\nInteractive chat:")
     print("  Esc or /exit returns to the menu/caller")
     print("  /clear resets the current conversation")
@@ -732,6 +842,8 @@ def _print_controls() -> None:
     print("  ALPACCAROO_DENSE_WEIGHT_MB=0 keeps weights fully quantized")
     print("  ALPACCAROO_KERNELS=0 disables optional pinned JIT kernels")
     print("  ALPACCAROO_PURE=1 forces the standard-library backend")
+    print("  ALPACCAROO_THREADS pins the kernel thread count (wins over everything)")
+    print("  ALPACCAROO_AUTOTUNE=1 applies a cached `alpaccaroo tune` result")
     print("  ALPACCAROO_SMALL_MATVEC_ELEMS re-tunes the quantized matvec crossover")
 
 
@@ -985,6 +1097,26 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("doctor", help="check the installation")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("tune", help="measure and cache this machine's best "
+                                    "kernel thread count (opt-in)")
+    p.add_argument("--model", "-m", default=None,
+                   help="tune the exact matvec shapes of an installed model "
+                        "(read from its GGUF header, not loaded)")
+    p.add_argument("--threads", type=int, nargs="+", default=None,
+                   help="thread counts to try (default: 1, cores/2, cores, "
+                        "logical CPUs)")
+    p.add_argument("--reps", type=int, default=12,
+                   help="timed repetitions per shape; best-of is reported")
+    p.add_argument("--budget", type=float, default=25.0,
+                   help="wall-clock ceiling for the whole sweep, seconds")
+    p.add_argument("--crossover", action="store_true",
+                   help="measure the narrow-matrix serial/parallel threshold "
+                        "instead of the thread count")
+    p.add_argument("--force", action="store_true",
+                   help="re-measure even when a valid cached result exists")
+    p.add_argument("--json", metavar="PATH", default=None)
+    p.set_defaults(func=cmd_tune)
 
     # listed for `alpaccaroo --help`, but never parsed here: main() hands the
     # whole tail to alpaccaroo.bench so its twenty flags (and its own --help)
