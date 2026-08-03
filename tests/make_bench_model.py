@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alpacca import gguf, quants  # noqa: E402
+from alpaccaroo import gguf, quants  # noqa: E402
 
 try:
     import numpy as _np
@@ -100,7 +100,7 @@ def main(path: str, dtype: str = "Q4_0", *, n_vocab: int = N_VOCAB,
         types.append(1)
 
     w = gguf.GGUFWriter(path, arch)
-    w.add("general.name", gguf.T_STRING, f"alpacca-bench-synthetic-{arch}")
+    w.add("general.name", gguf.T_STRING, f"alpaccaroo-bench-synthetic-{arch}")
     w.add(f"{arch}.context_length", gguf.T_UINT32, n_ctx)
     w.add(f"{arch}.embedding_length", gguf.T_UINT32, n_embd)
     w.add(f"{arch}.block_count", gguf.T_UINT32, n_layer)

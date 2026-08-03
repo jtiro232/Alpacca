@@ -2,8 +2,8 @@
 """Real-model correctness gate (needs network to huggingface.co).
 
 Downloads TinyLlama-stories (stories15M, ~19 MB Q4_0 GGUF) through
-alpacca's own Hugging Face pull path, then runs greedy generation with the
-alpacca engine and checks the output is coherent English - which exercises
+alpaccaroo's own Hugging Face pull path, then runs greedy generation with the
+alpaccaroo engine and checks the output is coherent English - which exercises
 the GGUF parser, Q4_0 dequantizer, SPM tokenizer, transformer and sampler
 against weights trained by someone else.
 
@@ -14,11 +14,11 @@ every fixture test in the suite - so the ids below are checked against a
 real 32000-piece Llama vocabulary instead.
 
 A second, larger gate runs only when a Gemma 3 GGUF is available locally:
-set ALPACCA_GEMMA3_GGUF to its path, or leave a Gemma 3 model installed
-under ~/.alpacca. It is skipped (loudly) in CI, where an 800 MB download is
+set ALPACCAROO_GEMMA3_GGUF to its path, or leave a Gemma 3 model installed
+under ~/.alpaccaroo. It is skipped (loudly) in CI, where an 800 MB download is
 not worth it. Its vectors were generated from the authoritative
 sentencepiece proto for gemma-3-1b-it (model_type=BPE, 262144 pieces), not
-from alpacca itself.
+from alpaccaroo itself.
 
 usage: python3 tests/real_model_test.py
 """
@@ -46,7 +46,7 @@ SPM_GOLDEN = {
 
 # Generated from the authoritative sentencepiece proto (unsloth/gemma-3-1b-it
 # tokenizer.model, trainer_spec.model_type = BPE), which encodes these
-# identically to alpacca. Gemma stores merge *ranks* in tokenizer.ggml.scores
+# identically to alpaccaroo. Gemma stores merge *ranks* in tokenizer.ggml.scores
 # rather than log-probabilities, so this pins the other score convention.
 GEMMA3_GOLDEN = {
     "user": [2364],
@@ -75,11 +75,11 @@ def check_spm_golden(model) -> None:
 
 
 def _find_gemma3_gguf() -> "Path | None":
-    explicit = os.environ.get("ALPACCA_GEMMA3_GGUF")
+    explicit = os.environ.get("ALPACCAROO_GEMMA3_GGUF")
     if explicit:
         return Path(explicit) if Path(explicit).is_file() else None
-    from alpacca.gguf import GGUFFile
-    root = Path.home() / ".alpacca" / "models"
+    from alpaccaroo.gguf import GGUFFile
+    root = Path.home() / ".alpaccaroo" / "models"
     if not root.is_dir():
         return None
     for path in sorted(root.rglob("*.gguf")):
@@ -96,11 +96,11 @@ def check_gemma3_golden() -> None:
     """Same gate for a rank-scored (Gemma 3) vocabulary, when one is here."""
     path = _find_gemma3_gguf()
     if path is None:
-        print("SKIP: no Gemma 3 GGUF found (set ALPACCA_GEMMA3_GGUF to run "
+        print("SKIP: no Gemma 3 GGUF found (set ALPACCAROO_GEMMA3_GGUF to run "
               "the rank-scored SPM golden gate)")
         return
-    from alpacca.gguf import GGUFFile
-    from alpacca.tokenizer import Tokenizer
+    from alpaccaroo.gguf import GGUFFile
+    from alpaccaroo.tokenizer import Tokenizer
     # metadata only: no weights are read, so this costs a fraction of a second
     with GGUFFile.open(path) as gf:
         tok = Tokenizer.from_gguf(gf.metadata)
@@ -121,13 +121,13 @@ def check_gemma3_golden() -> None:
 
 
 def main() -> None:
-    os.environ.setdefault("ALPACCA_HOME", str(REPO / ".smoke-home"))
+    os.environ.setdefault("ALPACCAROO_HOME", str(REPO / ".smoke-home"))
 
-    from alpacca import chat
-    from alpacca.model import Model
-    from alpacca.pull import pull_model
-    from alpacca.sample import SamplerParams
-    from alpacca.store import parse_model_ref
+    from alpaccaroo import chat
+    from alpaccaroo.model import Model
+    from alpaccaroo.pull import pull_model
+    from alpaccaroo.sample import SamplerParams
+    from alpaccaroo.store import parse_model_ref
 
     local = pull_model(parse_model_ref(MODEL_REF))
     model = Model.load(str(local.model_path), progress=False)
@@ -154,7 +154,7 @@ def main() -> None:
     assert len(words) >= 15, f"too few words generated: {words}"
     assert hits >= 5, f"output does not look like English: {text!r}"
     assert printable >= len(text) * 0.95, "output contains junk bytes"
-    print("PASS: real model generates coherent English through the alpacca engine")
+    print("PASS: real model generates coherent English through the alpaccaroo engine")
 
 
 if __name__ == "__main__":

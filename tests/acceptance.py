@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Alpacca acceptance test - pull a real instruct model, ask it a factual
+"""Alpaccaroo acceptance test - pull a real instruct model, ask it a factual
 question headlessly, and check the answer.
 
     python3 tests/acceptance.py                       # llama3.2:1b (default)
     python3 tests/acceptance.py --model NousResearch/Hermes-3-Llama-3.1-8B
 
 The default is a 1B model (~770 MB download, ~2 GB RAM with NumPy now
-that quantized weights stay quantized in RAM; ~6 GB with ALPACCA_F32=1).
+that quantized weights stay quantized in RAM; ~6 GB with ALPACCAROO_F32=1).
 The 8B Hermes model works with NumPy at roughly 13 GB RAM quantized
-(35+ GB with ALPACCA_F32=1). Without NumPy, weights become Python float
+(35+ GB with ALPACCAROO_F32=1). Without NumPy, weights become Python float
 objects at ~38 bytes each (measured), so 1B-class models need ~45 GB and
 8B-class ~300 GB - impractical; the script checks RAM and warns before
 committing. Needs network access to the model source on first run.
@@ -44,18 +44,18 @@ def main() -> None:
     ap.add_argument("--yes", action="store_true", help="skip the RAM confirmation")
     args = ap.parse_args()
 
-    from alpacca import chat, tensor
-    from alpacca.model import Model
-    from alpacca.pull import pull_model
-    from alpacca.sample import SamplerParams
-    from alpacca.store import find_local, parse_model_ref
+    from alpaccaroo import chat, tensor
+    from alpaccaroo.model import Model
+    from alpaccaroo.pull import pull_model
+    from alpaccaroo.sample import SamplerParams
+    from alpaccaroo.store import find_local, parse_model_ref
 
     big = "8b" in args.model.lower() or "7b" in args.model.lower()
     ram = available_ram_gb()
-    if tensor.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+    if tensor.HAS_NUMPY and not os.environ.get("ALPACCAROO_F32"):
         need = 13 if big else 2    # quantized int8 weight storage
     elif tensor.HAS_NUMPY:
-        need = 35 if big else 6    # ALPACCA_F32=1 dense float32 expansion
+        need = 35 if big else 6    # ALPACCAROO_F32=1 dense float32 expansion
     else:
         need = 300 if big else 45  # pure python: ~38 bytes per list weight
     if ram >= 0 and ram < need:

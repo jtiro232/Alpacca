@@ -1,4 +1,4 @@
-# Alpacca: close the decode-throughput gap with llama.cpp, in pure Python
+# Alpaccaroo: close the decode-throughput gap with llama.cpp, in pure Python
 
 > **This file is the source of truth for this task, not the chat message that
 > pointed you here.** It is committed to the repo at
@@ -13,13 +13,13 @@
 > you kept it. Write to it *as you go*, not at the end. If you lose context,
 > that file plus this one is enough to resume without repeating work.
 
-You are working on **Alpacca** (`/home/hoopbot/alpacca`), my own project: a
+You are working on **Alpaccaroo** (`/home/hoopbot/alpaccaroo`), my own project: a
 from-scratch GGUF inference engine written entirely in Python. NumPy is an
-optional accelerator; an optional, pinned Numba JIT compiles Alpacca's *own
+optional accelerator; an optional, pinned Numba JIT compiles Alpaccaroo's *own
 Python source* kernels to native SIMD at runtime. No C, no C++, no shipped
 binaries, no GPU. I own this codebase and I'm asking you to modify it freely.
 
-**Goal: raise Alpacca's 8B decode throughput toward llama.cpp's (measured via
+**Goal: raise Alpaccaroo's 8B decode throughput toward llama.cpp's (measured via
 Ollama) on the same machine, without leaving pure Python.**
 
 A prior engineering pass concluded that parity is **not reachable** and that the
@@ -39,10 +39,10 @@ The only metric that decides success:
 
 ```
 8B Q4_K_M, single stream, CPU only, warm JIT, model already loaded:
-    tokens/second of decode, Alpacca vs Ollama, same machine.
+    tokens/second of decode, Alpaccaroo vs Ollama, same machine.
 ```
 
-| | Ollama (llama.cpp) | Alpacca today | target |
+| | Ollama (llama.cpp) | Alpaccaroo today | target |
 |---|---:|---:|---:|
 | Decode | 11.0–12.2 tok/s | 5.0–5.15 tok/s | **≥ 11** |
 | Prefill (911 tok) | 32.0 tok/s | ~10 tok/s | stretch goal |
@@ -55,10 +55,10 @@ were end-to-end throughput.
 **Hard constraints.** Violating any of these makes the work useless to me:
 
 - No C/C++/Rust/assembly source, no compiled extension modules, no GPU. Numba
-  JIT of Alpacca's own Python source is the intended vehicle. NumPy is fine.
+  JIT of Alpaccaroo's own Python source is the intended vehicle. NumPy is fine.
 - No new *required* runtime dependencies. NumPy stays optional; the pure-stdlib
-  path (`ALPACCA_PURE=1`) must keep working and stay correct.
-- **Write original code.** Alpacca's premise is that every algorithm in it is
+  path (`ALPACCAROO_PURE=1`) must keep working and stay correct.
+- **Write original code.** Alpaccaroo's premise is that every algorithm in it is
   ours. Where llama.cpp is referenced below, it is as a description of a
   published technique (quantization block layouts, fused dequantize-dot, VNNI
   integer dot products) — implement from the specification and from first
@@ -80,7 +80,7 @@ Python 3.12.3, NumPy 1.26.4, Numba 0.65.1 (the pinned version)
 ```
 
 Measured memory bandwidth ceiling: **~59 GB/s**. Three independent probes agree
-(BLAS f32 GEMV 58.6, plain Numba f32 loop 59.7, Alpacca's quantized kernel
+(BLAS f32 GEMV 58.6, plain Numba f32 loop 59.7, Alpaccaroo's quantized kernel
 58.9 GB/s). Treat ~59 GB/s as the wall until you disprove it — and do try to
 disprove it (§6.1).
 
@@ -88,7 +88,7 @@ disprove it (§6.1).
 prior run: the server log showed `GPULayers:[]` and Vulkan disabled. If your
 run has GPU offload enabled, the comparison is void.
 
-Ollama also ran with `NumThreads:6` and an **f16 KV cache**. Alpacca defaults to
+Ollama also ran with `NumThreads:6` and an **f16 KV cache**. Alpaccaroo defaults to
 12 Numba threads and an **f32 KV cache**. Those differences are unexplored and
 are live leads in §6.
 
@@ -99,15 +99,15 @@ are live leads in §6.
 Don't write optimization code until these reproduce.
 
 ```sh
-cd /home/hoopbot/alpacca
+cd /home/hoopbot/alpaccaroo
 
-# Alpacca test suites (must stay green throughout)
+# Alpaccaroo test suites (must stay green throughout)
 python3 tests/smoke.py                                              # 402 checks
-env PYTHONDONTWRITEBYTECODE=1 ALPACCA_PURE=1 python3 tests/smoke.py # 305 checks
+env PYTHONDONTWRITEBYTECODE=1 ALPACCAROO_PURE=1 python3 tests/smoke.py # 305 checks
 # with Numba installed the suite gains one kernels-only check       # 403 checks
 
 # The 8B model under test (already downloaded)
-/home/hoopbot/.alpacca/models/hf/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/\
+/home/hoopbot/.alpaccaroo/models/hf/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/\
 Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
 # Ollama reference (8B Q4_K_M, CPU only). It is often not running.
@@ -129,8 +129,8 @@ Decode harness (warm the JIT first — see §5.1):
 
 ```python
 import os, time
-os.environ['ALPACCA_DENSE_WEIGHT_MB'] = '0'      # keep weights fully quantized
-from alpacca.model import Model
+os.environ['ALPACCAROO_DENSE_WEIGHT_MB'] = '0'      # keep weights fully quantized
+from alpaccaroo.model import Model
 m = Model.load(PATH, progress=False)
 m.forward(1); m.reset()                           # WARM THE JIT
 t = time.perf_counter()
@@ -142,12 +142,12 @@ print((time.perf_counter() - t) / 8 * 1000, "ms/token")
 
 ## 4. Where the time goes (established — but re-verify)
 
-Alpacca stores each quantized weight as an **int8 code plus per-sub-block f32
+Alpaccaroo stores each quantized weight as an **int8 code plus per-sub-block f32
 scales**: 1.25 bytes/weight for Q4_K. llama.cpp keeps the native packed block,
 ~0.56 bytes/weight. For an 8B Q4_K_M model that is **9.35 GiB vs ~4.6 GiB**
 streamed per token.
 
-Decode is memory-bandwidth-bound. Alpacca reads 9.35 GiB at ~50 GB/s = 200
+Decode is memory-bandwidth-bound. Alpaccaroo reads 9.35 GiB at ~50 GB/s = 200
 ms/token = 5.0 tok/s, i.e. **85% of the 59 GB/s ceiling**. The decode gap
 (2.2–2.4×) and the storage ratio (1.9–2.0×) are the same number. That is the
 core finding: the gap is bytes per weight, not kernel quality.
@@ -185,7 +185,7 @@ just not efficiently enough. Use `inspect_asm()` early.
 unpacking with cache tiling was ruled out on a back-of-envelope estimate and
 never benchmarked. The estimate may be right, but it isn't evidence.
 
-**5.5 Never checking the thread count.** Alpacca doesn't set
+**5.5 Never checking the thread count.** Alpaccaroo doesn't set
 `NUMBA_NUM_THREADS`, so it used all 12 SMT threads; Ollama used 6. **Measured: 6
 threads = 5.15 tok/s, 12 threads = 4.71 tok/s — 9% free**, on a bandwidth-bound
 loop where SMT siblings contend. This surfaced only at the very end. Check the
@@ -211,7 +211,7 @@ Ranked by expected value. The prior pass touched none of these.
 
 ### 6.1 Thread count, threading layer, and the ceiling itself
 - `NUMBA_NUM_THREADS=6` already measured **+9%**. Sweep 4/6/8/12. Consider
-  defaulting Alpacca to physical-core count, with a knob.
+  defaulting Alpaccaroo to physical-core count, with a knob.
 - The Numba threading layer is `default`. Try `tbb`, `omp`, `workqueue` via
   `NUMBA_THREADING_LAYER`. Layer choice changes barrier cost per `prange`, and
   there are 226 kernel launches per token.
@@ -242,9 +242,9 @@ several percent to much more.
   correctness bug, not an optimization.
 
 ### 6.4 KV cache
-Alpacca uses **f32**; Ollama uses **f16** (verified in its logs). At long
+Alpaccaroo uses **f32**; Ollama uses **f16** (verified in its logs). At long
 context this traffic is real, and it's exactly where users feel it. Also check
-whether Alpacca's attention re-reads more of the cache than it needs.
+whether Alpaccaroo's attention re-reads more of the cache than it needs.
 
 ### 6.5 Cheaper scales (the one near-certain win)
 Q4_K stores `d` and `m` as f32 per 32 weights = 0.25 of the 1.25 B/weight.
@@ -256,7 +256,7 @@ read once per 32 weights, so a 65536-entry uint16→f32 lookup table (256 KB,
 L2-resident) decodes them at negligible cost. Low risk.
 
 ### 6.6 Prefill (secondary; 3.2× behind)
-Alpacca dequantizes to f32 and calls BLAS (~240 GFLOP/s measured). llama.cpp
+Alpaccaroo dequantizes to f32 and calls BLAS (~240 GFLOP/s measured). llama.cpp
 uses int8 GEMM, which NumPy/BLAS don't expose. Cheap things first: check whether
 OpenBLAS is actually threading across all cores, and raise the prefill chunk
 size so the per-chunk dequantize amortizes over more columns.
@@ -322,9 +322,9 @@ Two things that follow from this and were never pursued:
 Also ruled out, with reasons:
 
 - **Speculative decoding** (n-gram/prompt-lookup, no draft model). It relies on
-  batching being nearly free. Alpacca's batched kernel is ALU-bound at ~42
+  batching being nearly free. Alpaccaroo's batched kernel is ALU-bound at ~42
   GMAC/s, so a k-token draft costs ~k×. llama.cpp gets this win because its
-  kernel has compute headroom under the bandwidth wall; Alpacca doesn't. **If
+  kernel has compute headroom under the bandwidth wall; Alpaccaroo doesn't. **If
   you raise the batched kernel's compute efficiency, revisit this** — it becomes
   viable the moment batching stops costing linearly.
 - **Micro-optimizing the existing int8 kernel.** Already at ~100% of achievable
@@ -337,16 +337,16 @@ Also ruled out, with reasons:
 - `tests/smoke.py`'s `check()` calls `sys.exit(1)` on the **first** failure, so
   one early failure hides every later test. If a mutation "isn't caught",
   confirm the test actually ran.
-- Run fully quantized with `ALPACCA_DENSE_WEIGHT_MB=0`. Without it the CLI may
+- Run fully quantized with `ALPACCAROO_DENSE_WEIGHT_MB=0`. Without it the CLI may
   densify weights to f32 for BLAS, changing what you're measuring.
-- `ALPACCA_PURE=1` forces the stdlib path. `ALPACCA_KERNELS=0` disables Numba.
-  `ALPACCA_FUSED_MATMUL_MAX_BATCH` sets the fused/BLAS crossover for batched
+- `ALPACCAROO_PURE=1` forces the stdlib path. `ALPACCAROO_KERNELS=0` disables Numba.
+  `ALPACCAROO_FUSED_MATMUL_MAX_BATCH` sets the fused/BLAS crossover for batched
   matmul (default 96).
 - Numba is pinned to 0.65.1; another version deactivates the kernels unless
-  `ALPACCA_KERNELS=force`.
+  `ALPACCAROO_KERNELS=force`.
 - Recent relevant work is on branch `perf/fused-quantized-matmul`: fused batched
   matmul kernels that made small-batch prefill 2.3–16.6× faster. Read
-  `alpacca/kernels.py` and `alpacca/qmatrix.py` first — they are the hot path.
+  `alpaccaroo/kernels.py` and `alpaccaroo/qmatrix.py` first — they are the hot path.
 - `README.md` has an "Honest performance expectations" section that is meant to
   stay honest. If you change performance, update it with measured numbers,
   including anything that got worse.

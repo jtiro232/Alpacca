@@ -1,14 +1,14 @@
-# Alpacca - our own GPU tier: quantized matvec/matmul CUDA kernels,
+# Alpaccaroo - our own GPU tier: quantized matvec/matmul CUDA kernels,
 # written in Python. MIT License. See LICENSE.
-"""Alpacca's GPU tier: Python-source CUDA kernels, optionally JIT-compiled.
+"""Alpaccaroo's GPU tier: Python-source CUDA kernels, optionally JIT-compiled.
 
 Weight matrices stay quantized in VRAM in the same universal codes layout
 the NumPy backend unpacks (int8 codes + per-sub-block effective float32
-scales/offsets, :func:`alpacca.quants.np_unpack`). Every kernel here is
-Alpacca's own algorithm, authored in this file as ordinary Python and
+scales/offsets, :func:`alpaccaroo.quants.np_unpack`). Every kernel here is
+Alpaccaroo's own algorithm, authored in this file as ordinary Python and
 compiled at runtime by the OPTIONAL, PINNED numba-cuda JIT
-(``pip install alpacca[gpu]``). Without a CUDA device or the pinned JIT -
-or with ``ALPACCA_GPU=0`` - nothing changes: the CPU tiers (kernels/NumPy/
+(``pip install alpaccaroo[gpu]``). Without a CUDA device or the pinned JIT -
+or with ``ALPACCAROO_GPU=0`` - nothing changes: the CPU tiers (kernels/NumPy/
 pure) remain the reference implementations and the fallback, and any error
 in this tier degrades to them rather than failing the engine.
 
@@ -48,7 +48,7 @@ shape these kernels are wrong for, and it must stay gatherable on the host.
 
 Pin policy: numba-cuda is locked to ``NUMBA_CUDA_PIN`` below, mirroring
 the kernels tier. The pin is never updated implicitly; a different
-installed version deactivates the tier (``ALPACCA_GPU=force`` overrides at
+installed version deactivates the tier (``ALPACCAROO_GPU=force`` overrides at
 your own risk).
 
 Known trap, recorded because the failure is silent and misattributed: with
@@ -61,8 +61,8 @@ tier that cannot launch.
 
 Buffer reuse contract: the per-size pinned/device activation buffers (and
 the grow-only batched-matmul staging pair) are not synchronized for
-concurrent callers - alpacca's own server serializes generation behind a
-lock, same caveat as the hot-weight cache in :mod:`alpacca.qmatrix`.
+concurrent callers - alpaccaroo's own server serializes generation behind a
+lock, same caveat as the hot-weight cache in :mod:`alpaccaroo.qmatrix`.
 Every matvec and every batched matmul ends with a synchronous D2H on the
 legacy default stream, which drains the queued async H2D and kernel, so
 rewriting the staging buffers on the next call is safe.
@@ -99,7 +99,7 @@ _TPB = 256
 # dominant stream half as often. 16x16 kept (10.0 TFLOP/s on the fused
 # ffn matrix).
 # This one kernel replaced the old wide-kernel/looped-matvec pair and the
-# ALPACCA_GPU_WIDE_MATMUL_ELEMS crossover knob that picked between them:
+# ALPACCAROO_GPU_WIDE_MATMUL_ELEMS crossover knob that picked between them:
 # decoding each code tile into shared memory once removes the redundant
 # per-batch-lane unpack that made both old paths lose, at every size, so
 # the knob (and the env var, now silently ignored) had nothing left to
@@ -152,10 +152,10 @@ _state: dict | None = None  # lazy: {"ok": True, ...} or {} / {"error"} off
 
 
 def _vram_cap_bytes() -> int:
-    """ALPACCA_GPU_VRAM_MB caps total uploaded weight bytes - the test
+    """ALPACCAROO_GPU_VRAM_MB caps total uploaded weight bytes - the test
     hook for the mixed-placement fallback; unset/0 lets free VRAM minus
     GPU_RESERVE_MB decide."""
-    raw = os.environ.get("ALPACCA_GPU_VRAM_MB", "")
+    raw = os.environ.get("ALPACCAROO_GPU_VRAM_MB", "")
     if not raw.strip():
         return 0
     try:
@@ -175,8 +175,8 @@ def _init() -> dict:
     if _state is not None:
         return _state
     _state = {}
-    mode = os.environ.get("ALPACCA_GPU", "").strip().lower()
-    if mode in ("0", "off", "no") or os.environ.get("ALPACCA_PURE"):
+    mode = os.environ.get("ALPACCAROO_GPU", "").strip().lower()
+    if mode in ("0", "off", "no") or os.environ.get("ALPACCAROO_PURE"):
         return _state
     try:
         import numpy as np
@@ -199,8 +199,8 @@ def _init() -> dict:
     except Exception:
         pass
     if numba_cuda.__version__ != NUMBA_CUDA_PIN and mode != "force":
-        print(f"alpacca: numba-cuda {numba_cuda.__version__} != pinned "
-              f"{NUMBA_CUDA_PIN}; gpu tier disabled (ALPACCA_GPU=force to "
+        print(f"alpaccaroo: numba-cuda {numba_cuda.__version__} != pinned "
+              f"{NUMBA_CUDA_PIN}; gpu tier disabled (ALPACCAROO_GPU=force to "
               f"override)", file=sys.stderr)
         return _state
 
@@ -997,15 +997,15 @@ def available() -> bool:
 def status() -> str:
     st = _init()
     if st.get("ok"):
-        return (f"alpacca-gpu active (numba-cuda=={st['version']}, "
+        return (f"alpaccaroo-gpu active (numba-cuda=={st['version']}, "
                 f"pin {NUMBA_CUDA_PIN}, our Python source)")
     if st.get("error"):
-        return f"alpacca-gpu inactive ({st['error']})"
-    return "alpacca-gpu inactive (CPU tiers in use)"
+        return f"alpaccaroo-gpu inactive ({st['error']})"
+    return "alpaccaroo-gpu inactive (CPU tiers in use)"
 
 
 def doctor_line() -> str:
-    """One line for `alpacca doctor`: device + VRAM, or why there is none."""
+    """One line for `alpaccaroo doctor`: device + VRAM, or why there is none."""
     st = _init()
     if st.get("ok"):
         return (f"{st['name']} ({st['free_mb']} MiB free of "
@@ -1237,7 +1237,7 @@ def attention_batch(q, K, V, positions, group: int, inv_sqrt: float,
         # parked, not degraded per-matrix: attention holds no weights, so
         # the NumPy path recomputes losslessly from the host cache
         st["att_dead"] = True
-        print(f"alpacca-gpu: batch attention degraded to NumPy "
+        print(f"alpaccaroo-gpu: batch attention degraded to NumPy "
               f"({type(e).__name__}: {e})", file=sys.stderr)
         return None
 
@@ -1306,7 +1306,7 @@ def ffn_swiglu_batch(wgu, wdown, X):
 
 
 class _VramBudget(Exception):
-    """Upload refused by the free-VRAM reserve or ALPACCA_GPU_VRAM_MB."""
+    """Upload refused by the free-VRAM reserve or ALPACCAROO_GPU_VRAM_MB."""
 
 
 class GpuMatrix:
@@ -1391,7 +1391,7 @@ class GpuMatrix:
     def _release_vram(self) -> None:
         """Return this matrix's bytes to the budget. Idempotent; called on
         degrade (device arrays dropped) and on garbage collection, so a
-        freed model no longer counts against ALPACCA_GPU_VRAM_MB and a
+        freed model no longer counts against ALPACCAROO_GPU_VRAM_MB and a
         later budget exhaustion warns again."""
         st = _state
         if st and self.vram_nbytes:
@@ -1438,7 +1438,7 @@ class GpuMatrix:
             # never be read again
             self._dq = self._dd = self._dm = None
             self._release_vram()
-            print(f"alpacca-gpu: matrix {self.rows}x{self.cols} {self.dtype} "
+            print(f"alpaccaroo-gpu: matrix {self.rows}x{self.cols} {self.dtype} "
                   f"degraded to CPU ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
 
@@ -1600,7 +1600,7 @@ def gpu_matrix(data, dtype: str, rows: int, cols: int):
         st["skipped"] += 1
         if not st.get("skip_warned"):
             st["skip_warned"] = True
-            print(f"alpacca-gpu: VRAM budget reached ({e}) after "
+            print(f"alpaccaroo-gpu: VRAM budget reached ({e}) after "
                   f"{st['matrices']} matrices "
                   f"({st['uploaded_bytes'] >> 20} MiB); remaining matrices "
                   f"stay on the CPU tiers", file=sys.stderr)
@@ -1609,7 +1609,7 @@ def gpu_matrix(data, dtype: str, rows: int, cols: int):
         st["skipped"] += 1
         if not st.get("fail_warned"):
             st["fail_warned"] = True
-            print(f"alpacca-gpu: upload failed ({type(e).__name__}: {e}); "
+            print(f"alpaccaroo-gpu: upload failed ({type(e).__name__}: {e}); "
                   f"matrix stays on the CPU tiers", file=sys.stderr)
         return None
 
@@ -1622,7 +1622,7 @@ class _ChainUnsupported(Exception):
 
 
 def _chain_env_off() -> bool:
-    return os.environ.get("ALPACCA_GPU_CHAIN", "").strip().lower() in (
+    return os.environ.get("ALPACCAROO_GPU_CHAIN", "").strip().lower() in (
         "0", "off", "no")
 
 
@@ -1726,14 +1726,14 @@ class DecodeChain:
                            gm(ly.w_down, "ffn_down")))
 
         n_ctx = model.n_ctx
-        # ALPACCA_KV_F16=1: opt-in half-precision K/V mirror - stores cast
+        # ALPACCAROO_KV_F16=1: opt-in half-precision K/V mirror - stores cast
         # f32 -> f16 on the device, kernels read f16 back up to f32.
         # Halves the mirror's VRAM and the per-token K/V bandwidth decode
         # pays at depth, but the numbers legitimately shift (~1e-3), so
         # the default stays f32: every parity claim, and BTBK, run the
         # default. Read once at chain build; the host cache stays f32
         # and authoritative either way (rows come home widened).
-        self.kv_f16 = os.environ.get("ALPACCA_KV_F16", "").strip() == "1"
+        self.kv_f16 = os.environ.get("ALPACCAROO_KV_F16", "").strip() == "1"
         kv_dtype = np_.float16 if self.kv_f16 else np_.float32
         kv_itemsize = 2 if self.kv_f16 else 4
         mirror = 2 * hp.n_layer * n_ctx * kvd * kv_itemsize
@@ -1744,7 +1744,7 @@ class DecodeChain:
             raise _ChainUnsupported(
                 f"K/V mirror needs {mirror >> 20} MiB, {free_b >> 20} free")
         # visibility, not budget: the mirror is chain scratch, deliberately
-        # outside the ALPACCA_GPU_VRAM_MB weight cap (which the docs define
+        # outside the ALPACCAROO_GPU_VRAM_MB weight cap (which the docs define
         # as uploaded weight bytes), but vram_stats/doctor must not
         # under-report device residency by a gigabyte (review finding)
         st["chain_bytes"] = st.get("chain_bytes", 0) + mirror
@@ -2165,7 +2165,7 @@ def chain_forward(model, token: int):
     is always correct. The chain builds lazily on the first decoded token
     (mirror allocation and upload); ANY failure, build or runtime, parks
     it permanently for this model instance (never the tier), and
-    ALPACCA_GPU_CHAIN=0 refuses it outright."""
+    ALPACCAROO_GPU_CHAIN=0 refuses it outright."""
     st = _init()
     if not st.get("ok"):
         return None
@@ -2180,7 +2180,7 @@ def chain_forward(model, token: int):
             return None
         except Exception as e:
             model._gpu_chain_dead = True
-            print(f"alpacca-gpu: decode chain unavailable "
+            print(f"alpaccaroo-gpu: decode chain unavailable "
                   f"({type(e).__name__}: {e})", file=sys.stderr)
             return None
         model._gpu_chain = ch
@@ -2189,7 +2189,7 @@ def chain_forward(model, token: int):
     except Exception as e:
         model._gpu_chain = None
         model._gpu_chain_dead = True
-        print(f"alpacca-gpu: decode chain disabled ({type(e).__name__}: "
+        print(f"alpaccaroo-gpu: decode chain disabled ({type(e).__name__}: "
               f"{e}); decoding continues on the per-matvec path",
               file=sys.stderr)
         return None
@@ -2208,7 +2208,7 @@ def chain_prefill(model, tokens, want_logits: bool):
     legitimately logits-free chunk is distinguishable from a refusal).
 
     Shares the decode chain's gate and instance: llama-class geometry,
-    every chain matrix resident, and ALPACCA_GPU_CHAIN=0 refuses both
+    every chain matrix resident, and ALPACCAROO_GPU_CHAIN=0 refuses both
     paths - no knob of its own. The chain now builds at the first
     prefill chunk rather than the first decoded token, so the chunk's
     K/V rows land in the mirror as they are computed and the decode
@@ -2241,7 +2241,7 @@ def chain_prefill(model, tokens, want_logits: bool):
             return None
         except Exception as e:
             model._gpu_chain_dead = True
-            print(f"alpacca-gpu: decode chain unavailable "
+            print(f"alpaccaroo-gpu: decode chain unavailable "
                   f"({type(e).__name__}: {e})", file=sys.stderr)
             return None
         model._gpu_chain = ch
@@ -2256,11 +2256,11 @@ def chain_prefill(model, tokens, want_logits: bool):
         model._gpu_prefill_fails += 1
         if model._gpu_prefill_fails >= _PREFILL_PARK_AFTER:
             model._gpu_prefill_dead = True
-            print(f"alpacca-gpu: device prefill disabled "
+            print(f"alpaccaroo-gpu: device prefill disabled "
                   f"({type(e).__name__}: {e}); prefill continues on the "
                   f"existing path", file=sys.stderr)
         else:
-            print(f"alpacca-gpu: device prefill chunk failed "
+            print(f"alpaccaroo-gpu: device prefill chunk failed "
                   f"({type(e).__name__}: {e}); the caller recomputes it "
                   f"(streak {model._gpu_prefill_fails}/{_PREFILL_PARK_AFTER})",
                   file=sys.stderr)
@@ -2338,7 +2338,7 @@ def warmup() -> None:
         # warn, but do NOT clear _state: matrices already resident hold
         # references into it, and their per-call degrade path (download,
         # then compute on the host) needs the state alive to run at all
-        print(f"alpacca: gpu warmup failed ({type(e).__name__}: {e}); "
+        print(f"alpaccaroo: gpu warmup failed ({type(e).__name__}: {e}); "
               f"kernel calls will degrade per-matrix to the CPU tiers",
               file=sys.stderr)
 

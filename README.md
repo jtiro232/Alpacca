@@ -1,11 +1,11 @@
-# Alpacca
+# Alpaccaroo
 
 **LLMs in your terminal - a from-scratch, 100% Python inference engine for
 GGUF models, with Ollama-style model management. Zero dependencies.**
 
 ## Mission
 
-Alpacca stands on three commitments:
+Alpaccaroo stands on three commitments:
 
 1. **Totally our own software.** Every layer is implemented from scratch
    in this repository: the GGUF parser, the quantization codecs, the
@@ -16,11 +16,11 @@ Alpacca stands on three commitments:
 2. **Pure Python.** The engine runs on the standard library alone, on any
    Python >= 3.10, and every algorithm in this repository - including the
    fast kernels - is written in Python. Acceleration is optional and
-   tiered: NumPy when installed (10-100x faster math), and Alpacca's own
-   kernels in `alpacca/kernels.py` - our Python source, JIT-compiled to
+   tiered: NumPy when installed (10-100x faster math), and Alpaccaroo's own
+   kernels in `alpaccaroo/kernels.py` - our Python source, JIT-compiled to
    native SIMD at runtime by a *pinned* Numba (`python -m pip install
    ".[kernels]"` from this checkout; the pin is never bumped implicitly).
-   No C, no Rust, no compiled files in the repo. `ALPACCA_PURE=1` forces the stdlib
+   No C, no Rust, no compiled files in the repo. `ALPACCAROO_PURE=1` forces the stdlib
    path; the pure and NumPy paths are the reference implementations that
    everything else must match in CI.
 3. **Fast and reliable - honestly.** Speed is engineered as far as Python
@@ -35,27 +35,27 @@ Alpacca stands on three commitments:
 
 | Layer | Where | What's implemented |
 | --- | --- | --- |
-| GGUF file format | `alpacca/gguf.py` | reader (mmap) + writer, metadata, tensor table |
-| Quantization codecs | `alpacca/quants.py` | decode/encode support for F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
-| Quantized weight storage | `alpacca/qmatrix.py` | fast in-RAM matvec/matmul storage for Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; unsupported matrix formats fall back to dense, and say so at load |
-| Fast kernels | `alpacca/kernels.py` | our fused quantized-matvec algorithms in Python source, JIT-compiled by pinned optional Numba |
-| Tokenizers | `alpacca/tokenizer.py` | SentencePiece (llama.cpp's greedy highest-score-first merge, special-token pre-split, byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
-| Transformer | `alpacca/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
-| Sampling | `alpacca/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
-| Chat | `alpacca/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, Esc-to-menu interactive REPL with saved history |
-| History | `alpacca/history.py` | local JSON chat sessions, delete one/delete all controls, saved-chat statistics |
-| API server | `alpacca/serve.py` | OpenAI-compatible `/v1/chat/completions` (incl. SSE streaming) on `http.server` |
-| Model manager | `alpacca/store.py`, `alpacca/pull.py` | Ollama-registry protocol + Hugging Face pulls via `urllib`, resumable, SHA-256 verified |
-| CLI / terminal app | `alpacca/cli.py` | repo-owned `alpacca menu`; pull/run/serve/list/show/rm/tokenize/history/hist/doctor; default model persistence; auto RAM-aware speed defaults |
+| GGUF file format | `alpaccaroo/gguf.py` | reader (mmap) + writer, metadata, tensor table |
+| Quantization codecs | `alpaccaroo/quants.py` | decode/encode support for F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K |
+| Quantized weight storage | `alpaccaroo/qmatrix.py` | fast in-RAM matvec/matmul storage for Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K; unsupported matrix formats fall back to dense, and say so at load |
+| Fast kernels | `alpaccaroo/kernels.py` | our fused quantized-matvec algorithms in Python source, JIT-compiled by pinned optional Numba |
+| Tokenizers | `alpaccaroo/tokenizer.py` | SentencePiece (llama.cpp's greedy highest-score-first merge, special-token pre-split, byte fallback) and byte-level BPE with a GPT-2/llama-3 pre-tokenizer |
+| Transformer | `alpaccaroo/model.py` | RMSNorm, RoPE (llama & neox styles), grouped-query attention, SwiGLU, KV cache, dense-budget loader |
+| Sampling | `alpaccaroo/sample.py` | greedy, temperature, top-k, top-p, repeat penalty |
+| Chat | `alpaccaroo/chat.py` | llama3 / chatml / gemma / llama2 / zephyr templates, streaming, Esc-to-menu interactive REPL with saved history |
+| History | `alpaccaroo/history.py` | local JSON chat sessions, delete one/delete all controls, saved-chat statistics |
+| API server | `alpaccaroo/serve.py` | OpenAI-compatible `/v1/chat/completions` (incl. SSE streaming) on `http.server` |
+| Model manager | `alpaccaroo/store.py`, `alpaccaroo/pull.py` | Ollama-registry protocol + Hugging Face pulls via `urllib`, resumable, SHA-256 verified |
+| CLI / terminal app | `alpaccaroo/cli.py` | repo-owned `alpaccaroo menu`; pull/run/serve/list/show/rm/tokenize/history/hist/doctor; default model persistence; auto RAM-aware speed defaults |
 | Tests | `tests/` | offline smoke (mock registry, kernel parity, menu/history, both backends), real-model gate, benchmarks, synthetic bench-model builders |
 | Tooling | `scripts/` | offline installers for Linux/macOS/Windows, generating thin launchers into this checkout |
 
 ```text
-$ alpacca pull llama3.2:1b            # straight from the Ollama registry
-$ alpacca menu                        # local terminal app menu
-$ alpacca run llama3.2:1b             # interactive chat
-$ alpacca run llama3.2:1b "why is the sky blue?"
-$ alpacca serve llama3.2:1b           # OpenAI-compatible API on :8080
+$ alpaccaroo pull llama3.2:1b            # straight from the Ollama registry
+$ alpaccaroo menu                        # local terminal app menu
+$ alpaccaroo run llama3.2:1b             # interactive chat
+$ alpaccaroo run llama3.2:1b "why is the sky blue?"
+$ alpaccaroo serve llama3.2:1b           # OpenAI-compatible API on :8080
 ```
 
 ## Install - offline by design
@@ -66,31 +66,31 @@ published SHA-256), then either:
 
 ```sh
 # 1. no install at all:
-python3 -m alpacca doctor
+python3 -m alpaccaroo doctor
 
-# 2. or put an `alpacca` launcher on your PATH (offline, creates one file):
+# 2. or put an `alpaccaroo` launcher on your PATH (offline, creates one file):
 scripts/install.sh          # Linux/macOS   (PREFIX=... to relocate)
 .\scripts\install.ps1     # Windows PowerShell
 ```
 
 Requires Python >= 3.10. The generated launchers are deliberately thin:
-they set `PYTHONPATH` to this checkout and dispatch to `python -m alpacca`.
-Running `alpacca` with no arguments opens the repo-owned terminal menu in an
-interactive terminal; `alpacca menu` opens it explicitly; all normal commands
-still work (`alpacca doctor`, `alpacca run ...`, `alpacca history stats`).
-Installers use the normal store at `~/.alpacca` unless you set
-`ALPACCA_HOME` yourself.
+they set `PYTHONPATH` to this checkout and dispatch to `python -m alpaccaroo`.
+Running `alpaccaroo` with no arguments opens the repo-owned terminal menu in an
+interactive terminal; `alpaccaroo menu` opens it explicitly; all normal commands
+still work (`alpaccaroo doctor`, `alpaccaroo run ...`, `alpaccaroo history stats`).
+Installers use the normal store at `~/.alpaccaroo` unless you set
+`ALPACCAROO_HOME` yourself.
 
 Optional: `python -m pip install numpy` for fast generation, or
-`python -m pip install ".[kernels]"` from this checkout for Alpacca's pinned
+`python -m pip install ".[kernels]"` from this checkout for Alpaccaroo's pinned
 Numba kernel tier. Those are the only commands here that would touch a
-package index for Python packages, they are opt-in, and Alpacca works without
+package index for Python packages, they are opt-in, and Alpaccaroo works without
 them. `python -m pip install .` also works if you prefer a normal Python
 install.
 
 ## Getting models
 
-Models live in `~/.alpacca/models` (override: `$ALPACCA_HOME`). Reference
+Models live in `~/.alpaccaroo/models` (override: `$ALPACCAROO_HOME`). Reference
 them three ways:
 
 | Reference | Source |
@@ -101,67 +101,67 @@ them three ways:
 | `hf:org/repo:Q4_K_M` (or a filename) | Hugging Face - specific quant/file |
 | `./path/to/model.gguf` | any local GGUF |
 
-`alpacca pull` speaks the Ollama registry protocol directly (manifest +
+`alpaccaroo pull` speaks the Ollama registry protocol directly (manifest +
 content-addressed layers - weights, parameters, system prompt, license) and
 the Hugging Face API (quant selection, `-GGUF` sibling-repo fallback,
 `HF_TOKEN` for gated repos). Downloads resume after interruption and are
-verified against the publisher's SHA-256 digests. `alpacca run` auto-pulls
+verified against the publisher's SHA-256 digests. `alpaccaroo run` auto-pulls
 on first use. Model nicknames are stored as local aliases under
-`$ALPACCA_HOME` and do not rename the downloaded model directory or manifest.
-Use `alpacca nickname <model> <nickname>` or the Model manager menu to set one;
-`alpacca list` shows the `NICKNAME` column, and `alpacca nickname --list`
+`$ALPACCAROO_HOME` and do not rename the downloaded model directory or manifest.
+Use `alpaccaroo nickname <model> <nickname>` or the Model manager menu to set one;
+`alpaccaroo list` shows the `NICKNAME` column, and `alpaccaroo nickname --list`
 enumerates every alias - including any left orphaned by a removed model.
 
 ```sh
-alpacca list
-alpacca nickname llama3.2:1b "quick llama"
-alpacca nickname --list
-alpacca show "quick llama" --metadata
-alpacca rm llama3.2:1b
-alpacca tokenize -m "quick llama" -p "hello world"
-alpacca history list
-alpacca history stats
+alpaccaroo list
+alpaccaroo nickname llama3.2:1b "quick llama"
+alpaccaroo nickname --list
+alpaccaroo show "quick llama" --metadata
+alpaccaroo rm llama3.2:1b
+alpaccaroo tokenize -m "quick llama" -p "hello world"
+alpaccaroo history list
+alpaccaroo history stats
 ```
 
 ## Running models
 
 ```sh
-alpacca run llama3.2:1b                          # interactive (Esc or /exit returns, /clear resets)
-alpacca run "quick llama" "one-shot question"    # nicknames work for model selectors
-alpacca run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
-alpacca serve llama3.2:1b --port 8080
+alpaccaroo run llama3.2:1b                          # interactive (Esc or /exit returns, /clear resets)
+alpaccaroo run "quick llama" "one-shot question"    # nicknames work for model selectors
+alpaccaroo run ./model.gguf --temp 0.2 -n 256 -c 4096 --seed 1
+alpaccaroo serve llama3.2:1b --port 8080
 ```
 
 The terminal app has a repo-owned menu:
 
 ```sh
-alpacca menu       # or just `alpacca` in an interactive terminal
+alpaccaroo menu       # or just `alpaccaroo` in an interactive terminal
 ```
 
 The menu lists installed models, opens chat, switches the default chat
 model by name or nickname, sets model nicknames, shows model details, exposes
 history/statistics, and links back to the normal commands. The default chat
-model is stored locally in `~/.alpacca/default-model.txt` (or
-`$ALPACCA_HOME/default-model.txt`) and is only a UI convenience; model selector
+model is stored locally in `~/.alpaccaroo/default-model.txt` (or
+`$ALPACCAROO_HOME/default-model.txt`) and is only a UI convenience; model selector
 commands accept an explicit model reference or a nickname.
 
 An interactive chat stays inside the model's context window on its own: when the
 conversation no longer leaves room for a reply, the oldest turns are dropped
 (the system message is kept) and the REPL prints how many it dropped. `/clear`
 resets the conversation outright. The effective context length is printed at
-load next to the model's trained maximum, because `alpacca run` defaults to a
+load next to the model's trained maximum, because `alpaccaroo run` defaults to a
 smaller window than most models advertise - pass `-c` to raise it.
 
-Interactive chats are saved as local JSON files under `~/.alpacca/history`
-(or `$ALPACCA_HOME/history`). One-shot `alpacca run MODEL "prompt"` calls and
+Interactive chats are saved as local JSON files under `~/.alpaccaroo/history`
+(or `$ALPACCAROO_HOME/history`). One-shot `alpaccaroo run MODEL "prompt"` calls and
 server/API requests are not logged. Use:
 
 ```sh
-alpacca history list            # list saved interactive chats
-alpacca history show <chat>     # <chat> = list number, full ID, or unique prefix
-alpacca history stats           # read-only saved-chat token/s summary
-alpacca history rm <chat>       # delete one saved chat
-alpacca history clear --yes     # delete all saved chat history
+alpaccaroo history list            # list saved interactive chats
+alpaccaroo history show <chat>     # <chat> = list number, full ID, or unique prefix
+alpaccaroo history stats           # read-only saved-chat token/s summary
+alpaccaroo history rm <chat>       # delete one saved chat
+alpaccaroo history clear --yes     # delete all saved chat history
 ```
 
 `history stats` also lists installed models with zero saved chats so you can
@@ -177,7 +177,7 @@ stablelm, gemma, and Gemma 3 text GGUFs. Gemma 3 support includes Q/K
 normalization, local sliding-window attention patterns, dual RoPE bases, linear
 RoPE scaling, metadata-driven attention scale, GELU FFNs, post-attention/post-FFN
 norms, tied output embeddings, and optional final logit softcapping. Gemma 3
-support is text-only; multimodal projector/vision support is outside Alpacca's
+support is text-only; multimodal projector/vision support is outside Alpaccaroo's
 current engine scope.
 
 What has actually been exercised, and what has not: Gemma 3 1B has been run end
@@ -197,7 +197,7 @@ the template has no system turn and refuses two user turns in a row. Measured on
 Gemma 3 1B over 36 greedy generations, that rendering and a separate-system-turn
 rendering are not distinguishable in how well the model obeys a system prompt.
 Two divergences remain: every non-assistant role is mapped to `user`, and the
-template's `raise_exception` on non-alternating roles is not ported - alpacca
+template's `raise_exception` on non-alternating roles is not ported - alpaccaroo
 renders such a conversation instead of rejecting it.
 
 ### Honest performance expectations
@@ -242,7 +242,7 @@ the weight dot, the same trade llama.cpp makes. Measured end to end on the
 8B model, 48 greedy-decoded tokens agree 48/48 with the exact float32
 path, and the kernels are bit-exact against an integer simulation of
 their own algebra (a smoke check enforces <=1e-5 and was verified to fail
-under a mutated kernel). `ALPACCA_INT_DOT=0` restores the previous exact
+under a mutated kernel). `ALPACCAROO_INT_DOT=0` restores the previous exact
 storage and kernels. Weights themselves are represented exactly - the
 codes and scales are the file's own bits.
 
@@ -257,7 +257,7 @@ never materialized on this kernel; 4K-page streaming already sits on the
 DRAM wall), fusing attn_q+attn_k and gate+up launches (kept for structure,
 but 226 -> 162 launches was worth 0.0 ms here), and thread counts above
 the physical-core count (SMT contention costs 9-16%; kernels now default
-to physical cores, override with ALPACCA_THREADS).
+to physical cores, override with ALPACCAROO_THREADS).
 
 #### Notes for future engineers (human or AI) on the kernels
 
@@ -302,7 +302,7 @@ repeated. The short version:
   (4 int8 MACs/lane) from Python-authored loops.
 - **Measurement discipline**: warm the JIT before timing, benchmark on
   a quiet machine (background load once produced a 3 tok/s reading that
-  was pure noise), pair alpacca and Ollama numbers same-day, and treat
+  was pure noise), pair alpaccaroo and Ollama numbers same-day, and treat
   multi-minute prefill windows as +-15%. Sustained decode runs this
   hardware at its thermal ceiling with clocks intact - verify clocks
   and DRAM bandwidth before blaming code.
@@ -327,7 +327,7 @@ matrix to float32 before handing it to BLAS, a cost proportional to the
 *weights* rather than to the batch, so prefilling a single new token cost a
 full-model dequantize - 5.0 s on that 8B model, 25x a whole decode step, and
 paid again on every chat turn. Two fused kernels now stream the codes
-directly for batches up to `ALPACCA_FUSED_MATMUL_MAX_BATCH` (96 by default),
+directly for batches up to `ALPACCAROO_FUSED_MATMUL_MAX_BATCH` (96 by default),
 one laid out for narrow batches and one for wide ones; past that the tiled
 BLAS path still wins and is still used. Prefill of N new tokens, 8B Q4_K_M,
 model already loaded:
@@ -355,9 +355,9 @@ prefill on the 64-token rows is a single ~50 ms window and jitters
 | Run (`tests/bench.py`) | Mode | Load | Prefill | Decode | Peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Q4_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.084 s | ~1,100 tok/s | 63.2 tok/s | 65.5 MB |
-| Q4_0, same run | `ALPACCA_F32=1` dense | 0.130 s | 3,192 tok/s | 126.7 tok/s | 107.1 MB |
+| Q4_0, same run | `ALPACCAROO_F32=1` dense | 0.130 s | 3,192 tok/s | 126.7 tok/s | 107.1 MB |
 | Q4_0, 256 prompt / 128 decode, ctx 512 | quantized weights | 0.083 s | 2,998 tok/s | 60.3 tok/s | 71.3 MB |
-| Q4_0, same run | `ALPACCA_F32=1` dense | 0.128 s | 4,393 tok/s | 131.3 tok/s | 115.7 MB |
+| Q4_0, same run | `ALPACCAROO_F32=1` dense | 0.128 s | 4,393 tok/s | 131.3 tok/s | 115.7 MB |
 | Q8_0, 64 prompt / 32 decode, ctx 128 | quantized weights | 0.078 s | ~930 tok/s | 58.6 tok/s | 72.6 MB |
 | F32 GGUF, 64 prompt / 32 decode | native dense | 0.096 s | 3,638 tok/s | 152.0 tok/s | 156.7 MB |
 
@@ -378,7 +378,7 @@ What quantized storage does and does not buy here, measured honestly:
   on Windows (no `resource` module).
 - **Load time**: 0.084 s vs 0.130 s for float32 expansion (writes ~1.1
   bytes per weight instead of 4; the advantage grows with model size).
-- **Decode speed**: quantized decode remains ~0.5x of `ALPACCA_F32=1`
+- **Decode speed**: quantized decode remains ~0.5x of `ALPACCAROO_F32=1`
   dense decode. This is a measured NumPy ceiling, not a missing
   optimization in this codebase: OpenBLAS SGEMV runs multithreaded at
   memory bandwidth (0.53 ms for the dominant 32000x288 output projection),
@@ -395,33 +395,33 @@ What quantized storage does and does not buy here, measured honestly:
 ### Spending RAM for speed: the dense-weight budget
 
 Because dense BLAS is the fast path and quantized storage is the small
-path, the practical dial for 1B-8B models is `ALPACCA_DENSE_WEIGHT_MB=N`:
-at load time Alpacca expands up to `N` MiB of the most decode-critical
+path, the practical dial for 1B-8B models is `ALPACCAROO_DENSE_WEIGHT_MB=N`:
+at load time Alpaccaroo expands up to `N` MiB of the most decode-critical
 matrices to dense float32 and keeps the rest quantized. Matrices are
 picked in measured-benefit order - FFN projections first (they dominate
 llama-class decode), then attention q/output, then k/v, then the output
 projection; a token embedding is only densified when it doubles as a tied
 output matrix. Chosen matrices never keep their quantized copy, so unlike
-`ALPACCA_HOT_WEIGHT_MB` nothing is stored twice.
+`ALPACCAROO_HOT_WEIGHT_MB` nothing is stored twice.
 
 Measured on the same Linux container with a 1.1B-parameter
 TinyLlama-shaped synthetic Q4_0 model (GQA 32/4 heads, untied output;
 `tests/make_bench_model.py --embd 2048 --ff 5632 --layers 22 --heads 32
 --kv 4 --untied`), 32-token prompt / 16-token decode:
 
-| `ALPACCA_DENSE_WEIGHT_MB` | Storage | Prefill | Decode | Peak RSS |
+| `ALPACCAROO_DENSE_WEIGHT_MB` | Storage | Prefill | Decode | Peak RSS |
 | --- | --- | ---: | ---: | ---: |
 | unset (all quantized) | 156 quant | 18.1 tok/s | 1.29 tok/s | 1.85 GB |
 | `3100` (FFN stack dense) | 76 quant + 80 dense | 34.6 tok/s | 3.81 tok/s | 4.07 GB |
 | `4000` (all but embedding) | 1 quant + 155 dense | 49.3 tok/s | 7.34 tok/s | 4.79 GB |
-| `ALPACCA_F32=1` (everything) | 156 dense | 53.4 tok/s | 7.37 tok/s | 4.97 GB |
+| `ALPACCAROO_F32=1` (everything) | 156 dense | 53.4 tok/s | 7.37 tok/s | 4.97 GB |
 
 Decode scales almost linearly with how much of the per-token matvec work
 runs through BLAS: the FFN-only budget buys 3.0x decode for ~2.2 GB, and
 the everything-but-embedding budget matches full float32 speed while the
 embedding stays quantized. For an 8B model (e.g. Hermes-3-Llama-3.1-8B
 Q4), the FFN stack is ~22.5 GB (21.0 GiB) dense, so
-`ALPACCA_DENSE_WEIGHT_MB=24000` is the "fast decode if you have ~35 GB
+`ALPACCAROO_DENSE_WEIGHT_MB=24000` is the "fast decode if you have ~35 GB
 total RAM" setting, and smaller budgets degrade gracefully - every MiB
 goes to the highest-impact matrices first. `tests/bench.py` prints the
 resulting storage split per run.
@@ -429,7 +429,7 @@ resulting storage split per run.
 ### Our own kernels: native speed, still our Python
 
 `python -m pip install ".[kernels]"` from this checkout adds the third tier:
-the fused quantized-matvec algorithms in `alpacca/kernels.py` - written and
+the fused quantized-matvec algorithms in `alpaccaroo/kernels.py` - written and
 maintained as ordinary Python in this repository - get JIT-compiled to
 native SIMD machine code at runtime by Numba, **pinned at
 `numba==0.65.1`** (a validated pair with this code; the pin is never
@@ -450,22 +450,22 @@ shapes, int8 codes + scales vs the same matvec through NumPy:
 
 ~10x the NumPy quantized path, and dense-BLAS-class speed while reading
 3.5x fewer bytes - which is exactly why, when the kernels are active,
-`alpacca run` keeps weights quantized instead of densifying: fastest
+`alpaccaroo run` keeps weights quantized instead of densifying: fastest
 path and lowest RAM at the same time. Without Numba nothing changes;
 the NumPy and pure paths remain the reference and the fallback
-(`ALPACCA_KERNELS=0` disables; `ALPACCA_KERNELS=force` accepts an
+(`ALPACCAROO_KERNELS=0` disables; `ALPACCAROO_KERNELS=force` accepts an
 unpinned Numba at your own risk). First use compiles the kernels once
 (~1 s, cached on disk).
 
-**Fast is the default for `alpacca run` and `alpacca serve`**: unless
-`ALPACCA_DENSE_WEIGHT_MB` is set, the CLI sizes the budget automatically
+**Fast is the default for `alpaccaroo run` and `alpaccaroo serve`**: unless
+`ALPACCAROO_DENSE_WEIGHT_MB` is set, the CLI sizes the budget automatically
 from detected available RAM (cgroup-aware inside containers). When the
 machine can hold every densifiable matrix - checked exactly from the
 GGUF header against the residual quantized storage and the KV cache at
 the requested context - it spends exactly that; otherwise it reserves
 the quantized residue plus a context-scaled KV/runtime allowance and
 spends 85% of the remainder. The chosen value is printed at load. Set
-`ALPACCA_DENSE_WEIGHT_MB=0` for the low-RAM all-quantized mode, or an
+`ALPACCAROO_DENSE_WEIGHT_MB=0` for the low-RAM all-quantized mode, or an
 explicit MiB value to pin the budget - any set value pins the budget,
 and unparseable values fall back to all-quantized. RAM detection uses
 `/proc/meminfo` on Linux, `GlobalMemoryStatusEx` on Windows, and a
@@ -481,30 +481,30 @@ Rules of thumb:
   1B-class models decode at several tok/s and 8B-class models become usable.
   Prefer this tier whenever you can install the pinned Numba.
 - **with NumPy**: tiny and 1B-class models are the practical target. Use
-  quantized weights when RAM is the constraint, `ALPACCA_DENSE_WEIGHT_MB`
-  to spend whatever RAM you can spare on decode speed, and `ALPACCA_F32=1`
+  quantized weights when RAM is the constraint, `ALPACCAROO_DENSE_WEIGHT_MB`
+  to spend whatever RAM you can spare on decode speed, and `ALPACCAROO_F32=1`
   when the full float32 expansion fits comfortably anyway.
 - **stdlib only**: tiny models (stories15M-class) are fine; 1B is slow. Good
   for air-gapped checks, not long conversations.
 - **chat/server reuse**: repeated turns or requests with a shared prompt prefix
   skip already-cached K/V work automatically, and interleaved conversations
   restore each other's discarded contexts through the multi-slot prefix
-  cache (`ALPACCA_PREFIX_CACHE_MB` below) instead of re-prefilling.
+  cache (`ALPACCAROO_PREFIX_CACHE_MB` below) instead of re-prefilling.
 
 Useful environment knobs:
 
-- `ALPACCA_PURE=1`: force the standard-library backend.
-- `ALPACCA_KERNELS=0`: disable the optional JIT kernels;
-  `ALPACCA_KERNELS=force` accepts a non-pinned Numba at your own risk.
-- `ALPACCA_DENSE_WEIGHT_MB=N`: densify up to `N` MiB of the most
+- `ALPACCAROO_PURE=1`: force the standard-library backend.
+- `ALPACCAROO_KERNELS=0`: disable the optional JIT kernels;
+  `ALPACCAROO_KERNELS=force` accepts a non-pinned Numba at your own risk.
+- `ALPACCAROO_DENSE_WEIGHT_MB=N`: densify up to `N` MiB of the most
   decode-critical matrices at load time (FFN first) and keep the rest
   quantized - the main RAM-for-speed dial. The CLI auto-sizes this from
   available RAM when unset; `0` disables densification; library callers
   opt in explicitly. See the table above.
-- `ALPACCA_F32=1`: force the NumPy loader to expand all quantized matrices
+- `ALPACCAROO_F32=1`: force the NumPy loader to expand all quantized matrices
   to float32, useful for A/B checks and small models where BLAS wins.
-- `ALPACCA_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
-- `ALPACCA_PREFIX_CACHE_MB=N`: MiB budget (default 1024, `0` disables) for
+- `ALPACCAROO_PREFILL_CHUNK=N`: prompt batch size for NumPy prefill; default 256.
+- `ALPACCAROO_PREFIX_CACHE_MB=N`: MiB budget (default 1024, `0` disables) for
   the multi-slot prefix cache. When `prefill` switches away from a live
   context about to lose 256+ tokens of K/V work, those rows are
   snapshotted, keyed by their exact token ids; switching back restores
@@ -517,27 +517,27 @@ Useful environment knobs:
   never uses slots. `Model.prefix_cache_stats()` counts
   slots/bytes/hits/misses/saves/evictions and `describe()` shows a
   `prefix cache` segment while slots exist.
-- `ALPACCA_SMALL_MATVEC_ELEMS=N`: matrices below `N` elements use the
+- `ALPACCAROO_SMALL_MATVEC_ELEMS=N`: matrices below `N` elements use the
   batched-matmul quantized matvec instead of the einsum one. Default 0 (off) -
   einsum measured faster at every shape a llama- or Gemma-class model uses, on
   two different machines. Re-measure before raising it.
-- `ALPACCA_HOT_WEIGHT_MB=N`: optional lazy dense float32 cache for quantized
+- `ALPACCAROO_HOT_WEIGHT_MB=N`: optional lazy dense float32 cache for quantized
   matrices, capped at `N` MiB. Unlike the dense budget this caches at first
-  use and keeps the quantized copy too; prefer `ALPACCA_DENSE_WEIGHT_MB`
+  use and keeps the quantized copy too; prefer `ALPACCAROO_DENSE_WEIGHT_MB`
   unless you specifically want runtime-populated caching.
-  (`ALPACCA_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is now the
+  (`ALPACCAROO_UNPACKED_WEIGHT_MB` is gone; the int8 unpacked form is now the
   default storage and needs no budget.)
 
 ### The GPU tier: CUDA kernels, still our Python
 
 `python -m pip install ".[gpu]"` from this checkout adds a fourth optional
-tier: the quantized matvec/matmul kernels in `alpacca/cuda.py` - written
+tier: the quantized matvec/matmul kernels in `alpaccaroo/cuda.py` - written
 and maintained as ordinary Python in this repository - get JIT-compiled
 for the local NVIDIA GPU at runtime by **numba-cuda, pinned at `0.30.4`**
 together with its exact CUDA wheel set (same pin policy as `[kernels]`:
 the pins are a validated combination, never bumped implicitly, and a
 different installed version deactivates the tier rather than running
-unvalidated; `ALPACCA_GPU=force` overrides at your own risk). Weight
+unvalidated; `ALPACCAROO_GPU=force` overrides at your own risk). Weight
 matrices upload once at load in the same int8-codes + float32-scales
 layout the NumPy backend unpacks and stay quantized in VRAM (~1.25
 bytes/weight). The KV cache stays host-side and authoritative - prefix
@@ -547,7 +547,7 @@ GEMM-silu-GEMM FFN, and (when every chain matrix of a llama-class model
 is resident) whole-token decode as a device-resident chain with one
 synchronization per token. Every piece degrades per call or per
 instance to the exact CPU paths, so every other tier keeps working
-unchanged and `ALPACCA_GPU=0` restores them exactly. Like everything
+unchanged and `ALPACCAROO_GPU=0` restores them exactly. Like everything
 else here the wheels install once and run offline; keep copies
 (`pip download ".[gpu]"`) if the machine will be air-gapped later.
 
@@ -612,7 +612,7 @@ matrices) plus a 1.1 GiB K/V mirror at the default 4096 context; the
 token embedding never uploads - row gathers are the one workload these
 kernels are wrong for. Placement is per-matrix, so running out of VRAM
 mid-load just leaves the remaining matrices on the CPU tiers with one
-warning line - a capped run (`ALPACCA_GPU_VRAM_MB=500` on the 1b: 44
+warning line - a capped run (`ALPACCAROO_GPU_VRAM_MB=500` on the 1b: 44
 matrices on GPU, the rest on CPU) decodes token-identically to the
 uncapped one, with the chain declining mixed placement.
 
@@ -623,7 +623,7 @@ within 1.9e-6 worst relative error over randomized ragged shapes
 (batch==t, batch<t continuation, GQA groups 1-8, sliding windows).
 48-token greedy decode through the full chain is token-identical to the
 exact f32 reference path on both test models (llama3.2:1b vs the CPU
-tiers directly, 48/48; the 8B vs `ALPACCA_INT_DOT=0`, 48/48 - the
+tiers directly, 48/48; the 8B vs `ALPACCAROO_INT_DOT=0`, 48/48 - the
 int-dot CPU tier is approximate by design, so greedy text can drift
 from *it* on Q4_K_M while both stay glued to the reference), and a
 two-prompt shared-prefix sequence (prefill, decode, re-prefill with a
@@ -632,14 +632,14 @@ token-identical chain-on vs chain-off.
 
 GPU knobs:
 
-- `ALPACCA_GPU=0`: disable the tier; `ALPACCA_GPU=force` accepts a
+- `ALPACCAROO_GPU=0`: disable the tier; `ALPACCAROO_GPU=force` accepts a
   non-pinned numba-cuda at your own risk.
-- `ALPACCA_GPU_CHAIN=0`: keep the tier but disable the device-resident
+- `ALPACCAROO_GPU_CHAIN=0`: keep the tier but disable the device-resident
   decode chain (decode falls back to the v1 per-matvec dispatch).
-- `ALPACCA_GPU_VRAM_MB=N`: cap uploaded weight bytes (the
+- `ALPACCAROO_GPU_VRAM_MB=N`: cap uploaded weight bytes (the
   mixed-placement test hook; free VRAM minus a 512 MiB reserve decides
   otherwise).
-- `ALPACCA_KV_F16=1`: opt-in half-precision K/V mirror for the decode
+- `ALPACCAROO_KV_F16=1`: opt-in half-precision K/V mirror for the decode
   chain (stores cast f32 -> f16 on the device, kernels read back up to
   f32; the host cache stays f32 and authoritative). Halves the mirror's
   VRAM - 1.1 GiB -> 0.55 GiB for the 8B at ctx 8192 - which is the
@@ -648,7 +648,7 @@ GPU knobs:
   dial, not a speed dial. The numerics legitimately shift (~1e-3): no
   byte- or token-parity claim is made for this mode, and the default
   stays f32 so every parity guarantee above holds untouched.
-- `ALPACCA_GPU_WIDE_MATMUL_ELEMS` is retired: the tiled GEMM handles
+- `ALPACCAROO_GPU_WIDE_MATMUL_ELEMS` is retired: the tiled GEMM handles
   every matrix size in one launch, so there are no longer two batched
   kernels to choose between. The variable is accepted and silently
   ignored so existing environments keep working.
@@ -658,12 +658,12 @@ One installation trap the `[gpu]` pins exist to prevent: with
 torch wheel's bundled stale nvJitLink and every kernel dies with
 `ERROR_OUTDATED_LIBRARY(14)`. The availability probe compiles and runs a
 real kernel before the tier may activate and reports the actual cause
-through `alpacca doctor`, which shows the device, free VRAM and tier
+through `alpaccaroo doctor`, which shows the device, free VRAM and tier
 status either way.
 
 ### Ollama-native API
 
-`alpacca serve` also speaks the Ollama REST protocol on the same port, so
+`alpaccaroo serve` also speaks the Ollama REST protocol on the same port, so
 the official `ollama` Python client works unmodified - point it at the
 server and `client.chat(...)`, `client.generate(...)`, `ollama.list()`,
 `show()`, and `ps()` behave as they do against Ollama itself (verified
@@ -707,7 +707,7 @@ prefix of one syntactically valid JSON value, and generation stops
 guarantee at any temperature, on any supported model, on both the NumPy and
 pure-Python backends - not a prompt trick.
 
-The mechanism is a byte-level JSON grammar guard (`alpacca/jsonform.py`)
+The mechanism is a byte-level JSON grammar guard (`alpaccaroo/jsonform.py`)
 driving a candidate-rejection loop: each position is sampled normally, the
 candidate token's raw bytes are tested against the guard, and a token that
 would break the JSON is masked to -inf and the position resampled. The guard
@@ -754,10 +754,10 @@ and the roadmap orders the work that serves it.
   Llama-3.1-8B Q4_K_M drops 16.6x for a 1-token prefill and 2.3-2.7x for the
   16-32 token turns a chat actually produces (see "Where the time goes on a
   large model"). Architecture-agnostic: it works on quant codes.
-- Repo-owned terminal app menu (`alpacca menu`, or no-arg `alpacca` in an
+- Repo-owned terminal app menu (`alpaccaroo menu`, or no-arg `alpaccaroo` in an
   interactive terminal), with model switching, history navigation, deletion
   controls, saved-chat statistics, and Esc-to-menu chat return.
-- Interactive chat history: local JSON sessions under `ALPACCA_HOME`,
+- Interactive chat history: local JSON sessions under `ALPACCAROO_HOME`,
   `history list/show/stats/rm/clear --yes`, and stats rows for installed
   models even when they have no saved chats.
 - Optional pinned kernels: our Python-source fused quantized matvecs
@@ -768,10 +768,10 @@ and the roadmap orders the work that serves it.
   Q4_K/Q5_K/Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight,
   nothing re-dequantized per token (2.9x decode over the previous engine);
   other formats fall back to dense float32 and say so at load.
-- The dense-weight budget (`ALPACCA_DENSE_WEIGHT_MB`): spend RAM on BLAS
+- The dense-weight budget (`ALPACCAROO_DENSE_WEIGHT_MB`): spend RAM on BLAS
   speed exactly where it pays, FFN projections first - and the CLI sizes
   it automatically from available RAM (cgroup-aware in containers,
-  scales its reserve with the requested context), so `alpacca run` is as
+  scales its reserve with the requested context), so `alpaccaroo run` is as
   fast as the machine affords by default.
 - Batched prefill with last-token-only vocab projection, prefix-aware
   KV-cache reuse across chat turns and server requests, decode-overhead
@@ -838,14 +838,14 @@ generation gate on every push.
 - **No install-time network access**: the repo is the program. No package
   index, no build step, no binary artifacts, no submodules.
 - Release archives ship with SHA-256 checksums.
-- Model downloads (`alpacca pull`) are the only network feature, are
+- Model downloads (`alpaccaroo pull`) are the only network feature, are
   explicit, and verify the publisher's digests. Models carry their own
   licenses - when the publisher provides one, it is stored next to the
   weights.
 
 ## Credits
 
-All code here is written from scratch in Python by the Alpacca project.
+All code here is written from scratch in Python by the Alpaccaroo project.
 It interoperates with formats and protocols designed by others, with
 thanks - see
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md): the GGUF format and

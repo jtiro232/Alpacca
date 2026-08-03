@@ -1,4 +1,4 @@
-# Alpacca - model downloads from the Ollama registry and Hugging Face,
+# Alpaccaroo - model downloads from the Ollama registry and Hugging Face,
 # using only the Python standard library (urllib + hashlib).
 #
 # Protocol notes: Ollama models live in an OCI-style registry
@@ -26,7 +26,7 @@ from pathlib import Path
 from .store import (LocalModel, ModelRef, find_local, human_size,
                     now_iso8601, write_manifest)
 
-UA = "alpacca/0.2 (+https://github.com/jtiro232/Alpacca)"
+UA = "alpaccaroo/0.2 (+https://github.com/jtiro232/Alpaccaroo)"
 
 OLLAMA_MEDIA = {
     "application/vnd.ollama.image.model": "model.gguf",
@@ -38,11 +38,11 @@ OLLAMA_MEDIA = {
 
 
 def _registry() -> str:
-    return os.environ.get("ALPACCA_OLLAMA_REGISTRY", "https://registry.ollama.ai")
+    return os.environ.get("ALPACCAROO_OLLAMA_REGISTRY", "https://registry.ollama.ai")
 
 
 def _hf_endpoint() -> str:
-    return os.environ.get("ALPACCA_HF_ENDPOINT", "https://huggingface.co")
+    return os.environ.get("ALPACCAROO_HF_ENDPOINT", "https://huggingface.co")
 
 
 def _hf_headers() -> dict:
@@ -171,7 +171,7 @@ def _pull_ollama(ref: ModelRef, force: bool, verify: bool) -> LocalModel:
             model_size = size
 
     if not any(f == "model.gguf" for f, _, _ in todo):
-        raise RuntimeError(f"{ref.display()} has no GGUF weights layer; alpacca cannot run it")
+        raise RuntimeError(f"{ref.display()} has no GGUF weights layer; alpaccaroo cannot run it")
 
     d.mkdir(parents=True, exist_ok=True)
     for fname, digest_hex, size in todo:
@@ -267,7 +267,7 @@ def _hf_choose(files: list[dict], selector: str) -> dict | None:
                 _UNSUPPORTED_QUANT.search(_basename(chosen["path"])):
             raise ValueError(
                 f"{_basename(chosen['path'])} is an IQ quantization, which "
-                f"alpacca cannot read yet - pick a Q4_K_M, Q5_K_M or Q8_0 "
+                f"alpaccaroo cannot read yet - pick a Q4_K_M, Q5_K_M or Q8_0 "
                 f"file from the repo instead")
         return chosen
     loadable = [f for f in candidates
@@ -276,7 +276,7 @@ def _hf_choose(files: list[dict], selector: str) -> dict | None:
         names = ", ".join(sorted(_basename(f["path"]) for f in candidates)[:5])
         raise ValueError(
             f"this repo only ships IQ quantizations ({names}), which "
-            f"alpacca cannot read yet")
+            f"alpaccaroo cannot read yet")
     for q in _QUANT_PREFERENCE:
         for f in loadable:
             if q in _basename(f["path"]).lower():
@@ -314,7 +314,7 @@ def _pull_hf(ref: ModelRef, force: bool, verify: bool) -> LocalModel:
             pass
     if not files:
         raise RuntimeError(
-            f"no .gguf files in {ref.ns}/{ref.name} - alpacca runs GGUF models "
+            f"no .gguf files in {ref.ns}/{ref.name} - alpaccaroo runs GGUF models "
             f"(try a -GGUF repo, e.g. from ggml-org or bartowski)")
 
     chosen = _hf_choose(files, ref.tag)

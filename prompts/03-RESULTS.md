@@ -9,16 +9,16 @@ end-to-end 8B Q4_K_M decode unless marked "micro".
 8B Q4_K_M, single stream, CPU only, warm JIT, model loaded, same machine,
 same day:
 
-|  | Ollama (llama.cpp) | Alpacca before | Alpacca after |
+|  | Ollama (llama.cpp) | Alpaccaroo before | Alpaccaroo after |
 |---|---:|---:|---:|
 | Decode | 11.91-11.95 tok/s | 5.07-5.20 tok/s | **9.1-9.9 tok/s** |
 | Prefill 911 tok | 31.5 tok/s | 5.9 (same-day) | 7.2-8.0 tok/s |
 | Weight RAM | ~4.6 GiB | 9.35 GiB | **5.03 GiB** (RSS 5.78) |
 | Load time | - | 14.3 s | 7.8-9.4 s |
 
-Alpacca decode: 101.6/101.8/101.8 ms/token in quiet windows (9.83-9.85
+Alpaccaroo decode: 101.6/101.8/101.8 ms/token in quiet windows (9.83-9.85
 tok/s), 104.8-109.4 ms in windows with background load; final pairing in
-one session: Alpacca 9.14/9.40/9.54 vs Ollama 11.91. Decode gap closed
+one session: Alpaccaroo 9.14/9.40/9.54 vs Ollama 11.91. Decode gap closed
 from 2.3x to 1.21-1.30x. Every avenue below; commits on
 perf/fused-quantized-matmul. Both suites green throughout, counts
 402->403 numpy / 305 pure / 403->423 kernels; CI green.
@@ -48,7 +48,7 @@ now bytes-per-weight and per-token fixed cost, not kernel quality.**
 
 The binding constraints, quantified:
 1. DRAM wall 59-60 GB/s (measured four ways, flat across thread counts).
-2. Alpacca streams 0.578 B/w for Q4_K vs llama.cpp's 0.5625 (+2.7%), and
+2. Alpaccaroo streams 0.578 B/w for Q4_K vs llama.cpp's 0.5625 (+2.7%), and
    1.066 B/w for Q6_K vs 0.82 (+30% on 19% of weights) - worth ~6 ms of
    the 17 ms/token gap. Closing it needs the 6-bit code packing whose
    unpack currently costs more ALU than the bandwidth it saves (52 Gw/s
@@ -73,10 +73,10 @@ narrower storage.
 ## Baseline reproduction (2026-07-30) — ALL REPRODUCED
 
 - [x] smoke.py system python: 402 checks pass
-- [x] smoke.py ALPACCA_PURE=1: 305 checks pass
+- [x] smoke.py ALPACCAROO_PURE=1: 305 checks pass
 - [x] smoke.py in numba venv (0.65.1 + numpy 1.26.4): 403 checks pass
-- [x] Alpacca 8B decode: 4.41-4.49 tok/s @ 12 threads, 5.18 tok/s @ 6 threads
-      (16 tokens, warm JIT, ALPACCA_DENSE_WEIGHT_MB=0, load 14.3s)
+- [x] Alpaccaroo 8B decode: 4.41-4.49 tok/s @ 12 threads, 5.18 tok/s @ 6 threads
+      (16 tokens, warm JIT, ALPACCAROO_DENSE_WEIGHT_MB=0, load 14.3s)
 - [x] Ollama nemotron:latest (= Llama-3.1-Nemotron-Nano-8B Q4_K_M, 8.03B,
       llama arch): decode 11.95 tok/s, prefill 31.5 tok/s, size_vram=0
       (CPU-only confirmed via /api/ps)
@@ -144,7 +144,7 @@ vector reduce per 256 weights. 63.9 GB/s effective = at the memory wall for
 
 ### Integration results (2026-07-30, commits e728089 + Q6_K follow-up)
 
-End-to-end 8B Q4_K_M decode, warm JIT, ALPACCA_DENSE_WEIGHT_MB=0:
+End-to-end 8B Q4_K_M decode, warm JIT, ALPACCAROO_DENSE_WEIGHT_MB=0:
   5.18 tok/s (best pre-existing) -> 8.42 (int-dot v1) -> 9.85 tok/s after
   the Q6_K j-outer kernel (101.6 ms/token). Ollama: 11.95.
 Load time 14.3s -> 7.8s (native unpack is lighter than int8+f32 expand).
@@ -194,7 +194,7 @@ B/w, strictly better than the planned 1.125. No separate work remains.
   blocks make this valid): launches 226 -> 162, logits bit-identical
   (new smoke check, guards fusion engaged). Decode unchanged on this
   machine (101.8 vs 101.6 ms/token) - omp fork/join was already cheap.
-  KEPT for structure; ALPACCA_FUSE=0 reverts.
+  KEPT for structure; ALPACCAROO_FUSE=0 reverts.
 - Output-head shortcut (6.3c): REJECTED - sampler needs full logits
   (global top-k, repeat penalty on arbitrary ids); no exact-equivalent
   shortcut exists.
@@ -259,7 +259,7 @@ answer. Diagnosed by measurement, not guesswork:
   kernels' omp pool. A/B at ctx ~750: default 2259 ms/token,
   OPENBLAS_NUM_THREADS=1 gives 131 (clean machine).
 
-Fix: fused decode-attention kernel in alpacca's own Python (prange over
+Fix: fused decode-attention kernel in alpaccaroo's own Python (prange over
 query heads, softmax in-kernel), on the SAME omp pool as the matvecs.
 Result: ctx 25 104.5 ms (unchanged), ctx 768-960 113-115 ms in the
 DEFAULT env - cliff gone, and fused attention is ~3x cheaper than even
@@ -268,7 +268,7 @@ single-threaded matmul (9 vs 27 ms at ~900 ctx). Kernel-vs-matmul parity
 
 Adversarial review (8 agents) CONFIRMED 3 defects in the first cut, all
 fixed and re-verified:
-1. Fully DENSE models (F16/ALPACCA_F32) used to decode single-pool on
+1. Fully DENSE models (F16/ALPACCAROO_F32) used to decode single-pool on
    OpenBLAS; dispatching only their attention to numba CREATED the
    two-pool thrash (75 -> 258-316 ms/token measured). Gate changed from
    "JIT importable" to "this model runs quantized kernels" (same
@@ -326,12 +326,12 @@ j-outer loop - worth at most ~1.5 ms/token; future work.
 
 Exact single-token decode ceiling here = 4.92 GB/token / 59.5 GB/s
 ~ 11.4 tok/s; Ollama runs 11.9 by sitting on that wall with ~1 ms
-overhead. Alpacca: 102.4 ms = 9.77 tok/s. The remaining 20 ms
+overhead. Alpaccaroo: 102.4 ms = 9.77 tok/s. The remaining 20 ms
 decomposes as: Q6_K ALU ceiling ~9 ms (proven twice: needs 72 Gw/s,
 has 52), non-matvec ~6 ms (attention 0.5 + rope 1.4 + norms 1.0 +
 quantize 1.3 + dispatch ~2), Q4_K scale packing ~1.5 ms (prepass
 untested), Q4_K wall shortfall ~3 ms (96% of streaming peak). Realistic
-alpacca max on this box ~10.2-10.5 exact; parity needs vpdpbusd-class
+alpaccaroo max on this box ~10.2-10.5 exact; parity needs vpdpbusd-class
 codegen or faster DRAM. Also: sustained decode runs this chassis at
 Tjmax (95C, clocks hold 4.26 GHz) - cooling/power limits, not code, set
 part of the wall.

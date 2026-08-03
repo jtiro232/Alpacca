@@ -1,4 +1,4 @@
-# Alpacca - chat formatting and generation loops.
+# Alpaccaroo - chat formatting and generation loops.
 # MIT License. See LICENSE.
 from __future__ import annotations
 
@@ -441,7 +441,7 @@ def interactive(model: Model, params: SamplerParams, system: str = "",
                 model_path: str = "") -> None:
     fmt = ChatFormat(model, detect_format(model.metadata))
     description = model.describe()
-    print(f"alpacca chat - {description}", file=sys.stderr)
+    print(f"alpaccaroo chat - {description}", file=sys.stderr)
     print("press Esc or type /exit to return, /clear to reset the conversation\n",
           file=sys.stderr)
     messages: list[dict] = []

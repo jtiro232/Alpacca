@@ -1,4 +1,4 @@
-# Alpacca - local model store (~/.alpacca/models) and model references.
+# Alpaccaroo - local model store (~/.alpaccaroo/models) and model references.
 # MIT License. See LICENSE.
 from __future__ import annotations
 
@@ -14,19 +14,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def alpacca_home() -> Path:
-    env = os.environ.get("ALPACCA_HOME")
+def alpaccaroo_home() -> Path:
+    env = os.environ.get("ALPACCAROO_HOME")
     if env:
         return Path(env)
-    return Path.home() / ".alpacca"
+    return Path.home() / ".alpaccaroo"
 
 
 def models_root() -> Path:
-    return alpacca_home() / "models"
+    return alpaccaroo_home() / "models"
 
 
 def _nicknames_file() -> Path:
-    return alpacca_home() / "model-nicknames.json"
+    return alpaccaroo_home() / "model-nicknames.json"
 
 
 def _sanitize(part: str) -> str:
@@ -166,10 +166,10 @@ def _quarantine_nicknames(path: Path, err: Exception) -> None:
     try:
         os.replace(path, spoiled)
     except OSError:
-        print(f"alpacca: warning: {path} is unreadable ({err}); "
+        print(f"alpaccaroo: warning: {path} is unreadable ({err}); "
               f"model nicknames are being ignored", file=sys.stderr)
         return
-    print(f"alpacca: warning: {path} is unreadable ({err}); "
+    print(f"alpaccaroo: warning: {path} is unreadable ({err}); "
           f"moved it to {spoiled.name} and starting a new nickname file",
           file=sys.stderr)
 

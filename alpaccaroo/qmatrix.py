@@ -1,10 +1,10 @@
-# Alpacca - quantized matrix storage and matvec/matmul kernels.
+# Alpaccaroo - quantized matrix storage and matvec/matmul kernels.
 # MIT License. See LICENSE.
 """Row-major quantized GGUF matrix weights.
 
 NumPy backend
     At construction the raw GGUF blocks are unpacked once (via
-    :func:`alpacca.quants.np_unpack`) into int8 quant codes plus per-sub-block
+    :func:`alpaccaroo.quants.np_unpack`) into int8 quant codes plus per-sub-block
     effective float32 scales/offsets, all owned copies - the source mmap can
     close immediately and no raw block bytes are retained. This keeps RAM at
     roughly 1.1-1.3 bytes per weight (vs 4 for float32) while decode reads
@@ -16,14 +16,14 @@ NumPy backend
     Both compute out = sum_s d_eff[:, s] * (codes[:, s] @ x_s) (+ offsets),
     which is bit-equivalent algebra to dequantize-then-GEMV.
 
-    The optional hot-cache budget globals (``ALPACCA_HOT_WEIGHT_MB``) are not
-    synchronized for concurrent matvec callers: alpacca's own server
+    The optional hot-cache budget globals (``ALPACCAROO_HOT_WEIGHT_MB``) are not
+    synchronized for concurrent matvec callers: alpaccaroo's own server
     serializes generation behind a lock, but embedders doing concurrent
     inference with the budget set should serialize calls or leave it unset.
 
 Pure backend
     Owns a copy of the raw block bytes and decodes rows on the fly with the
-    pure decoders in :mod:`alpacca.quants`. Slow but dependency-free; the
+    pure decoders in :mod:`alpaccaroo.quants`. Slow but dependency-free; the
     model loader never wraps matrices in pure mode, this path exists so both
     backends can verify each other in tests.
 """
@@ -42,7 +42,7 @@ try:
 except Exception:  # pragma: no cover
     _np = None
 
-if os.environ.get("ALPACCA_PURE"):
+if os.environ.get("ALPACCAROO_PURE"):
     _np = None
 
 HAS_NUMPY = _np is not None
@@ -57,7 +57,7 @@ QUANTIZED_MATVEC_DTYPES = frozenset(QUANT_GEOMETRY)
 # matvecs. Default it off, and keep the knob so it can be re-measured rather
 # than re-guessed on hardware with a different BLAS.
 def _small_matvec_elems() -> int:
-    raw = os.environ.get("ALPACCA_SMALL_MATVEC_ELEMS", "")
+    raw = os.environ.get("ALPACCAROO_SMALL_MATVEC_ELEMS", "")
     try:
         return max(0, int(raw))
     except ValueError:
@@ -82,7 +82,7 @@ _SMALL_MATVEC_ELEMS = _small_matvec_elems()
 # than this one cannot be pushed into a regression. Re-measure, do not
 # re-guess: it is a knob.
 def _fused_matmul_max_batch() -> int:
-    raw = os.environ.get("ALPACCA_FUSED_MATMUL_MAX_BATCH", "")
+    raw = os.environ.get("ALPACCAROO_FUSED_MATMUL_MAX_BATCH", "")
     try:
         return max(0, int(raw))
     except ValueError:
@@ -96,13 +96,13 @@ def _fused_matmul_max_batch() -> int:
 # batch * matvec_ms ~= tiled_ms. Measured on the 14336x4096 Q4_K shape:
 # int matvec 0.53 ms, tiled ~43 ms -> ~80; default below it for safety.
 def _int_matmul_max_batch() -> int:
-    raw = os.environ.get("ALPACCA_INT_MATMUL_MAX_BATCH", "")
+    raw = os.environ.get("ALPACCAROO_INT_MATMUL_MAX_BATCH", "")
     try:
         return max(0, int(raw))
     except ValueError:
         return 64
 
-_HOT_WEIGHT_ENV = "ALPACCA_HOT_WEIGHT_MB"
+_HOT_WEIGHT_ENV = "ALPACCAROO_HOT_WEIGHT_MB"
 _HOT_CACHE_LIMIT_BYTES = None
 _HOT_CACHE_USED_BYTES = 0
 _HOT_CACHE_MATRICES = 0
@@ -459,7 +459,7 @@ class QuantMatrix:
             v += self._m[idx][:, :, None]
         return v.reshape(idx.size, self.cols)
 
-    # ---- optional dense f32 cache (ALPACCA_HOT_WEIGHT_MB) -------------------
+    # ---- optional dense f32 cache (ALPACCAROO_HOT_WEIGHT_MB) -------------------
 
     def _dense_from_storage(self):
         if self._mode != "codes":

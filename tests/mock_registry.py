@@ -8,7 +8,7 @@ Serves the files of a directory as both:
   * a Hugging Face repo:     /api/models/<org>/<repo>/tree/main,
                              /<org>/<repo>/resolve/main/<file>
     (repos whose name does not end in -GGUF return 404, to exercise
-     alpacca's -GGUF fallback)
+     alpaccaroo's -GGUF fallback)
 
 usage: mock_registry.py <serve_dir> <port_file>
 Binds 127.0.0.1 on a free port and writes the port number to <port_file>.

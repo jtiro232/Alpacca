@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a tiny random-weight llama-architecture GGUF using Alpacca's own
+"""Create a tiny random-weight llama-architecture GGUF using Alpaccaroo's own
 GGUF writer - no third-party packages needed.
 
 The model is gibberish but loads and generates, which is what the tests
@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alpacca import gguf  # noqa: E402
+from alpaccaroo import gguf  # noqa: E402
 
 N_EMBD = 64
 N_HEAD = 4
@@ -136,7 +136,7 @@ def main(path: str, dtype: str = "F32", arch: str = "llama",
 
     n_vocab = len(tokens)
     w = gguf.GGUFWriter(path, arch)
-    w.add("general.name", gguf.T_STRING, f"alpacca-tiny-{arch}-test")
+    w.add("general.name", gguf.T_STRING, f"alpaccaroo-tiny-{arch}-test")
     w.add(f"{arch}.context_length", gguf.T_UINT32, n_ctx)
     w.add(f"{arch}.embedding_length", gguf.T_UINT32, n_embd)
     w.add(f"{arch}.block_count", gguf.T_UINT32, n_layer)

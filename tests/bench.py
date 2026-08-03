@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Small repeatable benchmark for Alpacca inference.
+"""Small repeatable benchmark for Alpaccaroo inference.
 
 The benchmark intentionally uses only the standard library plus this repo. It
-loads a local GGUF path or Alpacca model reference, builds a deterministic
+loads a local GGUF path or Alpaccaroo model reference, builds a deterministic
 synthetic prompt, then times prompt prefill and greedy decode separately.
 """
 from __future__ import annotations
@@ -21,8 +21,8 @@ def _resolve_model(ref: str) -> Path:
     p = Path(ref).expanduser()
     if p.exists():
         return p
-    from alpacca.pull import pull_model
-    from alpacca.store import find_local, parse_model_ref
+    from alpaccaroo.pull import pull_model
+    from alpaccaroo.store import find_local, parse_model_ref
 
     model_ref = parse_model_ref(ref)
     local = find_local(model_ref)
@@ -60,16 +60,16 @@ def _synthetic_prompt(model, n_tokens: int) -> list[int]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="local GGUF path or Alpacca model ref")
+    ap.add_argument("--model", required=True, help="local GGUF path or Alpaccaroo model ref")
     ap.add_argument("--prefill", type=int, default=512)
     ap.add_argument("--decode", type=int, default=128)
     ap.add_argument("--ctx", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
 
-    from alpacca import tensor as T
-    from alpacca.model import Model
-    from alpacca.sample import Sampler, SamplerParams
+    from alpaccaroo import tensor as T
+    from alpaccaroo.model import Model
+    from alpaccaroo.sample import Sampler, SamplerParams
 
     path = _resolve_model(args.model)
     model = Model.load(str(path), n_ctx=args.ctx, progress=False)

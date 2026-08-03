@@ -1,4 +1,4 @@
-# Alpacca - lightweight JSON chat history.
+# Alpaccaroo - lightweight JSON chat history.
 # MIT License. See LICENSE.
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .store import alpacca_home, list_models, now_iso8601
+from .store import alpaccaroo_home, list_models, now_iso8601
 
 
 def history_root() -> Path:
-    return alpacca_home() / "history"
+    return alpaccaroo_home() / "history"
 
 
 def _history_id() -> str:

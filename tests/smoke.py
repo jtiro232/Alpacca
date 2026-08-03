@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alpacca offline smoke test - no network, no third-party packages.
+"""Alpaccaroo offline smoke test - no network, no third-party packages.
 
 Exercises the full cycle against a local mock of the Ollama registry and
 the Hugging Face API, with tiny generated GGUFs: pull -> list -> show ->
@@ -45,29 +45,29 @@ def run_cli(*args, env=None, expect=0,
     e = dict(os.environ)
     if env:
         e.update(env)
-    r = subprocess.run([sys.executable, "-m", "alpacca", *args],
+    r = subprocess.run([sys.executable, "-m", "alpaccaroo", *args],
                        input=input_text, capture_output=True, text=True,
                        env=e, cwd=str(REPO))
     if expect is not None and r.returncode != expect:
-        print(f"FAIL alpacca {' '.join(args)} -> rc={r.returncode}")
+        print(f"FAIL alpaccaroo {' '.join(args)} -> rc={r.returncode}")
         print("     | " + "\n     | ".join((r.stdout + r.stderr).splitlines()[-15:]))
         sys.exit(1)
     return r
 
 
 def main() -> None:
-    tmp = Path(tempfile.mkdtemp(prefix="alpacca-smoke-"))
+    tmp = Path(tempfile.mkdtemp(prefix="alpaccaroo-smoke-"))
     server = None
     # The storage-policy checks below assert exact HOST placement (which
     # matrices are quantized in RAM, dense, densified...). A GPU would claim
     # most of them and change every count, so the suite pins CPU placement
     # process-wide - subprocess checks inherit it through run_cli - and the
     # gpu-tier section re-enables the tier explicitly for its own checks.
-    os.environ["ALPACCA_GPU"] = "0"
+    os.environ["ALPACCAROO_GPU"] = "0"
     try:
         # ---- engine unit checks -----------------------------------------
         print("== engine checks ==")
-        from alpacca import quants
+        from alpaccaroo import quants
         vals = [(i % 97) / 7.0 - 6.5 for i in range(512)]
         for fmt, tol in (("Q8_0", 0.06), ("Q4_0", 0.6)):
             packed = (quants.quantize_q8_0(vals) if fmt == "Q8_0"
@@ -76,7 +76,7 @@ def main() -> None:
             err = max(abs(a - b) for a, b in zip(vals, list(back)))
             check(f"{fmt} quantize/dequantize roundtrip (max err {err:.3f})", err < tol)
 
-        from alpacca import tensor as T
+        from alpaccaroo import tensor as T
 
         def q4_k_bytes(n: int) -> bytes:
             out = bytearray()
@@ -206,9 +206,9 @@ def main() -> None:
                 check(f"{fmt} quantized matmul_t matches stacked matvecs (diff {berr:.2e})",
                       berr < 1e-3)
             if T.HAS_NUMPY:
-                old_hot_mb = os.environ.get("ALPACCA_HOT_WEIGHT_MB")
+                old_hot_mb = os.environ.get("ALPACCAROO_HOT_WEIGHT_MB")
                 try:
-                    os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                    os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "8"
                     T._reset_hot_cache_state()
                     hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
                     hot = T.to_list(T.matvec(hot_mat, T.vector(x)))
@@ -218,25 +218,25 @@ def main() -> None:
                           herr < 2e-3 and stats["matrices"] == 1,
                           str(stats))
                     if fmt == "Q8_0":
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "0"
                         T.matvec(hot_mat, T.vector(x))
                         stats = T.hot_cache_stats()
                         check("hot-cache budget change clears live matrix",
                               hot_mat._dense_cache is None and
                               stats["matrices"] == 0 and stats["used_bytes"] == 0,
                               str(stats))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "8"
                         T._reset_hot_cache_state()
                         row_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
                         T.matvec(row_hot_mat, T.vector(x))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "0"
                         T.matrix_row(row_hot_mat, 0)
                         stats = T.hot_cache_stats()
                         check("hot-cache budget change clears live matrix row lookup",
                               row_hot_mat._dense_cache is None and
                               stats["matrices"] == 0 and stats["used_bytes"] == 0,
                               str(stats))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = str(
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = str(
                             (rows * cols * 4 - 1) / (1024 * 1024))
                         T._reset_hot_cache_state()
                         over_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
@@ -247,7 +247,7 @@ def main() -> None:
                               oherr < 2e-3 and over_hot_mat._dense_cache is None and
                               stats["matrices"] == 0 and stats["used_bytes"] == 0,
                               str(stats))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "8"
                         T._reset_hot_cache_state()
                         gc_hot_mat = T.quantized_matrix(packed, fmt, rows, cols)
                         T.matvec(gc_hot_mat, T.vector(x))
@@ -259,14 +259,14 @@ def main() -> None:
                               str(stats))
                         # late env: budget set only after the matrix already
                         # served a matvec without any budget configured
-                        os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
+                        os.environ.pop("ALPACCAROO_HOT_WEIGHT_MB", None)
                         T._reset_hot_cache_state()
                         late_mat = T.quantized_matrix(packed, fmt, rows, cols)
                         T.matvec(late_mat, T.vector(x))
                         check("hot-cache absent env builds no cache",
                               late_mat._dense_cache is None,
                               str(T.hot_cache_stats()))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "8"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "8"
                         late = T.to_list(T.matvec(late_mat, T.vector(x)))
                         lerr = max(abs(a - b) for a, b in zip(late, dout))
                         stats = T.hot_cache_stats()
@@ -275,7 +275,7 @@ def main() -> None:
                               late_mat._dense_cache is not None and
                               stats["matrices"] == 1 and lerr < 2e-3,
                               str(stats))
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "0"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "0"
                         T.matvec(late_mat, T.vector(x))
                         stats = T.hot_cache_stats()
                         check("hot-cache late env budget zero clears cache",
@@ -284,7 +284,7 @@ def main() -> None:
                               str(stats))
                         # absurd budget: mb*1048576 overflows float; the
                         # guard parses it to 0, so no cache and no crash
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = "1e308"
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = "1e308"
                         T._reset_hot_cache_state()
                         inert_mat = T.quantized_matrix(packed, fmt, rows, cols)
                         inert_out = T.to_list(T.matvec(inert_mat, T.vector(x)))
@@ -298,9 +298,9 @@ def main() -> None:
                               str(stats))
                 finally:
                     if old_hot_mb is None:
-                        os.environ.pop("ALPACCA_HOT_WEIGHT_MB", None)
+                        os.environ.pop("ALPACCAROO_HOT_WEIGHT_MB", None)
                     else:
-                        os.environ["ALPACCA_HOT_WEIGHT_MB"] = old_hot_mb
+                        os.environ["ALPACCAROO_HOT_WEIGHT_MB"] = old_hot_mb
                     T._reset_hot_cache_state()
             row = min(3, rows - 1)
             qrow = T.to_list(T.matrix_row(qmat, row))
@@ -340,7 +340,7 @@ def main() -> None:
         # this whole region verifies the EXACT f32-activation storage and
         # kernels; the integer-dot path is approximate by design and has its
         # own checks (with an integer-simulation oracle) further down
-        os.environ["ALPACCA_INT_DOT"] = "0"
+        os.environ["ALPACCAROO_INT_DOT"] = "0"
         try:
             check_quantized_matvec("Q8_0", 5, 64)
             check_quantized_matvec("Q4_0", 5, 64)
@@ -353,7 +353,7 @@ def main() -> None:
             check_quantized_matvec("Q5_K", 3, 512)
             check_quantized_matvec("Q6_K", 3, 512)
         finally:
-            os.environ.pop("ALPACCA_INT_DOT", None)
+            os.environ.pop("ALPACCAROO_INT_DOT", None)
         if T.HAS_NUMPY:
             import numpy as np
             # large matrix exercises the einsum matvec kernel (small ones
@@ -377,11 +377,11 @@ def main() -> None:
                 bn = brows * bcols
                 bpacked = (q4_k_bytes(bn) if big_fmt == "Q4_K"
                            else q6_k_bytes(bn))
-                os.environ["ALPACCA_INT_DOT"] = "0"  # exact-path coverage
+                os.environ["ALPACCAROO_INT_DOT"] = "0"  # exact-path coverage
                 try:
                     bq = T.quantized_matrix(bpacked, big_fmt, brows, bcols)
                 finally:
-                    os.environ.pop("ALPACCA_INT_DOT", None)
+                    os.environ.pop("ALPACCAROO_INT_DOT", None)
                 bdense = T.matrix(quants.dequantize(bpacked, bn, big_fmt),
                                   brows, bcols)
                 xb2 = T.vector([((i * 19) % 67) / 23.0 - 1.4
@@ -405,7 +405,7 @@ def main() -> None:
               max(abs(a - b) for a, b in zip(dy, [6.0, -2.0])) < 1e-6)
 
         import io
-        from alpacca.chat import _read_chat_line
+        from alpaccaroo.chat import _read_chat_line
         prompt_out = io.StringIO()
         check("chat Escape returns to caller",
               _read_chat_line(stdin=io.StringIO("\x1b\n"),
@@ -416,11 +416,11 @@ def main() -> None:
               _read_chat_line(stdin=io.StringIO("hello\n"),
                               stdout=prompt_out) == "hello")
 
-        old_home = os.environ.get("ALPACCA_HOME")
+        old_home = os.environ.get("ALPACCAROO_HOME")
         try:
-            os.environ["ALPACCA_HOME"] = str(tmp / "history-unit-home")
-            import alpacca.history as history_mod
-            from alpacca.history import (clear_history, delete_chat,
+            os.environ["ALPACCAROO_HOME"] = str(tmp / "history-unit-home")
+            import alpaccaroo.history as history_mod
+            from alpaccaroo.history import (clear_history, delete_chat,
                                          list_chats, model_stats, read_chat,
                                          start_session)
 
@@ -558,7 +558,7 @@ def main() -> None:
                     race_clear.path.unlink()
             check("chat history clear tolerates vanished file",
                   vanished["clear"] and clear_deleted == 0)
-            from alpacca.cli import cmd_history
+            from alpaccaroo.cli import cmd_history
             race_cli = start_session("unit-model", "unit.gguf")
             race_cli.append_message("user", "vanished cli rm")
             race_cli.close()
@@ -615,11 +615,11 @@ def main() -> None:
                   not active_clear_path.exists() and list_chats() == [])
         finally:
             if old_home is None:
-                os.environ.pop("ALPACCA_HOME", None)
+                os.environ.pop("ALPACCAROO_HOME", None)
             else:
-                os.environ["ALPACCA_HOME"] = old_home
+                os.environ["ALPACCAROO_HOME"] = old_home
 
-        from alpacca import kernels as AK
+        from alpaccaroo import kernels as AK
         try:
             import numba as _numba
             has_pinned_numba = (T.HAS_NUMPY and
@@ -627,20 +627,20 @@ def main() -> None:
         except Exception:
             has_pinned_numba = False
         if has_pinned_numba:
-            check("alpacca kernels activate on the pinned numba",
+            check("alpaccaroo kernels activate on the pinned numba",
                   AK.available(), AK.status())
             r = subprocess.run(
                 [sys.executable, "-c",
-                 "import os; os.environ['ALPACCA_KERNELS'] = '0'\n"
+                 "import os; os.environ['ALPACCAROO_KERNELS'] = '0'\n"
                  "import sys; sys.path.insert(0, '.')\n"
-                 "from alpacca import kernels\n"
+                 "from alpaccaroo import kernels\n"
                  "assert not kernels.available()\n"
                  "print('off-ok')"],
                 capture_output=True, text=True, cwd=str(REPO))
-            check("ALPACCA_KERNELS=0 disables the kernels",
+            check("ALPACCAROO_KERNELS=0 disables the kernels",
                   "off-ok" in r.stdout, r.stdout + r.stderr)
         else:
-            check("alpacca kernels stay inactive without the pinned numba",
+            check("alpaccaroo kernels stay inactive without the pinned numba",
                   not AK.available(), AK.status())
 
         # ---- fused batched matmul vs the tiled dequantize+GEMM path -------
@@ -650,8 +650,8 @@ def main() -> None:
         # path it replaces, and from matvec for a single row.
         if T.HAS_NUMPY:
             import numpy as np
-            from alpacca.qmatrix import QuantMatrix, _fused_matmul_max_batch
-            from alpacca.quants import QUANT_GEOMETRY
+            from alpaccaroo.qmatrix import QuantMatrix, _fused_matmul_max_batch
+            from alpaccaroo.quants import QUANT_GEOMETRY
             rng = np.random.default_rng(7)
             worst = 0.0
             shapes_done = 0
@@ -663,21 +663,21 @@ def main() -> None:
                 # pin the f32-activation storage: this block verifies the
                 # exact fused kernels, the integer-dot path has its own
                 # checks (with its own quantified tolerance) below
-                os.environ["ALPACCA_INT_DOT"] = "0"
+                os.environ["ALPACCAROO_INT_DOT"] = "0"
                 try:
                     qm = QuantMatrix(raw, _dt, _rows, _cols)
                 finally:
-                    os.environ.pop("ALPACCA_INT_DOT", None)
+                    os.environ.pop("ALPACCAROO_INT_DOT", None)
                 # spans the narrow kernel (<=8), the wide one, and a batch
                 # past NARROW_BATCH where the two must still agree
                 for B in (1, 2, 5, 9, 16, 40):
                     X = rng.standard_normal((B, _cols)).astype(np.float32)
                     got = qm.matmul_t(X)
-                    os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+                    os.environ["ALPACCAROO_FUSED_MATMUL_MAX_BATCH"] = "0"
                     try:
                         ref = qm.matmul_t(X)
                     finally:
-                        os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+                        os.environ.pop("ALPACCAROO_FUSED_MATMUL_MAX_BATCH", None)
                     scale = max(1e-6, float(np.abs(ref).max()))
                     worst = max(worst, float(np.abs(got - ref).max()) / scale)
                     if B == 1:
@@ -700,12 +700,12 @@ def main() -> None:
             check("the fused-matmul crossover is a positive tunable batch size",
                   _fused_matmul_max_batch() > 0,
                   str(_fused_matmul_max_batch()))
-            os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+            os.environ["ALPACCAROO_FUSED_MATMUL_MAX_BATCH"] = "0"
             try:
-                check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
+                check("ALPACCAROO_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
                       _fused_matmul_max_batch() == 0)
             finally:
-                os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+                os.environ.pop("ALPACCAROO_FUSED_MATMUL_MAX_BATCH", None)
 
         # ---- integer-dot decode path (Q4_K/Q6_K native storage) -----------
         # Weights stay in the file's own fields (4-bit codes, 6-bit integer
@@ -715,7 +715,7 @@ def main() -> None:
         # approximate, and that error is bounded and measured separately.
         if T.HAS_NUMPY and AK.available():
             import numpy as np
-            from alpacca.qmatrix import QuantMatrix
+            from alpaccaroo.qmatrix import QuantMatrix
             rng = np.random.default_rng(11)
             for _dt, _rows, _cols in (("Q4_K", 9, 512), ("Q5_K", 9, 512),
                                       ("Q6_K", 9, 512)):
@@ -724,11 +724,11 @@ def main() -> None:
                 qm = QuantMatrix(raw, _dt, _rows, _cols)
                 check(f"{_dt} matrices adopt the native int-dot storage",
                       qm._mode == f"{_dt.lower()[:2]}k_int", qm._mode)
-                os.environ["ALPACCA_INT_DOT"] = "0"
+                os.environ["ALPACCAROO_INT_DOT"] = "0"
                 try:
                     qm_f32 = QuantMatrix(raw, _dt, _rows, _cols)
                 finally:
-                    os.environ.pop("ALPACCA_INT_DOT", None)
+                    os.environ.pop("ALPACCAROO_INT_DOT", None)
                 dense = qm_f32._dense_from_storage()
                 tile = qm._tile_f32(0, _rows)
                 check(f"{_dt} native tile expansion is bit-exact vs dense",
@@ -790,7 +790,7 @@ def main() -> None:
                 check(f"{_dt} shared-quantization matvec_group is bit-exact",
                       np.array_equal(np.asarray(grp[0]), solo) and
                       np.array_equal(np.asarray(grp[1]), solo))
-                os.environ["ALPACCA_INT_MATMUL_MAX_BATCH"] = "0"
+                os.environ["ALPACCAROO_INT_MATMUL_MAX_BATCH"] = "0"
                 try:
                     X = rng.standard_normal((3, _cols)).astype(np.float32)
                     tiled = np.asarray(qm.matmul_t(X))
@@ -800,7 +800,7 @@ def main() -> None:
                     check(f"{_dt} native tiled matmul matches dense BLAS",
                           terr < 2e-5, f"rel {terr:.2e}")
                 finally:
-                    os.environ.pop("ALPACCA_INT_MATMUL_MAX_BATCH", None)
+                    os.environ.pop("ALPACCAROO_INT_MATMUL_MAX_BATCH", None)
                 ri = qm.rows_at([0, _rows - 1])
                 shuffled = list(range(_rows))
                 rng.shuffle(shuffled)
@@ -810,17 +810,17 @@ def main() -> None:
                       np.array_equal(qm.row(2), dense[2]) and
                       np.array_equal(ri, dense[[0, _rows - 1]]) and
                       np.array_equal(gathered, expect))
-            os.environ["ALPACCA_FUSED_MATMUL_MAX_BATCH"] = "0"
+            os.environ["ALPACCAROO_FUSED_MATMUL_MAX_BATCH"] = "0"
             try:
-                check("ALPACCA_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
+                check("ALPACCAROO_FUSED_MATMUL_MAX_BATCH=0 disables the fused path",
                       _fused_matmul_max_batch() == 0)
             finally:
-                os.environ.pop("ALPACCA_FUSED_MATMUL_MAX_BATCH", None)
+                os.environ.pop("ALPACCAROO_FUSED_MATMUL_MAX_BATCH", None)
 
         if T.HAS_NUMPY:
             import numpy as np
             from types import SimpleNamespace
-            from alpacca.model import Model
+            from alpaccaroo.model import Model
             dummy = Model.__new__(Model)
             dummy.hp = SimpleNamespace(n_head=4, n_kv=2, head_dim=3)
             q = np.asarray([((i * 7) % 19) / 11.0 - 0.8 for i in range(12)],
@@ -925,7 +925,7 @@ def main() -> None:
         # This had no direct coverage at all, which is how a first version
         # that lost the tie-break at the cut passed the whole suite.
         import random
-        from alpacca.sample import Sampler, SamplerParams, _topk_indices
+        from alpaccaroo.sample import Sampler, SamplerParams, _topk_indices
 
         def topk_ref(vals, k):
             return sorted(range(len(vals)), key=vals.__getitem__,
@@ -989,8 +989,8 @@ def main() -> None:
               degen_ok)
 
         # ---- generation stop reasons -------------------------------------
-        from alpacca.chat import GenerationResult
-        from alpacca.serve import _finish_reason, _messages_from
+        from alpaccaroo.chat import GenerationResult
+        from alpaccaroo.serve import _finish_reason, _messages_from
         check("finish_reason maps a spent budget to length",
               _finish_reason(GenerationResult("", 4, 0.1, stop_reason="length"))
               == "length")
@@ -1004,30 +1004,30 @@ def main() -> None:
               _finish_reason(GenerationResult("", 4, 0.1, stop_reason="eog"))
               == "stop")
         # ---- quantized matvec kernel selection ---------------------------
-        from alpacca import qmatrix as _qm
+        from alpaccaroo import qmatrix as _qm
         check("the batched-matmul matvec path is off by default",
               _qm._small_matvec_elems() == 0 and _qm._SMALL_MATVEC_ELEMS == 0,
               str(_qm._SMALL_MATVEC_ELEMS))
-        _sme = os.environ.get("ALPACCA_SMALL_MATVEC_ELEMS")
+        _sme = os.environ.get("ALPACCAROO_SMALL_MATVEC_ELEMS")
         try:
-            os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = "1048576"
+            os.environ["ALPACCAROO_SMALL_MATVEC_ELEMS"] = "1048576"
             check("the matvec crossover can be re-tuned from the environment",
                   _qm._small_matvec_elems() == 1 << 20)
-            os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = "not-a-number"
+            os.environ["ALPACCAROO_SMALL_MATVEC_ELEMS"] = "not-a-number"
             check("a bad matvec crossover falls back to off",
                   _qm._small_matvec_elems() == 0)
         finally:
             if _sme is None:
-                os.environ.pop("ALPACCA_SMALL_MATVEC_ELEMS", None)
+                os.environ.pop("ALPACCAROO_SMALL_MATVEC_ELEMS", None)
             else:
-                os.environ["ALPACCA_SMALL_MATVEC_ELEMS"] = _sme
+                os.environ["ALPACCAROO_SMALL_MATVEC_ELEMS"] = _sme
 
         # ---- incremental detokenizing ------------------------------------
         # One undecodable byte used to poison the buffer for the rest of the
         # response: nothing was emitted again, which also stopped stop-strings
         # from ever matching.
-        import alpacca.tokenizer as _tokmod
-        from alpacca.tokenizer import StreamDecoder, TT_BYTE
+        import alpaccaroo.tokenizer as _tokmod
+        from alpaccaroo.tokenizer import StreamDecoder, TT_BYTE
         byte_tok = _tokmod.Tokenizer.from_gguf({
             "tokenizer.ggml.model": "llama",
             "tokenizer.ggml.tokens": ["<unk>"] + [f"<0x{b:02X}>" for b in range(256)],
@@ -1133,7 +1133,7 @@ def main() -> None:
               str(spm_tok.encode("abab")))
 
         # ---- model reference round-tripping ------------------------------
-        from alpacca.store import _clean_nickname, parse_model_ref
+        from alpaccaroo.store import _clean_nickname, parse_model_ref
         round_trip = ["llama3.2:1b", "llama3.2", "ollama:user/name:tag",
                       "ollama:user/name", "hf:org/repo", "hf:org/repo:Q4_K_M",
                       "org/repo"]
@@ -1152,7 +1152,7 @@ def main() -> None:
               parse_model_ref("ollama:user/name:tag").display())
 
         # ---- column alignment for wide characters -------------------------
-        from alpacca.cli import _clip, _display_width, _pad
+        from alpaccaroo.cli import _clip, _display_width, _pad
         check("display width counts CJK and emoji as two columns",
               _display_width("日本語") == 6 and _display_width("abc") == 3 and
               _display_width("\U0001f680") == 2,
@@ -1167,10 +1167,10 @@ def main() -> None:
               repr(_clip("日本語日本語日本語", 10)))
 
         # ---- a corrupt nicknames file is preserved, not destroyed ---------
-        from alpacca.store import _nicknames_file, _read_nicknames
-        nick_home = os.environ.get("ALPACCA_HOME")
+        from alpaccaroo.store import _nicknames_file, _read_nicknames
+        nick_home = os.environ.get("ALPACCAROO_HOME")
         try:
-            os.environ["ALPACCA_HOME"] = str(tmp / "nick-corrupt-home")
+            os.environ["ALPACCAROO_HOME"] = str(tmp / "nick-corrupt-home")
             nf = _nicknames_file()
             nf.parent.mkdir(parents=True, exist_ok=True)
             nf.write_text('{"nicknames": {"a": ', "utf-8")   # truncated JSON
@@ -1186,9 +1186,9 @@ def main() -> None:
                   _read_nicknames() == {})
         finally:
             if nick_home is None:
-                os.environ.pop("ALPACCA_HOME", None)
+                os.environ.pop("ALPACCAROO_HOME", None)
             else:
-                os.environ["ALPACCA_HOME"] = nick_home
+                os.environ["ALPACCAROO_HOME"] = nick_home
 
         # ---- nickname sanitizing -----------------------------------------
         check("nickname sanitizing strips ANSI escapes",
@@ -1220,12 +1220,12 @@ def main() -> None:
         check("serve rejects malformed messages instead of raising KeyError",
               rejected == len(bad_messages), str(rejected))
 
-        from alpacca.tokenizer import pretokenize
+        from alpaccaroo.tokenizer import pretokenize
         toks = pretokenize("Hello there, world! It's 2026...\n  indented")
         check("BPE pretokenizer splits text", "".join(toks) == "Hello there, world! It's 2026...\n  indented",
               str(toks))
 
-        from alpacca.cli import _auto_dense_budget_mb, _available_ram_mb
+        from alpaccaroo.cli import _auto_dense_budget_mb, _available_ram_mb
         check("auto dense budget formula spends what is left after reserves",
               _auto_dense_budget_mb(16000.0, 600.0) ==
               int(0.85 * (16000.0 - 1.2 * 600.0 - 2048.0)))
@@ -1234,7 +1234,7 @@ def main() -> None:
         check("auto dense budget reserve scales with requested context",
               _auto_dense_budget_mb(16000.0, 600.0, 16384) ==
               int(0.85 * (16000.0 - 1.2 * 600.0 - 2048.0 * 4.0)))
-        from alpacca.cli import _cgroup_limit_remaining_mb
+        from alpaccaroo.cli import _cgroup_limit_remaining_mb
         v = _cgroup_limit_remaining_mb()
         check("cgroup limit detection returns a sane value or None",
               v is None or v >= 0, str(v))
@@ -1243,7 +1243,7 @@ def main() -> None:
               detected_ram is None or detected_ram > 0,
               str(detected_ram))
 
-        from alpacca.pull import _hf_choose, _hf_collect_parts
+        from alpaccaroo.pull import _hf_choose, _hf_collect_parts
         hf_files = [
             {"path": "toy-Q4_K_M-00001-of-00002.gguf", "size": 1, "sha256": ""},
             {"path": "toy-Q4_K_M-00002-of-00002.gguf", "size": 1, "sha256": ""},
@@ -1321,8 +1321,8 @@ def main() -> None:
 
         # ---- SPM tokenizer -----------------------------------------------
         print("== SPM tokenizer (greedy merge, as llama.cpp) ==")
-        from alpacca.gguf import GGUFFile
-        from alpacca.tokenizer import (Tokenizer, TT_BYTE, TT_CONTROL,
+        from alpaccaroo.gguf import GGUFFile
+        from alpaccaroo.tokenizer import (Tokenizer, TT_BYTE, TT_CONTROL,
                                        TT_NORMAL, TT_USER_DEFINED)
         with GGUFFile.open(str(srv / "model.gguf")) as _gf:
             spm = Tokenizer.from_gguf(_gf.metadata)
@@ -1454,7 +1454,7 @@ def main() -> None:
         check("BPE vocabulary builds no SPM special-token cache",
               bpe.special_ids == [] and bpe.merge_ranks[("h", "e")] == 0)
 
-        from alpacca.model import Model, auto_budget_fit_mb
+        from alpaccaroo.model import Model, auto_budget_fit_mb
         fit = auto_budget_fit_mb(str(srv / "tiny-q4.gguf"))
         # tiny-q4 (untied): eligible = 6 ffn x 32768B + 8 attn x 16384B +
         # output 307*64*4B = 406272 B; fixed = embd residual + KV + 512 base
@@ -1603,7 +1603,7 @@ def main() -> None:
         # ---- chat rendering ----------------------------------------------
         # The only render() call in this suite used a llama fixture with no
         # chat_template, so it took the `raw` path and no format was covered.
-        from alpacca.chat import ChatFormat as _CF, detect_format as _detect
+        from alpaccaroo.chat import ChatFormat as _CF, detect_format as _detect
         check("gemma3 chat format is detected from the template",
               _detect(gemma3.metadata) == "gemma", str(_detect(gemma3.metadata)))
         g3_msgs = [{"role": "user", "content": "hello"}]
@@ -1767,9 +1767,9 @@ def main() -> None:
         # coverage. The Q4_0 checks above assert shapes and a matrix count
         # and nothing numeric, so densifying is also the numeric oracle:
         # dequantize-then-dense must agree with the quantized matvec.
-        g3_budget_home = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+        g3_budget_home = os.environ.get("ALPACCAROO_DENSE_WEIGHT_MB")
         try:
-            os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+            os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "64"
             g3_dense = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
             g3_dense_logits = T.to_list(g3_dense.prefill([1, 2, 3, 4]))
             g3_q_logits = T.to_list(gemma3_q4_logits)
@@ -1788,7 +1788,7 @@ def main() -> None:
                       g3_dense.weight_storage["densified_bytes"] > 0 and
                       "dense budget" in g3_dense.describe(),
                       g3_dense.describe())
-            os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0"
+            os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "0"
             g3_zero = Model.load(str(srv / "tiny-gemma3-q4.gguf"), progress=False)
             check("a zero dense budget keeps gemma3 fully quantized",
                   g3_zero.weight_storage["densified"] == [] and
@@ -1797,9 +1797,9 @@ def main() -> None:
                   str(g3_zero.weight_storage))
         finally:
             if g3_budget_home is None:
-                os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                os.environ.pop("ALPACCAROO_DENSE_WEIGHT_MB", None)
             else:
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = g3_budget_home
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = g3_budget_home
 
         for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
                           ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
@@ -1833,7 +1833,7 @@ def main() -> None:
             fused_logits = np.asarray(fm.prefill(fm_ids[:1]), dtype=np.float64)
             fused_engaged = (all(ly.wqk is not None for ly in fm.layers) and
                              all(ly.wgu is not None for ly in fm.layers))
-            os.environ["ALPACCA_FUSE"] = "0"
+            os.environ["ALPACCAROO_FUSE"] = "0"
             try:
                 um = Model.load(str(srv / "tiny-q4k.gguf"), progress=False)
                 unfused_engaged = (all(ly.wqk is None for ly in um.layers) and
@@ -1841,7 +1841,7 @@ def main() -> None:
                 unfused_logits = np.asarray(um.prefill(fm_ids[:1]),
                                             dtype=np.float64)
             finally:
-                os.environ.pop("ALPACCA_FUSE", None)
+                os.environ.pop("ALPACCAROO_FUSE", None)
             fdiff = float(np.abs(fused_logits - unfused_logits).max())
             check(f"fused qk/gate-up matches unfused logits (diff {fdiff:.2e})",
                   fused_engaged and unfused_engaged and fdiff < 1e-4,
@@ -1874,8 +1874,8 @@ def main() -> None:
         # Nothing covered n_past near n_ctx for any architecture, which is why
         # a prompt of exactly n_ctx returned tokens=0/text='' with no signal.
         print("== context window ==")
-        from alpacca import chat as chat_mod
-        from alpacca.chat import ChatFormat, fit_to_context, generate
+        from alpaccaroo import chat as chat_mod
+        from alpaccaroo.chat import ChatFormat, fit_to_context, generate
         ctx_model = Model.load(str(srv / "model.gguf"), n_ctx=32, progress=False)
         check("effective context window is reported next to the trained one",
               "ctx 32 of 256" in ctx_model.describe(), ctx_model.describe())
@@ -1997,10 +1997,10 @@ def main() -> None:
         ctx_model.reset()
         repl_out, repl_err = io.StringIO(), io.StringIO()
         repl_in = io.StringIO("testing " * 200 + "\nhi\n/exit\n")
-        ctx_home = os.environ.get("ALPACCA_HOME")
+        ctx_home = os.environ.get("ALPACCAROO_HOME")
         old_std = (sys.stdin, sys.stdout, sys.stderr)
         try:
-            os.environ["ALPACCA_HOME"] = str(tmp / "ctx-home")
+            os.environ["ALPACCAROO_HOME"] = str(tmp / "ctx-home")
             sys.stdin, sys.stdout, sys.stderr = repl_in, repl_out, repl_err
             chat_mod.interactive(ctx_model, ctx_params, model_name="ctx-test")
             repl_failed = ""
@@ -2009,9 +2009,9 @@ def main() -> None:
         finally:
             sys.stdin, sys.stdout, sys.stderr = old_std
             if ctx_home is None:
-                os.environ.pop("ALPACCA_HOME", None)
+                os.environ.pop("ALPACCAROO_HOME", None)
             else:
-                os.environ["ALPACCA_HOME"] = ctx_home
+                os.environ["ALPACCAROO_HOME"] = ctx_home
         check("the REPL survives a turn that overflows the context window",
               not repl_failed and "was not sent" in repl_err.getvalue(),
               repl_failed or repl_err.getvalue()[-300:])
@@ -2019,9 +2019,9 @@ def main() -> None:
               "tokens," in repl_err.getvalue(), repl_err.getvalue()[-300:])
 
         if not T.HAS_NUMPY:
-            old_budget = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+            old_budget = os.environ.get("ALPACCAROO_DENSE_WEIGHT_MB")
             try:
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "64"
                 inert = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 check("dense budget is inert on the pure backend",
                       inert.weight_storage["densified"] == [] and
@@ -2029,9 +2029,9 @@ def main() -> None:
                       str(inert.weight_storage))
             finally:
                 if old_budget is None:
-                    os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                    os.environ.pop("ALPACCAROO_DENSE_WEIGHT_MB", None)
                 else:
-                    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = old_budget
+                    os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = old_budget
 
         if T.HAS_NUMPY:
             def greedy_trace(model, prompt: str, steps: int) -> tuple[list[int], list[list[float]]]:
@@ -2051,23 +2051,23 @@ def main() -> None:
             for fmt, name in (("Q8_0", "tiny-q8.gguf"), ("Q4_0", "tiny-q4.gguf"),
                               ("Q4_1", "tiny-q41.gguf"), ("Q5_0", "tiny-q50.gguf"),
                               ("Q5_1", "tiny-q51.gguf")):
-                old_f32 = os.environ.get("ALPACCA_F32")
+                old_f32 = os.environ.get("ALPACCAROO_F32")
                 try:
-                    os.environ.pop("ALPACCA_F32", None)
+                    os.environ.pop("ALPACCAROO_F32", None)
                     q_model = Model.load(str(srv / name), progress=False)
-                    os.environ["ALPACCA_F32"] = "1"
+                    os.environ["ALPACCAROO_F32"] = "1"
                     d_model = Model.load(str(srv / name), progress=False)
                 finally:
                     if old_f32 is None:
-                        os.environ.pop("ALPACCA_F32", None)
+                        os.environ.pop("ALPACCAROO_F32", None)
                     else:
-                        os.environ["ALPACCA_F32"] = old_f32
+                        os.environ["ALPACCAROO_F32"] = old_f32
                 qtoks, qlogits = greedy_trace(q_model, "hello world", 6)
                 dtoks, dlogits = greedy_trace(d_model, "hello world", 6)
                 logit_diff = max(abs(a - b)
                                  for qa, da in zip(qlogits, dlogits)
                                  for a, b in zip(qa, da))
-                check(f"{fmt} quantized vs ALPACCA_F32 greedy generation/logits parity",
+                check(f"{fmt} quantized vs ALPACCAROO_F32 greedy generation/logits parity",
                       q_model.weight_storage["quantized"] == {fmt: 16} and
                       d_model.weight_storage["fallback"] == {fmt: 16} and
                       qtoks == dtoks and len(qlogits) == len(dlogits) and
@@ -2075,12 +2075,12 @@ def main() -> None:
                       f"quant={qtoks} dense={dtoks} diff={logit_diff:.2e} "
                       f"qstore={q_model.weight_storage} dstore={d_model.weight_storage}")
 
-            old_budget = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+            old_budget = os.environ.get("ALPACCAROO_DENSE_WEIGHT_MB")
             try:
                 # tiny-q4: 6 ffn matrices of 32768B + 4 attn q/output of
                 # 16384B = exactly 0.25 MiB; wk/wv/embd/output must stay
                 # quantized
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0.25"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "0.25"
                 hybrid = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 expect_dense = {f"blk.{i}.{role}.weight"
                                 for i in range(2)
@@ -2095,7 +2095,7 @@ def main() -> None:
                 check("describe reports the dense budget",
                       "dense budget 10 matrices" in hybrid.describe(),
                       hybrid.describe())
-                os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                os.environ.pop("ALPACCAROO_DENSE_WEIGHT_MB", None)
                 qfull = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 htoks, hlogits = greedy_trace(hybrid, "hello world", 6)
                 ftoks, flogits = greedy_trace(qfull, "hello world", 6)
@@ -2106,14 +2106,14 @@ def main() -> None:
                       htoks == ftoks and len(hlogits) == len(flogits) and
                       hdiff < 1e-2,
                       f"hybrid={htoks} quant={ftoks}")
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "64"
                 roomy = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 check("dense budget never densifies an untied token embedding",
                       len(roomy.weight_storage["densified"]) == 15 and
                       "token_embd.weight" not in roomy.weight_storage["densified"] and
                       roomy.weight_storage["quantized"] == {"Q4_0": 1},
                       str(roomy.weight_storage))
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "not-a-number"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "not-a-number"
                 ignored = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 check("invalid dense budget is ignored",
                       ignored.weight_storage["quantized"] == {"Q4_0": 16} and
@@ -2126,33 +2126,33 @@ def main() -> None:
                      "--ff", "128"],
                     capture_output=True, text=True)
                 check("write tiny tied bench model", r.returncode == 0, r.stderr)
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "64"
                 tied = Model.load(str(srv / "tied-bench.gguf"), progress=False)
                 check("dense budget densifies a tied embedding as the output matrix",
                       "token_embd.weight" in tied.weight_storage["densified"] and
                       len(tied.weight_storage["densified"]) == 15 and
                       not tied.weight_storage["quantized"],
                       str(tied.weight_storage))
-                # ALPACCA_F32 wins over the dense budget: everything is
+                # ALPACCAROO_F32 wins over the dense budget: everything is
                 # already dense fallback, so no densify pass runs
-                prior_f32 = os.environ.get("ALPACCA_F32")
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "64"
-                os.environ["ALPACCA_F32"] = "1"
+                prior_f32 = os.environ.get("ALPACCAROO_F32")
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "64"
+                os.environ["ALPACCAROO_F32"] = "1"
                 try:
                     f32_wins = Model.load(str(srv / "tiny-q4.gguf"),
                                           progress=False)
                 finally:
                     if prior_f32 is None:
-                        os.environ.pop("ALPACCA_F32", None)
+                        os.environ.pop("ALPACCAROO_F32", None)
                     else:
-                        os.environ["ALPACCA_F32"] = prior_f32
-                check("ALPACCA_F32 wins over the dense budget",
+                        os.environ["ALPACCAROO_F32"] = prior_f32
+                check("ALPACCAROO_F32 wins over the dense budget",
                       f32_wins.weight_storage["densified"] == [] and
                       f32_wins.weight_storage["fallback"] == {"Q4_0": 16},
                       str(f32_wins.weight_storage))
                 # absurd budget: mb*1048576 overflows float; the guard
                 # parses it to 0 so the load stays fully quantized
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "1e308"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "1e308"
                 absurd = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
                 check("absurd dense budget is inert",
                       absurd.weight_storage["densified"] == [] and
@@ -2172,7 +2172,7 @@ def main() -> None:
                       r.stderr)
                 # budget int(0.20*1048576)=209715B: six FFN mats use
                 # 6*32768=196608B, then blk.0.attn_k lands at 204800B
-                os.environ["ALPACCA_DENSE_WEIGHT_MB"] = "0.20"
+                os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = "0.20"
                 spill = Model.load(str(srv / "gqa-bench.gguf"),
                                    progress=False)
                 expect_spill = {f"blk.{i}.{role}.weight"
@@ -2187,23 +2187,23 @@ def main() -> None:
                       str(spill.weight_storage))
             finally:
                 if old_budget is None:
-                    os.environ.pop("ALPACCA_DENSE_WEIGHT_MB", None)
+                    os.environ.pop("ALPACCAROO_DENSE_WEIGHT_MB", None)
                 else:
-                    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = old_budget
+                    os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = old_budget
 
-            old_f32 = os.environ.get("ALPACCA_F32")
+            old_f32 = os.environ.get("ALPACCAROO_F32")
             try:
-                os.environ["ALPACCA_F32"] = "1"
+                os.environ["ALPACCAROO_F32"] = "1"
                 f32_forced = Model.load(str(srv / "tiny-q4.gguf"), progress=False)
-                check("ALPACCA_F32 forces dense quantized matrix loading",
+                check("ALPACCAROO_F32 forces dense quantized matrix loading",
                       not f32_forced.weight_storage["quantized"] and
                       f32_forced.weight_storage["fallback"] == {"Q4_0": 16},
                       str(f32_forced.weight_storage))
             finally:
                 if old_f32 is None:
-                    os.environ.pop("ALPACCA_F32", None)
+                    os.environ.pop("ALPACCAROO_F32", None)
                 else:
-                    os.environ["ALPACCA_F32"] = old_f32
+                    os.environ["ALPACCAROO_F32"] = old_f32
 
         # Q2_K and Q3_K used to have no quantized matvec, so a 1B model in
         # either format silently expanded to 3.7 GiB of dense float32.
@@ -2217,15 +2217,15 @@ def main() -> None:
                   str(q2.weight_storage))
             check("describe reports quantized Q2_K storage with its size",
                   "weights quantized Q2_K (16 matrices," in q2_desc, q2_desc)
-            q2_f32_env = os.environ.get("ALPACCA_F32")
+            q2_f32_env = os.environ.get("ALPACCAROO_F32")
             try:
-                os.environ["ALPACCA_F32"] = "1"
+                os.environ["ALPACCAROO_F32"] = "1"
                 q2_dense = Model.load(str(srv / "tiny-q2k.gguf"), progress=False)
             finally:
                 if q2_f32_env is None:
-                    os.environ.pop("ALPACCA_F32", None)
+                    os.environ.pop("ALPACCAROO_F32", None)
                 else:
-                    os.environ["ALPACCA_F32"] = q2_f32_env
+                    os.environ["ALPACCAROO_F32"] = q2_f32_env
             q2_ratio = (q2_dense.weight_storage["dense_bytes"] /
                         max(q2.weight_storage["quantized_bytes"], 1))
             check(f"quantized Q2_K costs {q2_ratio:.1f}x less than dense float32",
@@ -2251,18 +2251,18 @@ def main() -> None:
         (srv / "license.txt").write_text("test license - MIT")
 
         # numpy/pure parity (when numpy is present)
-        from alpacca import tensor
+        from alpaccaroo import tensor
         if tensor.HAS_NUMPY:
             code = (
                 "import json\n"
-                "from alpacca.model import Model\n"
-                "import alpacca.tensor as T\n"
+                "from alpaccaroo.model import Model\n"
+                "import alpaccaroo.tensor as T\n"
                 f"m = Model.load({str(srv / 'model.gguf')!r}, progress=False)\n"
                 "l = m.prefill(m.tok.encode('hello world'))\n"
                 "print(json.dumps(T.to_list(l)[:8]))\n")
             a = subprocess.run([sys.executable, "-c", code], capture_output=True,
                                text=True, cwd=str(REPO))
-            env = dict(os.environ, ALPACCA_PURE="1")
+            env = dict(os.environ, ALPACCAROO_PURE="1")
             b = subprocess.run([sys.executable, "-c", code], capture_output=True,
                                text=True, cwd=str(REPO), env=env)
             la, lb = json.loads(a.stdout), json.loads(b.stdout)
@@ -2335,9 +2335,9 @@ def main() -> None:
         check("mock registry starts", bool(port))
 
         env = {
-            "ALPACCA_HOME": str(tmp / "home"),
-            "ALPACCA_OLLAMA_REGISTRY": f"http://127.0.0.1:{port}",
-            "ALPACCA_HF_ENDPOINT": f"http://127.0.0.1:{port}",
+            "ALPACCAROO_HOME": str(tmp / "home"),
+            "ALPACCAROO_OLLAMA_REGISTRY": f"http://127.0.0.1:{port}",
+            "ALPACCAROO_HF_ENDPOINT": f"http://127.0.0.1:{port}",
         }
 
         # ---- CLI: ollama path --------------------------------------------
@@ -2379,17 +2379,17 @@ def main() -> None:
         r = run_cli("run", str(model_path), "hi", "-n", "4", "--seed", "1", env=env)
         check("run by file path", "tokens," in r.stderr)
         r = run_cli("run", "tiny", "hi", "-n", "4", "--seed", "1",
-                    env={**env, "ALPACCA_PURE": "1"})
+                    env={**env, "ALPACCAROO_PURE": "1"})
         check("run with pure-python backend", "tokens," in r.stderr)
         r = run_cli("tokenize", "-m", "tiny", "-p", "hello", env=env)
         check("tokenize via model name", "\u2581hello" in r.stdout or "hello" in r.stdout)
         r = run_cli("tokenize", "-m", "Tiny Buddy", "-p", "hello", env=env)
         check("tokenize resolves nickname", "\u2581hello" in r.stdout or "hello" in r.stdout)
 
-        old_home = os.environ.get("ALPACCA_HOME")
+        old_home = os.environ.get("ALPACCAROO_HOME")
         try:
-            os.environ["ALPACCA_HOME"] = env["ALPACCA_HOME"]
-            from alpacca.history import start_session
+            os.environ["ALPACCAROO_HOME"] = env["ALPACCAROO_HOME"]
+            from alpaccaroo.history import start_session
             h = start_session("tiny", str(model_path))
             h.append_message("user", "history question")
             h.append_message("assistant", "history answer", tokens=2, seconds=0.01)
@@ -2397,9 +2397,9 @@ def main() -> None:
             history_id = h.id
         finally:
             if old_home is None:
-                os.environ.pop("ALPACCA_HOME", None)
+                os.environ.pop("ALPACCAROO_HOME", None)
             else:
-                os.environ["ALPACCA_HOME"] = old_home
+                os.environ["ALPACCAROO_HOME"] = old_home
         r = run_cli("history", "list", env=env)
         check("history list shows saved chat",
               history_id in r.stdout and "history question" in r.stdout,
@@ -2422,7 +2422,7 @@ def main() -> None:
         check("history stats lists installed model without saved chats",
               "tiny" in r.stdout and "n/a" in r.stdout,
               r.stdout)
-        hist_dir = Path(env["ALPACCA_HOME"]) / "history"
+        hist_dir = Path(env["ALPACCAROO_HOME"]) / "history"
         hist_dir.mkdir(parents=True, exist_ok=True)
         malformed_json = hist_dir / "malformed.json"
         bad_utf8_json = hist_dir / "bad-utf8.json"
@@ -2474,19 +2474,19 @@ def main() -> None:
         check("history clear --yes removes structurally malformed history",
               not bad_schema_json.exists() and not bad_schema_tmp.exists(),
               r.stdout + r.stderr)
-        old_home = os.environ.get("ALPACCA_HOME")
+        old_home = os.environ.get("ALPACCAROO_HOME")
         try:
-            os.environ["ALPACCA_HOME"] = env["ALPACCA_HOME"]
-            from alpacca.history import start_session
+            os.environ["ALPACCAROO_HOME"] = env["ALPACCAROO_HOME"]
+            from alpaccaroo.history import start_session
             for content in ("clear one", "clear two"):
                 h = start_session("tiny", str(model_path))
                 h.append_message("user", content)
                 h.close()
         finally:
             if old_home is None:
-                os.environ.pop("ALPACCA_HOME", None)
+                os.environ.pop("ALPACCAROO_HOME", None)
             else:
-                os.environ["ALPACCA_HOME"] = old_home
+                os.environ["ALPACCAROO_HOME"] = old_home
         r = run_cli("history", "clear", env=env, expect=1)
         check("history clear requires confirmation",
               "rerun with --yes" in r.stderr, r.stderr)
@@ -2501,7 +2501,7 @@ def main() -> None:
               r.stdout + r.stderr)
         r = run_cli("menu", env=env, input_text="2\n\n8\n")
         check("menu doctor path runs",
-              "alpacca 0.2.0" in r.stdout and "models dir:" in r.stdout,
+              "alpaccaroo 0.2.0" in r.stdout and "models dir:" in r.stdout,
               r.stdout + r.stderr)
         r = run_cli("menu", env=env, input_text="6\n\n8\n")
         check("menu history stats path runs",
@@ -2509,11 +2509,11 @@ def main() -> None:
               r.stdout + r.stderr)
         r = run_cli("menu", env=env, input_text="5\n4\n8\n")
         check("menu history list path runs",
-              "Alpacca Chat History" in r.stdout and
+              "Alpaccaroo Chat History" in r.stdout and
               "no chat history yet" in r.stdout,
               r.stdout + r.stderr)
         r = run_cli("menu", env=env, input_text="4\n2\nTiny Buddy\n\n6\n8\n")
-        default_model = Path(env["ALPACCA_HOME"]) / "default-model.txt"
+        default_model = Path(env["ALPACCAROO_HOME"]) / "default-model.txt"
         check("menu model switch accepts nickname",
               default_model.read_text(encoding="utf-8").strip() == "tiny" and
               "Tiny Buddy (tiny)" in r.stdout,
@@ -2548,7 +2548,7 @@ def main() -> None:
         if T.HAS_NUMPY:
             if has_pinned_numba:
                 check("run keeps weights quantized when kernels are active",
-                      "alpacca-kernels active" in r.stderr and
+                      "alpaccaroo-kernels active" in r.stderr and
                       "auto dense-weight budget:" not in r.stderr and
                       "weights quantized Q4_0 (16 matrices," in r.stderr,
                       r.stderr[-500:])
@@ -2559,8 +2559,8 @@ def main() -> None:
                       r.stderr[-500:])
             r0 = run_cli("run", "hf:test/tiny-GGUF:tiny-q4.gguf", "hi", "-n", "4",
                          "--seed", "1",
-                         env={**env, "ALPACCA_DENSE_WEIGHT_MB": "0"})
-            check("ALPACCA_DENSE_WEIGHT_MB=0 keeps the CLI fully quantized",
+                         env={**env, "ALPACCAROO_DENSE_WEIGHT_MB": "0"})
+            check("ALPACCAROO_DENSE_WEIGHT_MB=0 keeps the CLI fully quantized",
                   "auto dense-weight budget:" not in r0.stderr and
                   "weights quantized Q4_0 (16 matrices," in r0.stderr,
                   r0.stderr[-500:])
@@ -2572,7 +2572,7 @@ def main() -> None:
         # ---- serve ---------------------------------------------------------
         print("== serve (OpenAI-compatible API) ==")
         sp = subprocess.Popen(
-            [sys.executable, "-m", "alpacca", "serve", "tiny", "--port", "0"],
+            [sys.executable, "-m", "alpaccaroo", "serve", "tiny", "--port", "0"],
             env={**os.environ, **env}, cwd=str(REPO),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         import re
@@ -2633,9 +2633,9 @@ def main() -> None:
             sp.wait(timeout=10)
 
         import threading
-        from alpacca import chat
-        from alpacca.sample import SamplerParams
-        from alpacca.serve import serve as serve_in_process
+        from alpaccaroo import chat
+        from alpaccaroo.sample import SamplerParams
+        from alpaccaroo.serve import serve as serve_in_process
         api_model = Model.load(str(model_path), progress=False)
         ready = threading.Event()
         port_box: list[int] = []
@@ -2699,12 +2699,12 @@ def main() -> None:
         print("== json_only generation ==")
         import json as _json
         import make_tiny_model as _mtm
-        import alpacca.jsonform as _jf
-        from alpacca.jsonform import (JsonGuard, MAX_DEPTH as _JG_DEPTH,
+        import alpaccaroo.jsonform as _jf
+        from alpaccaroo.jsonform import (JsonGuard, MAX_DEPTH as _JG_DEPTH,
                                       sample_json_token)
-        from alpacca.chat import generate as _jgen
-        from alpacca.model import Model as _JModel
-        from alpacca.sample import Sampler as _JSampler, \
+        from alpaccaroo.chat import generate as _jgen
+        from alpaccaroo.model import Model as _JModel
+        from alpaccaroo.sample import Sampler as _JSampler, \
             SamplerParams as _JParams
 
         def _jg(data: bytes):
@@ -2790,7 +2790,7 @@ def main() -> None:
 
         # end to end: tiny model at temperature 2.0 - every reply is a valid
         # JSON value or, when the budget cuts it, a valid prefix of one
-        _jdir = Path(tempfile.mkdtemp(prefix="alpacca-jsonform-"))
+        _jdir = Path(tempfile.mkdtemp(prefix="alpaccaroo-jsonform-"))
         _mtm.main(str(_jdir / "tiny.gguf"), "F32")
         _jm = _JModel.load(str(_jdir / "tiny.gguf"), progress=False)
         _jp = _jm.tok.encode("hello world", add_bos=True)
@@ -2824,9 +2824,9 @@ def main() -> None:
 
         # ---- Ollama-native API (/api/*) -----------------------------------
         print("== ollama-native API ==")
-        from alpacca.serve import (_iso_now, _ollama_options, _param_size_label,
+        from alpaccaroo.serve import (_iso_now, _ollama_options, _param_size_label,
                                    _same_model, _wants_json)
-        from alpacca.sample import SamplerParams as _OllamaSP
+        from alpaccaroo.sample import SamplerParams as _OllamaSP
         check("ollama name match: :latest and path separators are cosmetic",
               _same_model("m", "m:latest") and
               _same_model("C:\\x\\m.gguf", "C:/x/m.gguf") and
@@ -2851,9 +2851,9 @@ def main() -> None:
               _param_size_label(15_000_000) == "15M")
 
         import threading as _oll_threading
-        from alpacca.model import Model as _OllamaModel
-        from alpacca.serve import serve as _ollama_serve
-        _oll_dir = Path(tempfile.mkdtemp(prefix="alpacca-ollama-api-"))
+        from alpaccaroo.model import Model as _OllamaModel
+        from alpaccaroo.serve import serve as _ollama_serve
+        _oll_dir = Path(tempfile.mkdtemp(prefix="alpaccaroo-ollama-api-"))
         subprocess.run([sys.executable, str(REPO / "tests" / "make_tiny_model.py"),
                         str(_oll_dir / "tiny.gguf")],
                        check=True, capture_output=True, cwd=str(REPO))
@@ -2908,7 +2908,7 @@ def main() -> None:
                   and m["details"]["parameter_size"]
                   for m in _oll_tags["models"]), str(_oll_tags)[:200])
         with urllib.request.urlopen(_oll_base + "/api/version", timeout=10) as resp:
-            from alpacca import __version__ as _oll_version
+            from alpaccaroo import __version__ as _oll_version
             check("api/version reports the package version",
                   json.loads(resp.read())["version"] == _oll_version)
         with urllib.request.urlopen(_oll_base + "/api/ps", timeout=10) as resp:
@@ -2957,22 +2957,22 @@ def main() -> None:
         except TypeError:
             check("api/chat format=json answers (constrained or degraded)", True)
 
-        # ---- gpu tier (alpacca/cuda.py, optional pinned numba-cuda) -------
+        # ---- gpu tier (alpaccaroo/cuda.py, optional pinned numba-cuda) -------
         # Cross-tier parity: GpuMatrix must match QuantMatrix within the
         # same relative bar the fused-vs-tiled check uses, row access must
         # be bit-exact, and greedy decode must be token-identical on every
         # placement the VRAM budget can produce. Everything except the
         # doctor line is gated on a working CUDA device + the pinned JIT.
-        # The suite-wide ALPACCA_GPU=0 pin lifts here; cuda caches its env
+        # The suite-wide ALPACCAROO_GPU=0 pin lifts here; cuda caches its env
         # gate at first init, so reset it before probing.
-        os.environ["ALPACCA_GPU"] = "1"
-        from alpacca import cuda as AG
+        os.environ["ALPACCAROO_GPU"] = "1"
+        from alpaccaroo import cuda as AG
         AG._state = None
         r = run_cli("doctor")
         check("doctor reports a gpu line", "gpu:" in r.stdout, r.stdout)
         if T.HAS_NUMPY and AG.available():
             import numpy as np
-            from alpacca.qmatrix import QuantMatrix
+            from alpaccaroo.qmatrix import QuantMatrix
 
             def gpu_q4k(n):
                 out = bytearray()
@@ -3006,7 +3006,7 @@ def main() -> None:
                     out += ql + qh + sc + struct.pack("<e", d)
                 return bytes(out)
 
-            os.environ["ALPACCA_INT_DOT"] = "0"  # exact codes path CPU-side
+            os.environ["ALPACCAROO_INT_DOT"] = "0"  # exact codes path CPU-side
             try:
                 gworst = 0.0
                 groworst = 0.0
@@ -3036,12 +3036,12 @@ def main() -> None:
                         gworst = max(gworst, float(
                             np.abs(stacked - gm.matmul_t(GX)).max()) / gscale)
                         # force the looped-matvec matmul path as well
-                        os.environ["ALPACCA_GPU_WIDE_MATMUL_ELEMS"] = "0"
+                        os.environ["ALPACCAROO_GPU_WIDE_MATMUL_ELEMS"] = "0"
                         try:
                             gworst = max(gworst, float(
                                 np.abs(refm - gm.matmul_t(GX)).max()) / gscale)
                         finally:
-                            os.environ.pop("ALPACCA_GPU_WIDE_MATMUL_ELEMS",
+                            os.environ.pop("ALPACCAROO_GPU_WIDE_MATMUL_ELEMS",
                                            None)
                     for i in range(_rows):
                         groworst = max(groworst, float(np.abs(
@@ -3052,7 +3052,7 @@ def main() -> None:
                     check(f"{_dt} gpu empty row gather shape",
                           gm.rows_at([]).shape == (0, _cols))
             finally:
-                os.environ.pop("ALPACCA_INT_DOT", None)
+                os.environ.pop("ALPACCAROO_INT_DOT", None)
             check(f"gpu matvec/matmul match QuantMatrix on both kernel paths "
                   f"(worst rel {gworst:.2e})", gworst < 2e-5)
             check(f"gpu row access is bit-exact (worst {groworst:.2e})",
@@ -3071,7 +3071,7 @@ def main() -> None:
                 "import sys\n"
                 f"sys.path.insert(0, {str(REPO)!r})\n"
                 "import numpy as np\n"
-                "from alpacca.model import Model\n"
+                "from alpaccaroo.model import Model\n"
                 f"m = Model.load({str(gpu_gguf)!r}, progress=False)\n"
                 "logits = m.prefill(m.tok.encode('hello world',"
                 " add_bos=True))\n"
@@ -3093,10 +3093,10 @@ def main() -> None:
                         return line
                 return f"rc={r.returncode}: {r.stderr[-200:]}"
 
-            gpu_cpu_ids = gpu_greedy({"ALPACCA_GPU": "0"})
-            gpu_gpu_ids = gpu_greedy({"ALPACCA_GPU": "1"})
-            gpu_cap_ids = gpu_greedy({"ALPACCA_GPU": "1",
-                                      "ALPACCA_GPU_VRAM_MB": "0.2"})
+            gpu_cpu_ids = gpu_greedy({"ALPACCAROO_GPU": "0"})
+            gpu_gpu_ids = gpu_greedy({"ALPACCAROO_GPU": "1"})
+            gpu_cap_ids = gpu_greedy({"ALPACCAROO_GPU": "1",
+                                      "ALPACCAROO_GPU_VRAM_MB": "0.2"})
             check("gpu greedy decode is token-identical to cpu",
                   gpu_cpu_ids.startswith("IDS ")
                   and gpu_cpu_ids == gpu_gpu_ids,
@@ -3106,8 +3106,8 @@ def main() -> None:
                   f"{gpu_cap_ids} vs {gpu_cpu_ids}")
             # opt-in f16 K/V mirror: no parity claim (the numerics shift
             # by design), but it must engage and decode without parking
-            gpu_f16_ids = gpu_greedy({"ALPACCA_GPU": "1",
-                                      "ALPACCA_KV_F16": "1"})
+            gpu_f16_ids = gpu_greedy({"ALPACCAROO_GPU": "1",
+                                      "ALPACCAROO_KV_F16": "1"})
             check("f16 K/V mirror decodes without parking",
                   gpu_f16_ids.startswith("IDS "), gpu_f16_ids)
 
@@ -3120,7 +3120,7 @@ def main() -> None:
             # token-identity, exercised via the failure legs: a mid-chunk
             # failure falls back to the host recompute for that chunk, and
             # only _PREFILL_PARK_AFTER consecutive failures park the path.
-            import alpacca.model as _amodel
+            import alpaccaroo.model as _amodel
 
             def _chain_load():
                 return _amodel.Model.load(str(gpu_gguf), progress=False)
@@ -3139,14 +3139,14 @@ def main() -> None:
                     "hello world the quick brown fox jumps over the lazy dog"
                     " and the crow watches from the wall at dusk",
                     add_bos=True)
-                os.environ["ALPACCA_PREFILL_CHUNK"] = "4096"
+                os.environ["ALPACCAROO_PREFILL_CHUNK"] = "4096"
                 chain_ref = np.asarray(cm.prefill(chain_prompt))
                 chain_ref_ids = _greedy16(cm, chain_ref)
                 check("device prefill chain engages on the tiny model",
                       cm._gpu_chain is not None and not cm._gpu_prefill_dead)
 
                 cm2 = _chain_load()
-                os.environ["ALPACCA_PREFILL_CHUNK"] = "5"
+                os.environ["ALPACCAROO_PREFILL_CHUNK"] = "5"
                 lg = np.asarray(cm2.prefill(chain_prompt))
                 check("chain chunk boundaries are byte-invariant "
                       "(want_logits=False legs included)",
@@ -3192,7 +3192,7 @@ def main() -> None:
                       and cm4._gpu_prefill_fails == 0)
 
                 cm5 = _chain_load()
-                os.environ["ALPACCA_PREFILL_CHUNK"] = "256"
+                os.environ["ALPACCAROO_PREFILL_CHUNK"] = "256"
                 cm5.prefill(chain_prompt[:11])
                 lg = np.asarray(cm5.prefill(chain_prompt))
                 check("live prefix reuse onto the chain is byte-identical",
@@ -3230,14 +3230,14 @@ def main() -> None:
                     # store to the new cap, oldest-first, keeping the MRU
                     # slot (the just-restored conversation)
                     slot_a = st1["bytes"]
-                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = (
+                    os.environ["ALPACCAROO_PREFIX_CACHE_MB"] = (
                         f"{slot_a * 1.1 / 1048576:.6f}")
                     cm6.prefill(warm_prompt)     # no save, no restore: drain
                     st3 = cm6.prefix_cache_stats()
                     check("mid-run budget shrink drains the store to cap",
                           st3["slots"] == 1 and st3["bytes"] == slot_a
                           and st3["evictions"] == 1)
-                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = "0"
+                    os.environ["ALPACCAROO_PREFIX_CACHE_MB"] = "0"
                     cm6.prefill(conv_b)
                     st4 = cm6.prefix_cache_stats()
                     check("disable clears the store",
@@ -3247,11 +3247,11 @@ def main() -> None:
                     # back to the saved conversation must skip the pre-
                     # restore save rather than evict the slot being restored
                     cm8 = _chain_load()
-                    os.environ.pop("ALPACCA_PREFIX_CACHE_MB", None)
+                    os.environ.pop("ALPACCAROO_PREFIX_CACHE_MB", None)
                     cm8.prefill(chain_prompt)
                     cm8.prefill(conv_b)          # saves A
                     sa = cm8.prefix_cache_stats()
-                    os.environ["ALPACCA_PREFIX_CACHE_MB"] = (
+                    os.environ["ALPACCAROO_PREFIX_CACHE_MB"] = (
                         f"{sa['bytes'] * 1.1 / 1048576:.6f}")
                     cm8.prefill(chain_prompt)    # restore A; B-save loses
                     sb = cm8.prefix_cache_stats()
@@ -3261,7 +3261,7 @@ def main() -> None:
                           and cm8.last_prefill_forwarded == 1)
                 finally:
                     _amodel._PREFIX_CACHE_MIN_MATCH = min_match
-                    os.environ.pop("ALPACCA_PREFIX_CACHE_MB", None)
+                    os.environ.pop("ALPACCAROO_PREFIX_CACHE_MB", None)
 
                 # the pure-python gate: without numpy the route is inert
                 has_np = _amodel.T.HAS_NUMPY
@@ -3273,8 +3273,8 @@ def main() -> None:
                 check("pure-python tier keeps the single-cache behavior",
                       routed == 0 and not cm7._prefix_slots)
             finally:
-                os.environ.pop("ALPACCA_PREFILL_CHUNK", None)
-        os.environ["ALPACCA_GPU"] = "0"  # back to the suite-wide host pin
+                os.environ.pop("ALPACCAROO_PREFILL_CHUNK", None)
+        os.environ["ALPACCAROO_GPU"] = "0"  # back to the suite-wide host pin
 
         print("== removal ==")
         run_cli("rm", "tiny", env=env)

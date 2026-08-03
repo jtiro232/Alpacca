@@ -1,19 +1,19 @@
-# Alpacca - our own fused quantized-matvec kernels, written in Python.
+# Alpaccaroo - our own fused quantized-matvec kernels, written in Python.
 # MIT License. See LICENSE.
-"""Alpacca's native-speed kernels: Python source, optionally JIT-compiled.
+"""Alpaccaroo's native-speed kernels: Python source, optionally JIT-compiled.
 
-Every kernel here is Alpacca's own algorithm, authored and maintained in
+Every kernel here is Alpaccaroo's own algorithm, authored and maintained in
 this file as ordinary Python. When the OPTIONAL, PINNED Numba JIT is
-installed (``pip install alpacca[kernels]``), these functions are compiled
+installed (``pip install alpaccaroo[kernels]``), these functions are compiled
 at runtime to native SIMD machine code and the quantized decode path runs
 at memory-bandwidth speed while weights stay quantized in RAM. Without
-Numba - or with ``ALPACCA_KERNELS=0`` - nothing changes: the NumPy and
+Numba - or with ``ALPACCAROO_KERNELS=0`` - nothing changes: the NumPy and
 pure-Python paths remain the reference implementations and the fallback.
 
 Pin policy: Numba is locked to ``NUMBA_PIN`` below, a combination
 validated against this code and the supported NumPy range. The pin is
 never updated implicitly; a different installed Numba version deactivates
-the kernels (set ``ALPACCA_KERNELS=force`` to override at your own risk).
+the kernels (set ``ALPACCAROO_KERNELS=force`` to override at your own risk).
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ _state: dict | None = None  # lazy: {"matvec": compiled fn} or {} if inactive
 
 def int_dot_enabled() -> bool:
     """True when the integer-dot decode path is on (default when kernels
-    are active; ALPACCA_INT_DOT=0 reverts to the f32-activation kernels)."""
-    return (os.environ.get("ALPACCA_INT_DOT", "").strip().lower()
+    are active; ALPACCAROO_INT_DOT=0 reverts to the f32-activation kernels)."""
+    return (os.environ.get("ALPACCAROO_INT_DOT", "").strip().lower()
             not in ("0", "off", "no")) and available()
 
 
@@ -49,8 +49,8 @@ def _init() -> dict:
     if _state is not None:
         return _state
     _state = {}
-    mode = os.environ.get("ALPACCA_KERNELS", "").strip().lower()
-    if mode in ("0", "off", "no") or os.environ.get("ALPACCA_PURE"):
+    mode = os.environ.get("ALPACCAROO_KERNELS", "").strip().lower()
+    if mode in ("0", "off", "no") or os.environ.get("ALPACCAROO_PURE"):
         return _state
     try:
         import numpy as np
@@ -60,14 +60,14 @@ def _init() -> dict:
         return _state
     if numba.__version__ != NUMBA_PIN and mode != "force":
         import sys
-        print(f"alpacca: numba {numba.__version__} != pinned {NUMBA_PIN}; "
-              f"kernels disabled (ALPACCA_KERNELS=force to override)",
+        print(f"alpaccaroo: numba {numba.__version__} != pinned {NUMBA_PIN}; "
+              f"kernels disabled (ALPACCAROO_KERNELS=force to override)",
               file=sys.stderr)
         return _state
 
     # Thread count: prefer physical cores for the bandwidth-bound decode
     # loop unless the user chose explicitly (either knob wins over us).
-    threads_env = os.environ.get("ALPACCA_THREADS", "").strip()
+    threads_env = os.environ.get("ALPACCAROO_THREADS", "").strip()
     if threads_env:
         try:
             numba.set_num_threads(max(1, int(threads_env)))
@@ -545,9 +545,9 @@ def available() -> bool:
 def status() -> str:
     st = _init()
     if st:
-        return (f"alpacca-kernels active (numba=={st['numba_version']}, "
+        return (f"alpaccaroo-kernels active (numba=={st['numba_version']}, "
                 f"pin {NUMBA_PIN}, our Python source)")
-    return "alpacca-kernels inactive (pure/NumPy paths in use)"
+    return "alpaccaroo-kernels inactive (pure/NumPy paths in use)"
 
 
 def matvec_codes(q3, d_eff, m_eff, x):

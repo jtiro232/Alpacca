@@ -1,4 +1,4 @@
-# Allows `python -m alpacca` with no install at all. MIT License.
+# Allows `python -m alpaccaroo` with no install at all. MIT License.
 from .cli import main
 
 if __name__ == "__main__":

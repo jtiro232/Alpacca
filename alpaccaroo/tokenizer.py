@@ -1,4 +1,4 @@
-# Alpacca - tokenizers implemented from scratch: SentencePiece-style
+# Alpaccaroo - tokenizers implemented from scratch: SentencePiece-style
 # (greedy highest-score-first bigram merge, byte fallback) and byte-level BPE
 # with a GPT-2/llama-3 style pre-tokenizer built on unicodedata (no regex deps).
 # MIT License. See LICENSE.

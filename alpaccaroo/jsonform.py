@@ -1,4 +1,4 @@
-# Alpacca - guaranteed-valid-JSON generation: a byte-level JSON grammar
+# Alpaccaroo - guaranteed-valid-JSON generation: a byte-level JSON grammar
 # guard plus the candidate-rejection sampling loop chat.generate runs for
 # json_only=True. MIT License. See LICENSE.
 # (These first two lines must never say "*oding:" - PEP 263 reads that as an

@@ -1,4 +1,4 @@
-# Alpacca - OpenAI-compatible HTTP API on the standard library only.
+# Alpaccaroo - OpenAI-compatible HTTP API on the standard library only.
 # Endpoints: /health, /v1/models, /v1/chat/completions (incl. streaming),
 # a llama.cpp-style /completion, and the Ollama-native surface (/api/chat,
 # /api/generate, /api/tags, /api/show, /api/ps, /api/version) so the official
@@ -256,7 +256,7 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 return self.send_json({"status": "ok"})
             if path == "/v1/models":
                 return self.send_json({"object": "list", "data": [
-                    {"id": model_name, "object": "model", "owned_by": "alpacca"}]})
+                    {"id": model_name, "object": "model", "owned_by": "alpaccaroo"}]})
             if path == "/api/tags":
                 return self.api_tags()
             if path == "/api/version":
@@ -583,7 +583,7 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
     httpd = _Server((host, port), Handler)
     actual_port = httpd.server_address[1]
-    print(f"alpacca serving {model_name} on http://{host}:{actual_port} "
+    print(f"alpaccaroo serving {model_name} on http://{host}:{actual_port} "
           f"(OpenAI-compatible: POST /v1/chat/completions; "
           f"Ollama-native: POST /api/chat)", file=sys.stderr)
     if ready_callback:

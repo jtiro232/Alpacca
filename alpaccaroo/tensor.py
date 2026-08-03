@@ -1,10 +1,10 @@
-# Alpacca - minimal tensor backend: NumPy when available, pure Python
-# otherwise (set ALPACCA_PURE=1 to force the pure path).
+# Alpaccaroo - minimal tensor backend: NumPy when available, pure Python
+# otherwise (set ALPACCAROO_PURE=1 to force the pure path).
 # MIT License. See LICENSE.
 """The handful of dense operations the transformer needs.
 
 Vectors are NumPy 1-D float32 arrays or Python lists of floats; matrices
-are NumPy 2-D arrays, lists of row-lists, or :class:`alpacca.qmatrix.
+are NumPy 2-D arrays, lists of row-lists, or :class:`alpaccaroo.qmatrix.
 QuantMatrix` for weights kept in quantized form. The pure path is exact but
 slow - it exists so the engine runs with zero dependencies, and so the two
 implementations can verify each other in tests.
@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     _np = None
 
-if os.environ.get("ALPACCA_PURE"):
+if os.environ.get("ALPACCAROO_PURE"):
     _np = None
 
 HAS_NUMPY = _np is not None
@@ -36,7 +36,7 @@ from .qmatrix import (  # noqa: E402  (re-exported quantized-matrix surface)
 from .quants import QK, QK_K  # noqa: E402,F401  (block sizes, for callers/tests)
 
 
-# Flipped by alpacca.cuda when the first weight matrix reaches VRAM, so
+# Flipped by alpaccaroo.cuda when the first weight matrix reaches VRAM, so
 # backend_name() reflects what is actually running, not what is installed.
 _GPU_ACTIVE = False
 
@@ -48,7 +48,7 @@ def backend_name() -> str:
 
 
 def _is_gpu_matrix(W) -> bool:
-    # duck-typed marker, not isinstance: importing alpacca.cuda here would
+    # duck-typed marker, not isinstance: importing alpaccaroo.cuda here would
     # drag the CUDA stack into every CPU-only import of this module
     return getattr(W, "is_gpu_matrix", False)
 

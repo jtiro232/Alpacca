@@ -1,4 +1,4 @@
-# Alpacca - the transformer, implemented from scratch in Python.
+# Alpaccaroo - the transformer, implemented from scratch in Python.
 # Llama-class decoder: RMSNorm, rotary embeddings, grouped-query attention,
 # SwiGLU MLP, KV cache. Runs on NumPy when available, pure Python otherwise.
 # MIT License. See LICENSE.
@@ -42,7 +42,7 @@ _KNOWN_QUANT_DTYPES = {
     "IQ3_XXS", "IQ4_NL", "IQ4_XS",
 }
 
-# ALPACCA_DENSE_WEIGHT_MB densification order: NumPy's quantized matvec has
+# ALPACCAROO_DENSE_WEIGHT_MB densification order: NumPy's quantized matvec has
 # no BLAS-class kernel, so spending RAM on dense float32 buys decode speed
 # roughly in proportion to how much of a token's matvec work a matrix does.
 # FFN projections dominate llama-class decode, attention q/output come next,
@@ -58,7 +58,7 @@ _DENSIFY_TIERS: tuple[tuple[str, ...], ...] = (
 
 
 def _dense_budget_bytes() -> int:
-    raw = os.environ.get("ALPACCA_DENSE_WEIGHT_MB")
+    raw = os.environ.get("ALPACCAROO_DENSE_WEIGHT_MB")
     if raw is None or not raw.strip():
         return 0
     try:
@@ -73,7 +73,7 @@ def _dense_budget_bytes() -> int:
         return 0
 
 
-# ALPACCA_PREFIX_CACHE_MB: byte budget for the multi-slot prefix cache -
+# ALPACCAROO_PREFIX_CACHE_MB: byte budget for the multi-slot prefix cache -
 # saved KV snapshots that let `prefill` switch between interleaved
 # conversations without re-prefilling each one from scratch. Unset, blank
 # or unparseable means the 1024 MiB default; zero or negative disables the
@@ -90,7 +90,7 @@ _PREFIX_CACHE_MIN_MATCH = 256
 
 
 def _prefix_cache_budget_bytes() -> int:
-    raw = os.environ.get("ALPACCA_PREFIX_CACHE_MB")
+    raw = os.environ.get("ALPACCAROO_PREFIX_CACHE_MB")
     if raw is None or not raw.strip():
         mb = _PREFIX_CACHE_DEFAULT_MB
     else:
@@ -221,7 +221,7 @@ class Model:
     # class defaults so instances built without load() (tests use __new__)
     # take the reference paths; load() sets the real values. The two gpu
     # flags flip together when the load put matrices in VRAM, which is
-    # exactly the condition ALPACCA_GPU=0 prevents - so both stage-2 gpu
+    # exactly the condition ALPACCAROO_GPU=0 prevents - so both stage-2 gpu
     # paths honor the same off switch as the tier itself.
     _use_kernel_attention = False
     _use_gpu_batch_attention = False
@@ -289,7 +289,7 @@ class Model:
             arch = gf.architecture
             if arch not in SUPPORTED_ARCHES:
                 raise ValueError(
-                    f"architecture '{arch}' is not supported by the alpacca engine yet "
+                    f"architecture '{arch}' is not supported by the alpaccaroo engine yet "
                     f"(supported: {', '.join(sorted(SUPPORTED_ARCHES))})")
             # fail on unreadable storage now, in milliseconds, instead of a
             # raw per-tensor error after the tokenizer and half the layers.
@@ -316,7 +316,7 @@ class Model:
             if unreadable:
                 raise ValueError(
                     f"{path}: stores tensors as {'/'.join(unreadable)}, "
-                    f"which alpacca cannot read yet - pick a Q4_K_M, Q5_K_M "
+                    f"which alpaccaroo cannot read yet - pick a Q4_K_M, Q5_K_M "
                     f"or Q8_0 build of this model instead")
 
             def meta(key, default=None):
@@ -471,13 +471,13 @@ class Model:
             fallback_matrices: dict[str, int] = {}
             densified_names: list[str] = []
 
-            # ALPACCA_DENSE_WEIGHT_MB: pick which quantizable matrices to
+            # ALPACCAROO_DENSE_WEIGHT_MB: pick which quantizable matrices to
             # expand to dense float32 at load (BLAS-speed decode), spending
             # the budget tier by tier; everything else stays quantized.
             densify_plan: set[str] = set()
             densified_bytes = 0
             budget = 0
-            if T.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+            if T.HAS_NUMPY and not os.environ.get("ALPACCAROO_F32"):
                 budget = _dense_budget_bytes()
             if budget > 0:
                 tied_output = "output.weight" not in gf.tensors
@@ -510,7 +510,7 @@ class Model:
             gpu_matrices = 0
             gpu_bytes = 0
             _gpu = None
-            if T.HAS_NUMPY and not os.environ.get("ALPACCA_F32"):
+            if T.HAS_NUMPY and not os.environ.get("ALPACCAROO_F32"):
                 try:
                     from . import cuda as _gpu_mod
                     if _gpu_mod.available():
@@ -530,7 +530,7 @@ class Model:
                     raise ValueError(
                         f"tensor {name} has {info.n_elements} elements, "
                         f"expected {rows * cols}")
-                if (T.HAS_NUMPY and not os.environ.get("ALPACCA_F32") and
+                if (T.HAS_NUMPY and not os.environ.get("ALPACCAROO_F32") and
                         name not in densify_plan and
                         T.can_quantized_matvec(info.dtype, cols)):
                     if _gpu is not None and name != "token_embd.weight":
@@ -565,8 +565,8 @@ class Model:
             # one activation quantization instead of two; the per-row math is
             # unchanged. attn_v stays separate - it is Q6_K in Q4_K_M files
             # while q/k are Q4_K, and mixed dtypes cannot share blocks.
-            fuse_enabled = (T.HAS_NUMPY and not os.environ.get("ALPACCA_F32")
-                            and os.environ.get("ALPACCA_FUSE", "").strip()
+            fuse_enabled = (T.HAS_NUMPY and not os.environ.get("ALPACCAROO_F32")
+                            and os.environ.get("ALPACCAROO_FUSE", "").strip()
                             .lower() not in ("0", "off", "no"))
 
             def fused_mat(names, rows_each, cols):
@@ -625,7 +625,7 @@ class Model:
                 pre_shape: dict[str, int] = {}
                 fb_bytes = 0
                 quantize_ok = (T.HAS_NUMPY
-                               and not os.environ.get("ALPACCA_F32"))
+                               and not os.environ.get("ALPACCAROO_F32"))
                 for nm, info in gf.tensors.items():
                     if (len(info.shape) < 2 or nm in densify_plan
                             or info.dtype not in _KNOWN_QUANT_DTYPES):
@@ -656,7 +656,7 @@ class Model:
                                "/".join(str(pre_shape[d])
                                         for d in sorted(pre_shape))))
                     if unsupported:
-                        reasons.append("alpacca has no quantized matvec for %s"
+                        reasons.append("alpaccaroo has no quantized matvec for %s"
                                        % "/".join(unsupported))
                     print(f"warning: {'; '.join(reasons)}, so "
                           f"{sum(pre_fb.values())} matrices load as dense "
@@ -842,7 +842,7 @@ class Model:
         Gated on NumPy: the pure-Python tier keeps list caches, and the
         byte-parity argument here rests on float32 array row copies - so
         that tier keeps the exact single-cache behavior it has today, the
-        same guarantee as ALPACCA_PREFIX_CACHE_MB=0."""
+        same guarantee as ALPACCAROO_PREFIX_CACHE_MB=0."""
         budget = _prefix_cache_budget_bytes()
         if budget <= 0 or not T.HAS_NUMPY:
             if self._prefix_slots:
@@ -1084,7 +1084,7 @@ class Model:
     def _attention_batch_np(self, q, K, V, positions, group: int, inv_sqrt: float):
         hp = self.hp
         if self._use_gpu_batch_attention:
-            # gpu batch attention (alpacca/cuda.py): same math with an
+            # gpu batch attention (alpaccaroo/cuda.py): same math with an
             # online softmax. None (unsupported geometry, tier parked)
             # falls through - the einsum below stays the reference.
             from . import cuda as _gpu
@@ -1116,7 +1116,7 @@ class Model:
             raise RuntimeError(f"context window full ({self.n_ctx} tokens)")
 
         if self._use_gpu_chain and len(tokens) > 1:
-            # device-resident prefill chunk (alpacca/cuda.py): the whole
+            # device-resident prefill chunk (alpaccaroo/cuda.py): the whole
             # chunk on the GPU with one embedding upload, the K/V rows
             # written straight into the decode mirror and copied back to
             # the host cache. None means unavailable or just failed -
@@ -1175,7 +1175,7 @@ class Model:
             ffn = None
             if (ly.wgu is not None and self._use_gpu_batch_attention
                     and hp.arch not in _GEMMA_ARCHES):
-                # fused device FFN (alpacca/cuda.py): both GEMMs plus the
+                # fused device FFN (alpaccaroo/cuda.py): both GEMMs plus the
                 # silu*up between them in VRAM, so the (batch, 2*n_ff)
                 # gate|up block never travels. None (mixed placement,
                 # batch 1, degraded) falls through to the exact host path.
@@ -1203,7 +1203,7 @@ class Model:
 
     def _forward_np(self, token: int):
         if self._use_gpu_chain:
-            # device-resident decode chain (alpacca/cuda.py): the whole
+            # device-resident decode chain (alpaccaroo/cuda.py): the whole
             # token on the GPU, one sync. None means unavailable or just
             # failed - either way the body below recomputes the token
             # correctly, and a failed chain never activates again.
@@ -1640,7 +1640,7 @@ class Model:
         self.last_prefill_forwarded = len(suffix)
         logits = None
         if T.HAS_NUMPY:
-            raw = os.environ.get("ALPACCA_PREFILL_CHUNK", "256")
+            raw = os.environ.get("ALPACCAROO_PREFILL_CHUNK", "256")
             try:
                 chunk = max(1, int(raw))
             except ValueError:

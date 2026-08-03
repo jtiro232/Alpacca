@@ -1,10 +1,10 @@
-# Alpacca - the only module that branches on the host OS.
+# Alpaccaroo - the only module that branches on the host OS.
 # MIT License. See LICENSE.
 """Host-OS shims for two things POSIX hands us for free.
 
 The engine asks for a capability; this module supplies the best available
 implementation and returns a neutral answer when the host has none. Every
-OS-specific line in Alpacca lives here, so `gguf.py` and `kernels.py` stay
+OS-specific line in Alpaccaroo lives here, so `gguf.py` and `kernels.py` stay
 platform-free and read the same everywhere.
 
 In both functions the POSIX path comes first and returns immediately, so

@@ -1,4 +1,4 @@
-# Alpacca - GGUF quantization formats, implemented from the spec in pure
+# Alpaccaroo - GGUF quantization formats, implemented from the spec in pure
 # Python (with optional NumPy fast paths). MIT License. See LICENSE.
 """Dequantize GGUF tensor data to float32, and quantize for the writer.
 
@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 
 import os
 
-if os.environ.get("ALPACCA_PURE"):
+if os.environ.get("ALPACCAROO_PURE"):
     _np = None
 
 QK = 32      # block size of the classic quants
@@ -331,7 +331,7 @@ QUANT_GEOMETRY = {
 # ---- NumPy fast paths ----------------------------------------------------
 #
 # Each unpacker decodes raw blocks into the shared compact representation
-# used by both `dequantize` and `alpacca.qmatrix.QuantMatrix`:
+# used by both `dequantize` and `alpaccaroo.qmatrix.QuantMatrix`:
 #   codes int8 (nb, block_elements)  - quant codes in element order
 #   d_eff float32 (nb, n_sub)        - effective scale per sub-block
 #   m_eff float32 (nb, n_sub) | None - effective offset per sub-block
@@ -636,7 +636,7 @@ def dequantize(data, n: int, dtype: str):
     """
     if dtype not in _PURE_DECODERS:
         raise ValueError(
-            f"tensor type {dtype} is not supported by the alpacca engine "
+            f"tensor type {dtype} is not supported by the alpaccaroo engine "
             f"(supported: {', '.join(sorted(_PURE_DECODERS))})")
     if _np is not None:
         if dtype == "F32":

@@ -1,4 +1,4 @@
-# Alpacca - token sampling: greedy, temperature, top-k, top-p, repeat
+# Alpaccaroo - token sampling: greedy, temperature, top-k, top-p, repeat
 # penalty. Deterministic for a given seed. MIT License. See LICENSE.
 from __future__ import annotations
 

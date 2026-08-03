@@ -1,4 +1,4 @@
-# Alpacca - command-line interface. MIT License. See LICENSE.
+# Alpaccaroo - command-line interface. MIT License. See LICENSE.
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .sample import SamplerParams
-from .store import (LocalModel, alpacca_home, clear_model_nickname, find_local,
+from .store import (LocalModel, alpaccaroo_home, clear_model_nickname, find_local,
                     human_size, list_models, models_root, nickname_for_model,
                     parse_model_ref, remove_model, resolve_model_input,
                     set_model_nickname)
@@ -22,12 +22,12 @@ model references:
   ./path/to/model.gguf             local GGUF file
 
 examples:
-  alpacca pull llama3.2:1b
-  alpacca menu                                  # terminal app menu
-  alpacca run llama3.2:1b                        # interactive chat
-  alpacca run llama3.2:1b "why is the sky blue?" # one-shot
-  alpacca history list                           # list saved chats
-  alpacca serve llama3.2:1b --port 8080          # OpenAI-compatible API
+  alpaccaroo pull llama3.2:1b
+  alpaccaroo menu                                  # terminal app menu
+  alpaccaroo run llama3.2:1b                        # interactive chat
+  alpaccaroo run llama3.2:1b "why is the sky blue?" # one-shot
+  alpaccaroo history list                           # list saved chats
+  alpaccaroo serve llama3.2:1b --port 8080          # OpenAI-compatible API
 """
 
 
@@ -39,10 +39,10 @@ def _resolve_or_pull(name: str, auto_pull: bool = True) -> tuple[LocalModel, str
     if local is not None:
         return local, ref.display()
     if ref.source == "file":
-        raise SystemExit(f"alpacca: model file not found: {ref.path}")
+        raise SystemExit(f"alpaccaroo: model file not found: {ref.path}")
     if not auto_pull:
-        raise SystemExit(f"alpacca: {ref.display()} is not installed "
-                         f"(try `alpacca pull {ref.display()}`)")
+        raise SystemExit(f"alpaccaroo: {ref.display()} is not installed "
+                         f"(try `alpaccaroo pull {ref.display()}`)")
     print(f"{ref.display()} is not installed yet - pulling it first", file=sys.stderr)
     return pull_model(ref), ref.display()
 
@@ -151,20 +151,20 @@ def _auto_dense_budget_mb(avail_mb: float, file_mb: float, n_ctx: int = 0) -> in
 
 
 def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
-    """Default `alpacca run`/`serve` to the fastest storage this machine
-    affords: size ALPACCA_DENSE_WEIGHT_MB from available RAM unless the
+    """Default `alpaccaroo run`/`serve` to the fastest storage this machine
+    affords: size ALPACCAROO_DENSE_WEIGHT_MB from available RAM unless the
     user pinned it (any value - `0` keeps everything quantized). This is
     CLI policy; the library default (Model.load) stays opt-in."""
     from . import tensor
-    if not tensor.HAS_NUMPY or os.environ.get("ALPACCA_F32"):
+    if not tensor.HAS_NUMPY or os.environ.get("ALPACCAROO_F32"):
         return
     from . import kernels
-    pinned = os.environ.get("ALPACCA_DENSE_WEIGHT_MB") is not None
+    pinned = os.environ.get("ALPACCAROO_DENSE_WEIGHT_MB") is not None
     from . import cuda
     if cuda.available():
         # weights are bound for VRAM: densifying them to host float32
         # would keep them off the GPU, so the auto budget stays unset (a
-        # user-pinned ALPACCA_DENSE_WEIGHT_MB still flows into Model.load)
+        # user-pinned ALPACCAROO_DENSE_WEIGHT_MB still flows into Model.load)
         print(cuda.status(), file=sys.stderr)
         if kernels.available():
             kernels.warmup()
@@ -180,17 +180,17 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
               f"(fastest path, lowest RAM)", file=sys.stderr)
         return
     # report the missing kernels even when the budget is pinned:
-    # ALPACCA_DENSE_WEIGHT_MB=0 is the fully-quantized mode, which is
+    # ALPACCAROO_DENSE_WEIGHT_MB=0 is the fully-quantized mode, which is
     # exactly where their absence costs the most
-    print(f"alpacca: {kernels.status()}; NumPy decode is several times slower "
+    print(f"alpaccaroo: {kernels.status()}; NumPy decode is several times slower "
           f"than the fused kernels (pip install \"numba=={kernels.NUMBA_PIN}\" "
           f"to enable them)", file=sys.stderr)
     if pinned:
         return
     avail = _available_ram_mb()
     if avail is None:
-        print("alpacca: could not detect available RAM; keeping weights "
-              "quantized (set ALPACCA_DENSE_WEIGHT_MB to choose a dense "
+        print("alpaccaroo: could not detect available RAM; keeping weights "
+              "quantized (set ALPACCAROO_DENSE_WEIGHT_MB to choose a dense "
               "budget)", file=sys.stderr)
         return
     try:
@@ -212,10 +212,10 @@ def _maybe_auto_dense_budget(local: LocalModel, n_ctx: int = 0) -> None:
         budget = _auto_dense_budget_mb(avail, file_mb, n_ctx)
     if budget <= 0:
         return
-    os.environ["ALPACCA_DENSE_WEIGHT_MB"] = str(budget)
+    os.environ["ALPACCAROO_DENSE_WEIGHT_MB"] = str(budget)
     print(f"auto dense-weight budget: {budget} MiB "
           f"(~{avail:.0f} MiB RAM available; "
-          f"set ALPACCA_DENSE_WEIGHT_MB=0 to keep weights quantized)",
+          f"set ALPACCAROO_DENSE_WEIGHT_MB=0 to keep weights quantized)",
           file=sys.stderr)
 
 
@@ -238,7 +238,7 @@ def cmd_pull(args) -> int:
 def cmd_list(_args) -> int:
     models = list_models()
     if not models:
-        print("no models installed - try: alpacca pull llama3.2:1b")
+        print("no models installed - try: alpaccaroo pull llama3.2:1b")
         return 0
     width = max(4, max(_display_width(m["name"]) for m in models))
     nicks = {m["name"]: _clip(m.get("nickname", ""), 32) for m in models}
@@ -259,7 +259,7 @@ def cmd_rm(args) -> int:
         if remove_model(ref):
             print(f"removed {ref.display()}")
         else:
-            print(f"alpacca: {ref.display()} is not installed", file=sys.stderr)
+            print(f"alpaccaroo: {ref.display()} is not installed", file=sys.stderr)
             rc = 1
     return rc
 
@@ -270,10 +270,10 @@ def cmd_show(args) -> int:
     ref = parse_model_ref(resolve_model_input(args.model))
     local = find_local(ref)
     if local is None:
-        raise SystemExit(f"alpacca: {ref.display()} is not installed")
+        raise SystemExit(f"alpaccaroo: {ref.display()} is not installed")
     manifest = dict(local.manifest or {"model_file": str(local.model_path)})
     # a file ref's display() is a bare path, which re-parses as a registry
-    # name - so `alpacca show ./tiny` would claim the registry model's alias
+    # name - so `alpaccaroo show ./tiny` would claim the registry model's alias
     nickname = "" if ref.source == "file" else nickname_for_model(ref.display())
     if nickname:
         manifest["nickname"] = nickname
@@ -323,8 +323,8 @@ def cmd_serve(args) -> int:
     _apply_manifest_defaults(local, args)
     model = _load_model(local, args)
     from .serve import serve
-    host = args.host or os.environ.get("ALPACCA_HOST", "127.0.0.1")
-    port = args.port if args.port is not None else int(os.environ.get("ALPACCA_PORT", "8080"))
+    host = args.host or os.environ.get("ALPACCAROO_HOST", "127.0.0.1")
+    port = args.port if args.port is not None else int(os.environ.get("ALPACCAROO_PORT", "8080"))
     serve(model, model_name, host, port, defaults=_sampler_params(args))
     return 0
 
@@ -332,7 +332,7 @@ def cmd_serve(args) -> int:
 
 def cmd_doctor(_args) -> int:
     from . import tensor
-    print(f"alpacca {__version__} (from-scratch python engine)")
+    print(f"alpaccaroo {__version__} (from-scratch python engine)")
     print(f"python:      {sys.version.split()[0]} ({sys.executable})")
     print(f"backend:     {tensor.backend_name()}"
           + ("  (optional accelerator active)" if tensor.HAS_NUMPY
@@ -347,7 +347,7 @@ def cmd_doctor(_args) -> int:
         ok = f"NOT WRITABLE ({e})"
     print(f"models dir:  {root} ({ok})")
     n = len(list_models())
-    print(f"installed:   {n} model(s)" + ("" if n else " - try `alpacca pull llama3.2:1b`"))
+    print(f"installed:   {n} model(s)" + ("" if n else " - try `alpaccaroo pull llama3.2:1b`"))
     return 0
 
 
@@ -436,7 +436,7 @@ def _clip(text: str, width: int) -> str:
 
 
 def _default_model_file() -> Path:
-    return alpacca_home() / "default-model.txt"
+    return alpaccaroo_home() / "default-model.txt"
 
 
 def _read_default_model() -> str:
@@ -475,7 +475,7 @@ def _menu_pause() -> None:
 
 
 def _menu_error(e) -> None:
-    print(f"alpacca: error: {e}", file=sys.stderr)
+    print(f"alpaccaroo: error: {e}", file=sys.stderr)
 
 
 def _print_installed_models() -> None:
@@ -504,7 +504,7 @@ def _menu_run_model() -> None:
 
 def _menu_model_manager() -> None:
     while True:
-        print("\nAlpacca Model Manager\n")
+        print("\nAlpaccaroo Model Manager\n")
         _print_installed_models()
         print("\n1. Add/download a model")
         print("2. Switch chat model")
@@ -516,7 +516,7 @@ def _menu_model_manager() -> None:
         if choice in ("", "6"):
             return
         if choice == "1":
-            print("\nEnter any supported Alpacca model reference.")
+            print("\nEnter any supported Alpaccaroo model reference.")
             print("Examples: llama3.2:1b, qwen2.5:0.5b, "
                   "hf:NousResearch/Hermes-3-Llama-3.1-8B")
             model_ref = _prompt_line("Model reference (blank to cancel): ").strip()
@@ -538,7 +538,7 @@ def _menu_model_manager() -> None:
                 ref = parse_model_ref(resolved)
                 local = find_local(ref)
             except ValueError as e:
-                print(f"alpacca: error: {e}", file=sys.stderr)
+                print(f"alpaccaroo: error: {e}", file=sys.stderr)
                 local = None
             if local is None:
                 print("Model is not installed or the reference is invalid.")
@@ -606,7 +606,7 @@ def _menu_model_manager() -> None:
 
 def _menu_history() -> None:
     while True:
-        print("\nAlpacca Chat History\n")
+        print("\nAlpaccaroo Chat History\n")
         _history_list()
         print("\n1. View a chat")
         print("2. Delete one chat")
@@ -639,41 +639,41 @@ def _menu_history() -> None:
 
 
 def _print_controls() -> None:
-    print("\nAlpacca Controls\n")
+    print("\nAlpaccaroo Controls\n")
     print("Core commands:")
-    print("  alpacca menu")
-    print("  alpacca list")
-    print("  alpacca pull <model>")
-    print("  alpacca nickname <model> <nickname>  |  alpacca nickname --list")
-    print("  alpacca run <model-or-nickname> [prompt text]")
-    print("  alpacca serve <model-or-nickname> [--host HOST] [--port PORT]")
-    print("  alpacca history list|show|stats|rm|clear --yes")
-    print("  alpacca show <model> [--metadata]")
-    print("  alpacca rm <model> [more models...]")
-    print("  alpacca tokenize -m <model> -p \"text\"")
-    print("  alpacca doctor")
+    print("  alpaccaroo menu")
+    print("  alpaccaroo list")
+    print("  alpaccaroo pull <model>")
+    print("  alpaccaroo nickname <model> <nickname>  |  alpaccaroo nickname --list")
+    print("  alpaccaroo run <model-or-nickname> [prompt text]")
+    print("  alpaccaroo serve <model-or-nickname> [--host HOST] [--port PORT]")
+    print("  alpaccaroo history list|show|stats|rm|clear --yes")
+    print("  alpaccaroo show <model> [--metadata]")
+    print("  alpaccaroo rm <model> [more models...]")
+    print("  alpaccaroo tokenize -m <model> -p \"text\"")
+    print("  alpaccaroo doctor")
     print("\nInteractive chat:")
     print("  Esc or /exit returns to the menu/caller")
     print("  /clear resets the current conversation")
     print("  the oldest turns are dropped automatically to fit the context window")
     print("\nUseful environment variables:")
-    print("  ALPACCA_HOME changes the model/history/default-model store")
-    print("  ALPACCA_DENSE_WEIGHT_MB=0 keeps weights fully quantized")
-    print("  ALPACCA_KERNELS=0 disables optional pinned JIT kernels")
-    print("  ALPACCA_PURE=1 forces the standard-library backend")
-    print("  ALPACCA_SMALL_MATVEC_ELEMS re-tunes the quantized matvec crossover")
+    print("  ALPACCAROO_HOME changes the model/history/default-model store")
+    print("  ALPACCAROO_DENSE_WEIGHT_MB=0 keeps weights fully quantized")
+    print("  ALPACCAROO_KERNELS=0 disables optional pinned JIT kernels")
+    print("  ALPACCAROO_PURE=1 forces the standard-library backend")
+    print("  ALPACCAROO_SMALL_MATVEC_ELEMS re-tunes the quantized matvec crossover")
 
 
 def cmd_menu(_args) -> int:
     """Repo-owned local terminal app menu."""
     while True:
-        print("\nAlpacca\n")
+        print("\nAlpaccaroo\n")
         _print_installed_models()
         current = _read_default_model()
         print(f"\nCurrent chat model:\n  {_model_label(current)}\n")
         print("1. Chat with current or selected model")
-        print("2. Alpacca doctor")
-        print("3. Open Alpacca shell")
+        print("2. Alpaccaroo doctor")
+        print("3. Open Alpaccaroo shell")
         print("4. Model manager")
         print("5. Chat history")
         print("6. Saved chat statistics")
@@ -830,14 +830,14 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, ValueError):
                 pass
     ap = argparse.ArgumentParser(
-        prog="alpacca",
-        description="alpacca - LLMs in your terminal, implemented in pure Python",
+        prog="alpaccaroo",
+        description="alpaccaroo - LLMs in your terminal, implemented in pure Python",
         epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", "-v", action="version",
-                    version=f"alpacca {__version__}")
+                    version=f"alpaccaroo {__version__}")
     sub = ap.add_subparsers(dest="command", metavar="<command>")
 
-    p = sub.add_parser("pull", help="download a model into ~/.alpacca/models")
+    p = sub.add_parser("pull", help="download a model into ~/.alpaccaroo/models")
     p.add_argument("model")
     p.add_argument("--force", "-f", action="store_true")
     p.add_argument("--no-verify", action="store_true")
@@ -917,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
         print("", file=sys.stderr)
         return 130
     except (RuntimeError, ValueError, OSError) as e:
-        print(f"alpacca: error: {e}", file=sys.stderr)
+        print(f"alpaccaroo: error: {e}", file=sys.stderr)
         return 1
 
 
