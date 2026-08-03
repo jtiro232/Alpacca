@@ -1,16 +1,21 @@
-# Alpaccaroo round 5: validate and extend on a second machine
+# Alpaccaroo round 5: continue portable performance work on another PC
+
+This prompt is for a fresh Codex instance on a different PC. The mission is
+to improve Alpaccaroo2 into a broadly reliable, faster local inference
+engine. This is **not** a compare-and-contrast project between computers.
+Hardware differences are useful only because they expose which
+optimisations generalise, which must remain opt-in/tuned, and which should
+be discarded.
 
 Round 4 (`prompts/04-portable-performance.md`) built a measurement-driven
 performance architecture and characterised **one** machine: a
 bandwidth-starved, power-cycling Intel laptop sustaining 2.2-4.0 GB/s.
 Round 3 (`prompts/03-close-the-ollama-gap.md`) characterised a different
-one: an ALU-bound Ryzen sustaining 59-60 GB/s.
-
-Those two machines disagree about almost everything that matters, and
-several verdicts recorded as final in round 3 were decided by a ratio that
-does not hold in round 4's conditions. **This round exists to break the
-tie with data from a third set of conditions - yours - and to finish the
-work that was blocked on not having them.**
+one: an ALU-bound Ryzen sustaining 59-60 GB/s. Treat those results as
+constraints and prior evidence, not as the thing you are trying to
+recreate. Use this PC to validate the current defaults, find portable
+improvements, and implement only changes that survive correctness and
+end-to-end measurement.
 
 The tools already exist. Do not rebuild them. Most of this round is
 running them, recording what they say, and acting only where the data
@@ -26,16 +31,46 @@ supports it.
    profiler field used below.
 
 If any of those three contradicts this plan, they were written against
-measurements and this plan was not. Trust them and say so in your log.
+measurements and this plan was not. Trust them unless the current code or
+new measurements prove they have gone stale; if that happens, state the
+discrepancy in `prompts/05-RESULTS.md` before acting on it.
 
 ## Bootstrap
+
+Start from a clean checkout or a new local branch. Do not overwrite an
+existing dirty worktree.
 
 ```sh
 git clone https://github.com/jtiro232/Alpacca.git
 cd Alpacca
-git checkout Alpacaroo2
+git checkout Alpaccaroo2
 python -m pip install ".[kernels]"     # numpy + the PINNED numba==0.65.1
+```
+
+The branch is `Alpaccaroo2` - two `c`s, matching the project name. If it is
+not present, list remote branches (`git ls-remote --heads origin`) and use
+the one carrying the round-4 performance work; do not silently fall back to
+`main`, and do not use `Alpaccaroo` (no `2`), which is its stale parent.
+
+Run the smoke suite before measuring:
+
+```sh
 python tests/smoke.py                  # must print "all NNN checks passed"
+```
+
+On Windows, if the suite reaches tokenizer checks and fails with a
+`UnicodeEncodeError` while printing labels, rerun it with temporary UTF-8
+mode instead of changing code:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+python tests\smoke.py
+```
+
+On Linux/macOS, this is equivalent:
+
+```sh
+PYTHONUTF8=1 python tests/smoke.py
 ```
 
 The pin is not advisory: a different Numba deactivates the kernels and
@@ -56,27 +91,31 @@ Nothing in this plan is meaningful without this. Run it, save it, and put
 it at the top of your results log:
 
 ```sh
+git status --short --branch                         # exact branch and cleanliness
 alpaccaroo doctor                                   # cpu, features, cores, BLAS threads
 alpaccaroo bench --model <model> --stability        # does it hold its clocks?
 alpaccaroo tune --asm                               # what the kernels compiled to
 alpaccaroo tune -m <model>                          # best thread count for these shapes
 ```
 
-The stability spread decides your entire method:
+The stability spread decides how cautious your method must be:
 
-- **spread < 1.3** - this machine holds its clocks. Single-shot A/B is
-  meaningful. You are in a better position than round 4 was and should say
-  so loudly, because several of its questions are only answerable here.
-- **spread >= 1.3** - single runs are worthless. Every A/B must go through
-  `alpaccaroo.bench.paired_compare` (ABBA round-robin + sign test). Round 4
-  measured the *opposite winner* for one shape depending on whether the
-  comparison was paired.
+- **spread < 1.3** - this machine holds its clocks well enough that short
+  exploratory timing is useful. Still use paired A/B plus a sign test before
+  changing a default.
+- **spread >= 1.3** - single runs are not decision-quality. Every A/B must
+  go through `alpaccaroo.bench.paired_compare` (ABBA round-robin + sign
+  test). Round 4 measured the *opposite winner* for one shape depending on
+  whether the comparison was paired.
 
 ## Non-negotiable constraints (inherited, still binding)
 
 - Keep the pure Python / NumPy / Numba / GPU tiering intact.
 - Every optimisation must be measurable and disableable by an env var.
 - Prefer runtime capability detection over machine-specific branches.
+- Do not turn the work into a report comparing PCs. Benchmarks are
+  evidence used to decide what Alpaccaroo2 should do by default, by
+  autotune, or behind a flag.
 - Do not tune the project around **your** machine either. Two machines'
   worth of over-fitting is what this round is correcting.
 - Kernel changes must be **bit-identical by construction** where possible -
@@ -87,6 +126,9 @@ The stability spread decides your entire method:
 - Do not merge anything that is faster per call and unmeasured per token.
   Round 4 shipped exactly one such change and it lost 22 of 25 end-to-end
   rounds.
+- Do not push, publish, or otherwise change remotes unless the user
+  explicitly authorises that in the fresh instance. Local commits are fine
+  when they make the work reviewable.
 
 ## Work packages
 
@@ -96,47 +138,59 @@ replace.
 
 ### Package G - the benchmark matrix (highest value, lowest risk)
 
-The harness exists and has never been pointed at anything but one laptop
-and one model.
+The harness exists, but the cross-device data needed to choose safe
+defaults is still incomplete. The goal is not to crown one machine faster
+than another; the goal is to discover which defaults, tuning rules, and
+fallbacks improve Alpaccaroo2 across realistic hardware.
 
 Deliverables:
-- `alpaccaroo bench --json` output for every model size you can run
-  (~1B, ~3B, ~8B), all four named prompt shapes, contexts 2048/4096/8192,
-  cold and warm.
-- The same for at least one quantization other than Q4_K_M - Q5_K_M or
-  Q4_K_S (whose attn_v is Q5_K) or an F16/F32 dense build.
+- `alpaccaroo bench --json` output for every model size this PC can run
+  safely (~1B, ~3B, ~8B), using the named prompt shapes and context windows
+  that fit in RAM/VRAM. Prefer 2048/4096/8192, but record skipped cases
+  instead of forcing a machine into swap or thermal collapse.
+- The same for at least one quantization other than Q4_K_M when practical -
+  Q5_K_M, Q4_K_S (whose attn_v is Q5_K), or an F16/F32 dense build. If the
+  machine cannot run those safely, log that as a capacity boundary.
 - A `--stability` record beside the numbers.
 - Results committed to `prompts/05-RESULTS.md`.
 
 Acceptance criteria:
 - Every row carries its environment block (the JSON does this for you).
 - Cold and warm are never quoted as one another.
-- Where your numbers contradict round 3 or 4, the contradiction is stated
-  plainly with both machines' conditions, not averaged away.
+- Where your numbers contradict round 3 or 4, the contradiction is used to
+  decide whether the behaviour should be a default, an autotuned choice, an
+  env-flagged option, or discarded. Do not average contradictory machines
+  into one vague conclusion.
 
-### Package H - answer the two open questions
+### Package H - reduce the two open uncertainties
 
 Both were blocked on round 4's machine being unable to measure reliably.
-If your Step 0 spread is < 1.3, you can settle them.
+If your Step 0 spread is < 1.3, you can produce decision-quality evidence
+for this class of machine. One PC does **not** settle a global default by
+itself; it can justify an autotuned rule, an env-flagged path, or a follow-up
+matrix requirement.
 
 **H1. Why did the narrow activation-quantization threshold regress?**
 `ALPACCAROO_SERIAL_QUANTIZE_COLS` wins 6-10% per call and lost 22/25
 end-to-end rounds. The obvious cause - thread-pool resizes - was probed
 directly and measured to cost nothing. Reproduce the A/B here
 (`prompts/04-RESULTS.md` NEGATIVE 1 has the method). Either explain it, or
-confirm it is specific to round 4's machine and can be enabled on yours.
+show that it is safe only when the tuner selects it. Do not enable it
+globally from one machine's win.
 
 **H2. Should the kernels use 512-bit registers?** `alpaccaroo tune --asm`
 on round 4's Tiger Lake shows `vpdpwssd` on 256-bit `ymm` and never `zmm`.
 On a downclocking part that is plausibly correct. On a part that sustains
-AVX-512 clocks it may be leaving throughput unused.
+AVX-512 clocks it may be leaving throughput unused. If this CPU has no
+AVX-512/VNNI path, record that and do not pursue this package here.
 
 Acceptance criteria:
 - H1: a mechanism supported by a direct measurement, or a documented
-  "machine-specific, enabled/disabled on class X" with the data.
-- H2: an asm census from your CPU, plus - only if it shows a gap - a
-  measured attempt at raising the vector width, kept only if it wins
-  end-to-end.
+  "safe only when tuning selects it" result with the data. Do not make it a
+  global default from one PC.
+- H2: an asm census from your CPU, plus - only if it shows a plausible and
+  controllable gap - a measured attempt at raising the vector width, kept
+  only if it wins end-to-end.
 
 ### Package I - Q6_K 6-bit packing, re-measured before implemented
 
@@ -146,9 +200,10 @@ cancelling the bandwidth saving - and that verdict is correct at that
 machine's 59-60 GB/s. Round 4's machine sustains 2.2-4.0 GB/s with
 comparable per-core ALU, which inverts the ratio the verdict rested on.
 
-The prize is real where bandwidth binds: Q6_K carries ~31% of a Q4_K_M 3B's
-weights at 1.066 B/weight against 0.82 achievable, so ~10% of the bytes a
-token touches.
+The hypothesis is worth testing where bandwidth binds: Q6_K carries ~31%
+of a Q4_K_M 3B's weights at 1.066 B/weight against 0.82 achievable, so the
+upper bound is roughly 10% of the bytes a token touches. That is not a
+speedup claim until the packed path wins end-to-end.
 
 Deliverables, **in this order**:
 1. A microbenchmark of the packed vs unpacked Q6_K kernel on **your**
@@ -158,7 +213,8 @@ Deliverables, **in this order**:
 
 Acceptance criteria:
 - Step 1 is logged whether or not step 2 happens. A reproduced negative on
-  a third machine is a valuable result and closes the avenue for good.
+  another machine is a valuable result and should stop this branch from
+  spending more time here unless a future toolchain changes the codegen.
 - If implemented: bit-identical or differentially proven, flag-disableable,
   and a measured end-to-end win with a sign test.
 
@@ -188,8 +244,9 @@ Package D fuses the Q4_K+Q6_K pairing a **Q4_K_M** file produces. A
 per-matrix dispatch, getting nothing.
 
 Deliverables:
-- A `_matvec_q4k_q5k_pair` kernel alongside the existing one, mechanically
-  derived from it with the Q5_K branch substituted.
+- A `_matvec_q4k_q5k_pair` kernel alongside the existing one. It is expected
+  to be close to the Q4_K+Q6_K pair kernel, but do not assume a textual copy
+  is correct; use the existing Q5_K exactness checks as the oracle.
 - Dispatch via `tensor._pair_indices`, which already refuses unknown
   pairings safely - so the current fallback is correct and the change is
   additive.
@@ -217,11 +274,34 @@ Acceptance criteria:
 - Any GPU-path defect found is fixed or documented, not worked around by
   disabling CPU features.
 
+### Package M - practical user workflow, not just kernel speed
+
+The user-visible problem is not only tokens/second. On machines where model
+load is 30-50 seconds, short prompts feel slow even when decode is
+unchanged. Round 4 added `alpaccaroo run <model> --connect` so one-shot CLI
+calls can stream through an already-running `alpaccaroo serve`.
+
+Deliverables:
+- Start `alpaccaroo serve` with one real installed model.
+- Run `alpaccaroo run <model> --connect "short prompt"` against it.
+- Record whether it avoids reload, streams correctly, and fails back to
+  local loading when no server answers.
+- If the workflow is confusing, fix the smallest code or documentation
+  surface that makes the intended resident workflow obvious, then test the
+  fallback path.
+
+Acceptance criteria:
+- The one-shot CLI remains unchanged unless `--connect` is requested.
+- Any reported speedup separates load avoidance from decode throughput.
+- The result is written as a user-facing workflow finding in
+  `prompts/05-RESULTS.md`.
+
 ## Correctness requirements
 
 Unchanged from round 4, and all currently green:
 
-- `python tests/smoke.py` passes (544 checks as of `af5a48d`).
+- `python tests/smoke.py` passes; the current suite prints at least 544
+  checks on this branch, and the exact count may increase.
 - Greedy output is character-identical with the profiler on and off.
 - Quantized/dense parity, JSON-only generation, chat templates, model store
   compatibility, and Windows **and** Linux importability all hold.
@@ -233,7 +313,11 @@ Unchanged from round 4, and all currently green:
 
 - Do not re-derive a measured negative. `03-RESULTS.md` and
   `04-RESULTS.md` list them with numbers; check both before starting.
-- Do not trust a single-shot A/B unless Step 0 showed a spread < 1.3.
+- Do not turn the deliverable into "which computer is better." Use hardware
+  variation to make Alpaccaroo2 better.
+- Do not use a single-shot A/B to change defaults. If Step 0 showed spread
+  < 1.3, single shots are only for exploration; decisions still need paired
+  end-to-end measurement.
 - Do not quote a per-call speedup as a per-token speedup.
 - Do not tune defaults to your machine. Defaults must be safe on unknown
   hardware; measured per-machine values belong in the `alpaccaroo tune`
@@ -241,6 +325,8 @@ Unchanged from round 4, and all currently green:
 - Do not remove fallback paths to chase a benchmark.
 - Do not hard-code device names, core counts, or OS branches outside
   `_platform.py`.
+- Do not push to GitHub, create releases, or edit remote repository state
+  unless the user explicitly asks for it in that instance.
 
 ## Recommended order of work
 
@@ -251,6 +337,7 @@ Unchanged from round 4, and all currently green:
 5. Package I - microbenchmark first, implement only on a win.
 6. Package K - additive and bounded.
 7. Package L - if you have the hardware.
+8. Package M - validate the practical resident-server workflow.
 
 ## Deliverable
 
@@ -260,4 +347,10 @@ discarded - written as work happens rather than at the end, opening with
 this machine's Step 0 characterisation so every number below it can be
 read in context.
 
-Commit and push to `Alpacaroo2` (or a branch from it) as work completes.
+If benchmark JSON/CSV/asm artifacts are small enough to review, keep them
+under a machine-named subfolder such as `prompts/05-artifacts/<machine>/`
+and link them from `prompts/05-RESULTS.md`. If an artifact is too large,
+record the command, the summary table, and where the local file lives.
+
+Commit locally to `Alpaccaroo2` or a branch from it as work becomes
+reviewable. Push only after explicit user approval.
