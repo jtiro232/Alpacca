@@ -2762,6 +2762,50 @@ def main() -> None:
         check("ALPACCAROO_AUTOTUNE=1 never benchmarks during a normal run",
               "tokens," in r.stderr and "per-token matvec cost" not in r.stderr,
               r.stderr[-400:])
+        r = run_cli("tune", "--asm", env=env, expect=None)
+        check("tune --asm reports what the kernels compiled to on this cpu",
+              "instruction census" in r.stdout
+              or "nothing to tune" in (r.stdout + r.stderr)
+              or "not been compiled" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-400:])
+
+        # ---- degraded tiers still work ------------------------------------
+        # Every optimization above must vanish cleanly when its foundation
+        # is missing, and the harness must keep reporting honestly.
+        nok_json = tmp / "bench-nokernels.json"
+        run_cli("bench", "--model", "tiny", "--prefill", "8", "--decode", "2",
+                "--json", str(nok_json),
+                env={**env, "ALPACCAROO_KERNELS": "0"})
+        nok = json.loads(nok_json.read_text(encoding="utf-8"))
+        check("everything degrades cleanly with the JIT kernels disabled",
+              not nok["runtime"]["kernels_active"]
+              and not nok["runtime"]["int_dot_enabled"]
+              and all("numba" not in (rec["paths"] or "")
+                      for rec in nok["records"])
+              and all(rec["decode_tok_per_s"] > 0 for rec in nok["records"]),
+              json.dumps(nok["records"][0])[:400])
+        pure_bench = tmp / "bench-pure.json"
+        run_cli("bench", "--model", "tiny", "--prefill", "8", "--decode", "2",
+                "--json", str(pure_bench),
+                env={**env, "ALPACCAROO_PURE": "1"})
+        pb = json.loads(pure_bench.read_text(encoding="utf-8"))
+        check("everything degrades cleanly with NumPy disabled",
+              pb["runtime"]["backend"] == "pure-python"
+              and all("pure-python" in (rec["paths"] or "")
+                      for rec in pb["records"])
+              and all(rec["decode_tok_per_s"] > 0 for rec in pb["records"]),
+              json.dumps(pb["records"][0])[:400])
+        # the new dispatch knobs must not change what a degraded tier emits
+        base = run_cli("run", "tiny", "narrow", "-n", "8", "--temp", "0",
+                       "--seed", "5", env=env)
+        for label, extra in (("serial dispatch", {"ALPACCAROO_SERIAL_MATVEC_ELEMS": str(1 << 40)}),
+                             ("grouped kernel off", {"ALPACCAROO_GROUP_KERNEL": "0"}),
+                             ("int-dot off", {"ALPACCAROO_INT_DOT": "0"})):
+            alt = run_cli("run", "tiny", "narrow", "-n", "8", "--temp", "0",
+                          "--seed", "5", env={**env, **extra})
+            check(f"greedy output is unchanged with {label}",
+                  alt.stdout == base.stdout,
+                  f"{base.stdout!r} vs {alt.stdout!r}")
 
         from alpaccaroo import profiling as _profiling
         check("every reported path label is a known one",
@@ -2993,6 +3037,43 @@ def main() -> None:
         try:
             with urllib.request.urlopen(base + "/health", timeout=10) as resp:
                 check("serve /health", json.loads(resp.read())["status"] == "ok")
+
+            # ---- CLI -> resident server reconnect (Track 6) --------------
+            # Loading a 3B takes 30-49s against ~1s per token, so skipping
+            # the load is worth more than any decode change. Opt-in, and it
+            # must fall back rather than fail when nothing is listening.
+            from alpaccaroo import client as _client
+            probed = _client.probe(base)
+            check("client probes a running server for its model",
+                  probed is not None and probed["model"],
+                  str(probed))
+            r = run_cli("run", "tiny", "hello there", "--connect", base,
+                        "-n", "6", "--temp", "0", env=env)
+            check("run --connect answers without loading a model",
+                  "connected to" in r.stderr
+                  and "chunks in" in r.stderr
+                  and "loading" not in r.stderr,
+                  (r.stdout + r.stderr)[-400:])
+            # a dead address must degrade to a local load, not an error
+            dead = "http://127.0.0.1:9"
+            check("probing a dead address returns None quickly",
+                  _client.probe(dead, timeout=2.0) is None)
+            r = run_cli("run", "tiny", "hi", "--connect", dead, "-n", "4",
+                        "--temp", "0", env=env)
+            check("run --connect falls back to a local load",
+                  "no server answering" in r.stderr and "tokens," in r.stderr,
+                  (r.stdout + r.stderr)[-400:])
+            old_port = os.environ.get("ALPACCAROO_PORT")
+            os.environ["ALPACCAROO_PORT"] = str(sport)
+            try:
+                check("the default connect url follows the serve env vars",
+                      _client.default_url().endswith(f":{sport}"),
+                      _client.default_url())
+            finally:
+                if old_port is None:
+                    os.environ.pop("ALPACCAROO_PORT", None)
+                else:
+                    os.environ["ALPACCAROO_PORT"] = old_port
             req = urllib.request.Request(
                 base + "/v1/chat/completions",
                 data=json.dumps({"messages": [{"role": "user", "content": "hi"}],

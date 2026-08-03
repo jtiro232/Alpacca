@@ -178,7 +178,7 @@ Every optimization here is measurable and disableable.
 | `ALPACCAROO_THREADS` | kernel pool size. **Wins over everything**, including autotuning. |
 | `ALPACCAROO_AUTOTUNE=1` | apply a cached `alpaccaroo tune` result at load. Never benchmarks. |
 | `ALPACCAROO_SERIAL_MATVEC_ELEMS` | weight count at or below which a matvec runs on one thread (default 131072) |
-| `ALPACCAROO_SERIAL_QUANTIZE_COLS` | column count at or below which activation quantization runs on one thread (default 8192) |
+| `ALPACCAROO_SERIAL_QUANTIZE_COLS` | column count at or below which activation quantization runs on one thread. **Default 0 (off)** - see section 5, it wins per call and loses end to end |
 | `ALPACCAROO_GROUP_KERNEL=0` | disable the grouped Q4_K+Q6_K kernel |
 | `ALPACCAROO_KERNELS=0` | disable the JIT kernels entirely |
 | `ALPACCAROO_INT_DOT=0` | keep the kernels, revert to f32-scale storage |
@@ -239,16 +239,28 @@ that moment, not that machine.
 Decode speed is not the whole of perceived speed. A one-shot
 `alpaccaroo run` pays process startup, imports, model load, JIT
 cache-load and prompt setup before the first token; on the reference
-laptop that is ~30 s of load against a 1264 ms token. Keeping the model
-resident removes all of it from every turn after the first:
+laptop that is 30-49 s of load against a ~1 s token, so **more than half
+the wall clock of a short answer is load**. Keeping the model resident
+removes all of it from every turn after the first:
 
 ```powershell
 alpaccaroo serve qwen3bmed --port 8080   # OpenAI- and Ollama-compatible API
 alpaccaroo run qwen3bmed                 # interactive: one load, many turns
+alpaccaroo run qwen3bmed --connect       # use a server that is already up
+alpaccaroo run qwen3bmed --connect http://host:9000 "why is the sky blue?"
 ```
 
+`--connect` is the fast reconnect: it probes `/health`, streams through the
+server's OpenAI-compatible endpoint, and **loads the model locally instead
+if nothing answers** - so it is opt-in, never mandatory, and the one-shot
+CLI is unchanged for anyone who does not ask for it. With no URL it uses
+`$ALPACCAROO_HOST:$ALPACCAROO_PORT`, the same variables `serve` reads.
+
+Because the server streams text rather than token counts, `--connect`
+reports stream chunks per second rather than implying a tok/s it cannot
+observe.
+
 The `cold` and `warm` bench phases measure exactly these two workflows.
-Neither is mandatory and the one-shot CLI is unchanged.
 
 ---
 
@@ -391,6 +403,80 @@ shape class: 1 thread 724.3 ms, 2 threads 467.1 ms, **4 threads 199.6 ms**,
 1.00x. The existing default was already right on this machine, which is
 the result worth having from a tuner: confirmation, not a change.
 
+### The end-to-end check, and the one result that changed a default
+
+Every measurement above is per call. A decode token is 181 calls, and the
+two are not the same claim. So the whole loop was A/B'd in **one process**,
+from one loaded model and one KV state, 25 ABBA rounds, with the token ids
+compared as well as the times.
+
+The first attempt turned on everything at once - grouped kernel, narrow
+matvec dispatch, and narrow activation quantization at 8192 columns - and
+it lost **22 of 25 rounds**, median 1.20x. Under a null hypothesis of no
+effect, 3 wins out of 25 is not a wandering clock; it is a regression.
+
+Rerunning the identical A/B with only the activation-quantization
+threshold returned to 0 gave **14 of 25 rounds** and a median of 0.976 -
+noise, and the regression gone. The effect tracked that one setting.
+
+| configuration | rounds won by "on" | median ratio | ratio of medians |
+|---|---|---|---|
+| grouped kernel + narrow matvec + narrow quantize (8192) | 3 / 25 | 1.197 | 1.093 |
+| grouped kernel + narrow matvec, quantize threshold off | 14 / 25 | 0.976 | 0.853 |
+
+`ALPACCAROO_SERIAL_QUANTIZE_COLS` therefore ships at **0, disabled**,
+despite a clean 6-10% per-call win in isolation. The knob remains.
+
+**The mechanism is not established, and this document will not pretend
+otherwise.** The obvious suspect was the thread-pool resize the threshold
+forces about 216 times per token - a 2048-wide model quantizes below the
+threshold and then matvecs above it, three times per layer. A direct probe
+of exactly that (identical kernel work, with and without a resize between
+each pair) measured **no cost at all**: ratio 1.06, 11 of 25 rounds. So the
+empirical result stands and its cause does not. The next engineer should
+treat "resizing the pool is expensive" as *unsupported*, not as received
+wisdom.
+
+**The lesson, which is worth more than the 10%: a microbenchmark win is not
+an end-to-end win.** Validate whole-loop changes whole-loop, with a sign
+test - with a 2x spread the median is not enough, and 3 wins out of 25 is a
+result where 1.20x alone would have been a shrug.
+
+### Track 4: what these Python loops actually compile to
+
+```powershell
+alpaccaroo tune --asm                      # matvec_q4k_int by default
+alpaccaroo tune --asm matvec_q6k_int --json q6k.s
+```
+
+The plan asks what instructions the kernels become on a given CPU rather
+than assuming. Numba knows; `--asm` surfaces it with no build step, so an
+engineer on AMD Zen, on a machine without AVX-512, or on Linux rather than
+Windows can check whether the integer contraction the kernels depend on
+survived. On the reference machine, `matvec_q4k_int`:
+
+| instruction | count | meaning |
+|---|---|---|
+| `vpdpwssd` | 31 | AVX-512 VNNI int16 dot-product accumulate - the best case |
+| `vpmullw` | 32 | the 6-bit sub-scale premultiplied into the codes |
+| `vpmaddwd` | 1 | the non-VNNI fallback |
+| `vpmuldq` | **0** | no int64 promotion - the `np.int32(acc + ...)` idiom is holding |
+| `ymm` / `zmm` | 66 / **0** | 256-bit registers, **not** 512-bit |
+
+Two things worth carrying forward. The int32 re-cast idiom that
+`kernels.py` depends on is verifiably working - zero 64-bit lane
+multiplies. And LLVM is emitting the AVX-512 VNNI instruction on **256-bit
+ymm operands, never zmm**: a deliberate vector-width cap, and on a
+downclocking Tiger Lake part not obviously the wrong choice. It was not
+pursued here because this machine is bandwidth-bound, not
+instruction-bound - but on a part that sustains its AVX-512 clocks it is
+the first thing to re-measure.
+
+One trap, handled: numba refuses to disassemble code it loaded from its
+on-disk cache and returns an empty listing, which reads as "no SIMD at
+all". `--asm` points it at a fresh cache directory so the numbers are real,
+and says so explicitly if they still come back all-zero.
+
 ### What has not been measured
 
 One machine, one OS, one CPU vendor, three model sizes' worth of *shapes*
@@ -406,9 +492,15 @@ one table; nothing above should be read as characterising them.
 - **Measure before you optimise, and measure paired.** The profiler will
   tell you where the time is in one run. If `--stability` reports a spread
   above ~1.3, no single-shot A/B on that machine means anything.
+- **Then measure end to end, with a sign test.** Per-call wins do not add
+  up to a per-token win by default, and with a 2x spread the median lies.
+  Count rounds won: near half is noise, 3 out of 25 is a regression. This
+  is how the activation-quantization threshold was caught after it had
+  already passed its own benchmark.
 - **Prefer work reduction to cleverness.** The two changes that paid here
-  reduced dispatches and bytes touched. The one that did not pay (an
-  `argpartition`-based sampler) added a pass to save a copy.
+  reduced dispatches and bytes touched. The two that did not pay both added
+  something to save something: an `argpartition` pass to avoid a float64
+  copy, and a thread-pool resize to avoid a fan-out.
 - **Bit-identity is cheap to keep and expensive to lose.** Packages D and E
   are bit-identical *by construction*, because they change which thread
   computes a row rather than how a row is computed. Any future kernel

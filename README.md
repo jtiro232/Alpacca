@@ -204,11 +204,13 @@ renders such a conversation instead of rejecting it.
 
 > **Measuring your own machine:** `docs/PERFORMANCE.md` is the reference for
 > the profiler (`alpaccaroo run <model> --profile`), the benchmark harness
-> (`alpaccaroo bench`), the opt-in autotuner (`alpaccaroo tune`), every
-> environment knob, and the measured results behind them. Start there
-> before changing anything - it also documents *why* two separate timing
-> runs on a power-limited laptop cannot be compared, which is the mistake
-> that costs the most time.
+> (`alpaccaroo bench`), the opt-in autotuner (`alpaccaroo tune`), the
+> codegen inspector (`alpaccaroo tune --asm`), the resident-server
+> reconnect (`alpaccaroo run <model> --connect`), every environment knob,
+> and the measured results behind them. Start there before changing
+> anything - it also documents *why* two separate timing runs on a
+> power-limited laptop cannot be compared, which is the mistake that costs
+> the most time.
 
 This engine values clarity, auditability, and zero dependencies over raw
 speed. The NumPy path batches prompt prefill, reuses the KV cache for shared

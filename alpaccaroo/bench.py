@@ -306,11 +306,17 @@ def paired_compare(variants, rounds: int = 12, warmup: int = 2) -> dict:
         for _ in range(max(0, warmup)):
             fn()
     samples: dict[str, list] = {lbl: [] for lbl in labels}
-    for _ in range(max(1, rounds)):
-        for lbl, fn in zip(labels, fns):
+    order = list(range(len(labels)))
+    for r in range(max(1, rounds)):
+        # ABBA, not AABB: running the variants in a fixed order every round
+        # charges whichever goes first for whatever the round's first call
+        # costs - a cold branch predictor, a scheduler slice boundary - and
+        # that bias does not cancel however many rounds you add. Reversing
+        # on alternate rounds makes it cancel.
+        for i in (order if r % 2 == 0 else order[::-1]):
             t = time.perf_counter()
-            fn()
-            samples[lbl].append(time.perf_counter() - t)
+            fns[i]()
+            samples[labels[i]].append(time.perf_counter() - t)
 
     def stats(xs):
         s = sorted(xs)
@@ -323,12 +329,25 @@ def paired_compare(variants, rounds: int = 12, warmup: int = 2) -> dict:
     out["baseline"] = base
     ratios = {}
     for lbl in labels[1:]:
-        per_round = sorted(b / a if a > 0 else float("inf")
-                           for a, b in zip(samples[base], samples[lbl]))
+        paired = [b / a if a > 0 else float("inf")
+                  for a, b in zip(samples[base], samples[lbl])]
+        per_round = sorted(paired)
+        wins = sum(1 for v in paired if v < 1.0)
+        med_base = stats(samples[base])["median"]
+        med_lbl = stats(samples[lbl])["median"]
         ratios[lbl] = {
             "median_vs_baseline": per_round[len(per_round) // 2],
             "best_vs_baseline": per_round[0],
             "worst_vs_baseline": per_round[-1],
+            # the ratio of the medians and the median of the ratios agree
+            # when the pairing is working and diverge when it is not, so
+            # both are reported rather than whichever looks better
+            "median_ratio_of_medians": (med_lbl / med_base
+                                        if med_base > 0 else None),
+            # a sign test: with no real effect this lands near half the
+            # rounds, and a spread of 4x cannot hide a consistent winner
+            "rounds_won": wins,
+            "rounds": len(paired),
         }
     out["ratios"] = ratios
     return out

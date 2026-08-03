@@ -65,9 +65,36 @@ NARROW_BATCH = 8
 SERIAL_MATVEC_ELEMS_DEFAULT = 131072
 
 # Activation quantization is a parallel region over cols/256 blocks - eight
-# of them for a 2048-wide model, which is far too little work to repay a
-# fan-out. Same rule, its own knob, sized in columns.
-SERIAL_QUANTIZE_COLS_DEFAULT = 8192
+# of them for a 2048-wide model. Same rule as above, its own knob, sized in
+# columns because that is what the loop trips on. Paired measurement on the
+# same 4-core Tiger Lake, microseconds per call:
+#
+#     cols       512   1024   2048   4096   8192  11008  16384
+#     pool      19.5   34.7   35.0   44.3   89.3  119.2  135.1
+#     serial    16.6   38.1   29.5   40.5   84.9  113.6  161.0
+#     ratio     0.84   0.90   0.90   0.92   0.94   0.91   1.30
+#
+# Serial wins everywhere up to 11008 and loses at 16384, so in ISOLATION
+# the crossover on four cores is around 12k.
+#
+# It ships OFF anyway, and the reason is the most useful thing in this file.
+# Setting it to 8192 makes the per-call benchmark 6-10% better and made the
+# real decode loop worse: an end-to-end paired A/B on qwen2.5-3B (25 ABBA
+# rounds, one process, one KV state) lost 22 of 25 rounds at a median of
+# 1.20x. Rerunning the identical A/B with only this knob returned to 0 gave
+# 14 of 25 and a median of 0.976 - the regression tracked this setting.
+#
+# The mechanism is NOT established. The obvious suspect was the thread-pool
+# resize this forces ~216 times per token (a 2048-wide model quantizes
+# below the threshold and then matvecs above it, three times per layer),
+# but a direct probe - the same kernel work with and without a resize
+# between each pair - measured no cost at all (11/25 rounds, ratio 1.06).
+# So: the empirical result stands, its cause does not. Do not write a
+# confident explanation here until someone has one.
+#
+# Leave it at 0 unless you have re-measured END TO END with a sign test,
+# not per call. The knob stays because the isolated win is real.
+SERIAL_QUANTIZE_COLS_DEFAULT = 0
 
 _tuned_serial_elems: int | None = None   # set by tuning.apply_cached_thresholds
 
@@ -913,6 +940,63 @@ def matvec_q5k_int(qp, qh, sc, mn, dh, dmh, x, pre=None):
     _want(st, qp.shape[0] * qp.shape[1] * 2)
     return st["matvec_q5k_int"](qp, qh, sc, mn, dh, dmh, st["f16_lut"],
                                 xq, ascale, bsums)
+
+
+#: SIMD patterns worth looking for in a kernel's generated code, and what
+#: their presence or absence means. The integer kernels' whole premise is
+#: that LLVM contracts the int32 re-cast idiom into 16-bit multiply-add;
+#: if it does not on some host, that is the first thing to know.
+ASM_MARKERS = (
+    ("vpdpwssd", "AVX-512 VNNI int16 dot-product accumulate - the best case"),
+    ("vpdpbusd", "AVX-512/AVX VNNI int8 dot-product accumulate"),
+    ("vpmaddwd", "packed int16 multiply-add - the fallback the kernels rely on"),
+    ("vpmullw", "packed int16 multiply without the add - partial contraction"),
+    ("vfmadd", "float FMA - fine for the f32-scale kernels, wrong for the int ones"),
+    ("vpmuldq", "64-bit lane multiply - the int64 promotion the kernels exist to avoid"),
+    ("zmm", "512-bit registers"),
+    ("ymm", "256-bit registers"),
+)
+
+
+def kernel_names() -> list:
+    """Compiled kernels available to :func:`inspect_asm`."""
+    st = _init()
+    if not st:
+        return []
+    return sorted(k for k, v in st.items() if hasattr(v, "inspect_asm"))
+
+
+def inspect_asm(name: str) -> dict:
+    """Host assembly for one compiled kernel, plus a SIMD-pattern census.
+
+    PERFORMANCE_PLAN Track 4 asks what instructions these Python loops
+    actually become on a given CPU. Numba knows; this surfaces it without
+    a build step, so a future engineer on AMD Zen, on a machine without
+    AVX-512, or on Linux rather than Windows can check whether the integer
+    contraction the kernels depend on survived - rather than assume it did.
+
+    Returns {"name", "signatures", "counts", "asm"} or {"error"}.
+    """
+    st = _init()
+    if not st:
+        return {"error": "kernels inactive"}
+    fn = st.get(name)
+    if fn is None or not hasattr(fn, "inspect_asm"):
+        return {"error": f"no compiled kernel named {name!r}; "
+                         f"try one of {', '.join(kernel_names())}"}
+    try:
+        asm_map = fn.inspect_asm()
+    except Exception as e:  # pragma: no cover - numba internals
+        return {"error": f"{type(e).__name__}: {e}"}
+    if not asm_map:
+        return {"error": f"{name} has not been compiled yet - "
+                         f"call kernels.warmup() first"}
+    text = "\n".join(str(v) for v in asm_map.values())
+    counts = {marker: text.count(marker) for marker, _why in ASM_MARKERS}
+    return {"name": name,
+            "signatures": [str(k) for k in asm_map],
+            "counts": counts,
+            "asm": text}
 
 
 def group_kernel_enabled() -> bool:

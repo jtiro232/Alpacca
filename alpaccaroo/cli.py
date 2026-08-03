@@ -28,6 +28,9 @@ examples:
   alpaccaroo run llama3.2:1b "why is the sky blue?" # one-shot
   alpaccaroo history list                           # list saved chats
   alpaccaroo serve llama3.2:1b --port 8080          # OpenAI-compatible API
+  alpaccaroo run llama3.2:1b --connect              # reuse that server, no load
+  alpaccaroo run llama3.2:1b --profile              # where each token's time goes
+  alpaccaroo bench --model llama3.2:1b              # cold/warm prefill+decode
 """
 
 
@@ -328,6 +331,21 @@ def cmd_show(args) -> int:
 
 
 def cmd_run(args) -> int:
+    # Track 6: a resident server already holds this model, and skipping the
+    # load is worth more than any decode change on a machine where loading
+    # a 3B takes 30-49 s against ~1 s per token. Opt-in, and it falls back
+    # to loading locally rather than failing, so the one-shot CLI is
+    # unchanged for everyone who does not ask for this.
+    if getattr(args, "connect", None) is not None:
+        from . import client
+        url = args.connect or client.default_url()
+        info = client.probe(url)
+        if info is not None:
+            return client.run_connected(url, info, args, _sampler_params(args))
+        print(f"alpaccaroo: no server answering at {url}; loading the model "
+              f"here instead (start one with `alpaccaroo serve {args.model}`)",
+              file=sys.stderr)
+
     local, model_name = _resolve_or_pull(args.model)
     _apply_manifest_defaults(local, args)
     profiler = _profile_begin(args)
@@ -430,6 +448,16 @@ def cmd_tune(args) -> int:
     """
     import json
 
+    if args.asm is not None and not os.environ.get("NUMBA_CACHE_DIR"):
+        # Numba refuses to disassemble code it loaded from its on-disk
+        # cache ("Inspection disabled for cached code") and hands back an
+        # empty listing, which reads as "no SIMD at all". Pointing it at a
+        # fresh cache directory forces a real compile in this process. Must
+        # happen before anything imports numba, which is why the --asm
+        # branch is handled ahead of the availability check below.
+        import tempfile
+        os.environ["NUMBA_CACHE_DIR"] = tempfile.mkdtemp(prefix="alpaccaroo-asm-")
+
     from . import kernels, tuning
     if not kernels.available():
         print(f"alpaccaroo tune: {kernels.status()} - there is nothing to "
@@ -465,6 +493,36 @@ def cmd_tune(args) -> int:
             print(f"  narrow-matrix threshold: "
                   f"{cached['serial_matvec_elements']} weights")
         print("re-run with --force to measure again")
+        return 0
+
+    if args.asm is not None:
+        kernels.warmup()
+        target = args.asm or "matvec_q4k_int"
+        res = kernels.inspect_asm(target)
+        if "error" in res:
+            print(f"alpaccaroo tune: {res['error']}", file=sys.stderr)
+            return 1
+        from .profiling import cpu_features
+        cpu = cpu_features()
+        print(f"kernel:  {res['name']}")
+        print(f"cpu:     {cpu.get('model')} "
+              f"[{', '.join(cpu.get('features') or []) or 'none detected'}]")
+        print(f"signatures: {len(res['signatures'])}")
+        print("\ninstruction census (what these Python loops became here):")
+        for marker, why in kernels.ASM_MARKERS:
+            n = res["counts"].get(marker, 0)
+            print(f"  {marker:<12} {n:>6}   {why}")
+        if not any(res["counts"].values()):
+            print("\nEvery count is zero, which means the listing is empty "
+                  "rather than the codegen being scalar - numba returns a "
+                  "placeholder for code it loaded from its cache. Retry in a "
+                  "shell with NUMBA_CACHE_DIR pointing at an empty directory.",
+                  file=sys.stderr)
+        if args.json:
+            Path(args.json).write_text(res["asm"], encoding="utf-8")
+            print(f"\nfull assembly written to {args.json}")
+        else:
+            print("\npass --json PATH to dump the full assembly")
         return 0
 
     if args.crossover:
@@ -821,6 +879,7 @@ def _print_controls() -> None:
     print("  alpaccaroo pull <model>")
     print("  alpaccaroo nickname <model> <nickname>  |  alpaccaroo nickname --list")
     print("  alpaccaroo run <model-or-nickname> [prompt text]")
+    print("  alpaccaroo run <model> --connect [URL]  # use a resident server")
     print("  alpaccaroo serve <model-or-nickname> [--host HOST] [--port PORT]")
     print("  alpaccaroo history list|show|stats|rm|clear --yes")
     print("  alpaccaroo show <model> [--metadata]")
@@ -833,6 +892,7 @@ def _print_controls() -> None:
     print("  alpaccaroo bench --model <model>        # cold/warm prefill+decode")
     print("  alpaccaroo bench --model <model> --json b.json --csv b.csv")
     print("  alpaccaroo tune -m <model>              # measure this machine once")
+    print("  alpaccaroo tune --asm                   # what the kernels compiled to")
     print("\nInteractive chat:")
     print("  Esc or /exit returns to the menu/caller")
     print("  /clear resets the current conversation")
@@ -1039,6 +1099,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("run", help="chat with a model (one-shot if a prompt is given)")
     p.add_argument("model")
     p.add_argument("prompt", nargs="*")
+    p.add_argument("--connect", nargs="?", const="", metavar="URL",
+                   help="use a running `alpaccaroo serve` instead of loading "
+                        "the model (default: $ALPACCAROO_HOST:$ALPACCAROO_PORT "
+                        "or http://127.0.0.1:8080); falls back to a local "
+                        "load if nothing answers")
     _add_model_flags(p)
     p.set_defaults(func=cmd_run)
 
@@ -1113,6 +1178,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--crossover", action="store_true",
                    help="measure the narrow-matrix serial/parallel threshold "
                         "instead of the thread count")
+    p.add_argument("--asm", nargs="?", const="", metavar="KERNEL",
+                   help="show which SIMD instructions a kernel compiled to "
+                        "on this CPU (default: matvec_q4k_int); --json dumps "
+                        "the full assembly")
     p.add_argument("--force", action="store_true",
                    help="re-measure even when a valid cached result exists")
     p.add_argument("--json", metavar="PATH", default=None)
