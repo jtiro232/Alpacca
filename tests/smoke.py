@@ -885,17 +885,84 @@ def main() -> None:
                       not AK.group_kernel_enabled())
             finally:
                 os.environ.pop("ALPACCAROO_GROUP_KERNEL", None)
+            # ---- grouped Q4_K+Q5_K kernel (Package K) --------------------
+            # The same group out of a Q4_K_S file, which stores attn_v as
+            # Q5_K instead of Q6_K and therefore used to fall through to
+            # per-matrix dispatch. Same bar as Package D: the per-row math
+            # is the per-matrix kernels' own, so bit-identical, not close.
+            g5 = QuantMatrix(q5_k_bytes(5 * 512), "Q5_K", 5, 512)
+            os.environ["ALPACCAROO_GROUP_KERNEL"] = "0"
+            try:
+                sep5 = [np.asarray(v).copy()
+                        for v in T.matvec_group([g4, g5], gx)]
+            finally:
+                os.environ.pop("ALPACCAROO_GROUP_KERNEL", None)
+            grp5 = [np.asarray(v).copy() for v in T.matvec_group([g4, g5], gx)]
+            check("grouped Q4_K+Q5_K kernel matches the per-matrix path exactly",
+                  all(np.array_equal(a, b) for a, b in zip(sep5, grp5))
+                  and np.any(sep5[0] != 0) and np.any(sep5[1] != 0),
+                  f"maxdiff {max(float(np.abs(a - b).max()) for a, b in zip(sep5, grp5)):.3e}")
+            # the Q5_K half must be the Q5_K kernel's own answer, not the
+            # Q4_K branch run over the wrong plane - a textual copy of the
+            # pair kernel with the fifth-bit plane dropped still returns
+            # plausible numbers, and only this comparison catches it
+            check("the grouped Q4_K+Q5_K halves match their solo kernels",
+                  np.array_equal(grp5[0], np.asarray(g4.matvec(gx)))
+                  and np.array_equal(grp5[1], np.asarray(g5.matvec(gx))))
+            # order independence: attn_v is not always last in the group
+            rev5 = [np.asarray(v).copy() for v in T.matvec_group([g5, g4], gx)]
+            check("the grouped Q4_K+Q5_K kernel is order-independent",
+                  np.array_equal(rev5[0], grp5[1])
+                  and np.array_equal(rev5[1], grp5[0]))
+
             # shape gating: a pairing the kernel was not compiled for must
             # take the per-matrix path rather than be forced into it
-            g5 = QuantMatrix(q5_k_bytes(5 * 512), "Q5_K", 5, 512)
-            check("only the compiled dtype pairing takes the grouped kernel",
-                  T._pair_indices([g4, g6], [True, True]) == (0, 1)
-                  and T._pair_indices([g4, g5], [True, True]) is None
+            check("only the compiled dtype pairings take the grouped kernel",
+                  T._pair_indices([g4, g6], [True, True]) == (0, 1, "q6k_int")
+                  and T._pair_indices([g4, g5], [True, True]) == (0, 1, "q5k_int")
+                  and T._pair_indices([g5, g4], [True, True]) == (1, 0, "q5k_int")
                   and T._pair_indices([g4, g6, g6], [True] * 3) is None
+                  and T._pair_indices([g4, g5, g5], [True] * 3) is None
+                  and T._pair_indices([g4, g5, g6], [True] * 3) is None
+                  and T._pair_indices([g5, g6], [True, True]) is None
                   and T._pair_indices([g4], [True]) is None)
             wide6 = QuantMatrix(q6_k_bytes(5 * 1024), "Q6_K", 5, 1024)
+            wide5 = QuantMatrix(q5_k_bytes(5 * 1024), "Q5_K", 5, 1024)
             check("a width mismatch never reaches the grouped kernel",
-                  T._pair_indices([g4, wide6], [True, True]) is None)
+                  T._pair_indices([g4, wide6], [True, True]) is None
+                  and T._pair_indices([g4, wide5], [True, True]) is None)
+
+            # ---- warmup must leave nothing to compile in-token -----------
+            # Package D added _matvec_q4k_q6k_pair without a warmup() entry,
+            # so on a cold Numba cache it compiled lazily inside the FIRST
+            # DECODE TOKEN of any Q4_K_M model. Measured round 5 on
+            # qwen2.5-3B Q4_K_M: one token at 1865.4 ms against a 91.3 ms
+            # warm worst case - and p50 did not move (82.0 vs 83.0), because
+            # one slow token cannot shift a median, so only the mean-based
+            # decode tok/s showed it (7.24 vs 12.12).
+            #
+            # This pins the PROPERTY, not that one kernel: every compiled
+            # dispatcher reachable from _state must have a signature after
+            # warmup(). A kernel added without a warmup line fails here
+            # rather than in a user's first token. It runs in a fresh
+            # interpreter so that work done earlier in this suite cannot
+            # compile a kernel warmup() forgot and hide the defect.
+            probe = (
+                "import alpaccaroo.kernels as K\n"
+                "st = K._init()\n"
+                "assert st, 'kernels inactive'\n"
+                "K.warmup()\n"
+                "bad = sorted(n for n, v in st.items()\n"
+                "             if hasattr(v, 'signatures') and not v.signatures)\n"
+                "print(','.join(bad))\n"
+            )
+            _pr = subprocess.run([sys.executable, "-c", probe],
+                                 capture_output=True, text=True,
+                                 cwd=str(REPO))
+            check("warmup compiles every kernel, so no first token pays a JIT",
+                  _pr.returncode == 0 and _pr.stdout.strip() == "",
+                  f"rc={_pr.returncode} uncompiled={_pr.stdout.strip()!r} "
+                  f"{_pr.stderr[-300:]}")
 
             # ---- narrow-matrix dispatch + autotuning (Packages E, F) -----
             from alpaccaroo import tuning as ATune
@@ -1451,6 +1518,63 @@ def main() -> None:
                 os.environ.pop("ALPACCAROO_HOME", None)
             else:
                 os.environ["ALPACCAROO_HOME"] = nick_home
+
+        # ---- the pre-rebrand model store is still readable -----------------
+        # The alpacca -> alpaccaroo rename moved models_root(). Without a
+        # fallback an upgrading user's models go invisible and re-download,
+        # which is what happened on the round-5 machine before this existed.
+        import alpaccaroo.store as _store
+        legacy_home = tmp / "legacy-home"
+        legacy_dir = (legacy_home / ".alpacca" / "models" / "ollama"
+                      / "library" / "ghost" / "1b")
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "model.gguf").write_bytes(b"not a real gguf")
+        (legacy_dir / "manifest.json").write_text(json.dumps(
+            {"name": "ghost:1b", "source": "ollama", "model_file": "model.gguf",
+             "size": 15, "pulled_at": "2026-01-01T00:00:00Z"}), "utf-8")
+        (legacy_home / ".alpaccaroo" / "models").mkdir(parents=True)
+        saved_home_fn = _store.Path.home
+        saved_env = os.environ.get("ALPACCAROO_HOME")
+        try:
+            os.environ.pop("ALPACCAROO_HOME", None)
+            _store.Path.home = staticmethod(lambda: legacy_home)
+            ref = _store.parse_model_ref("ghost:1b")
+            found = _store.find_local(ref)
+            listed = _store.list_models()
+            check("a pre-rebrand store is still found by find_local",
+                  found is not None
+                  and found.model_path == legacy_dir / "model.gguf",
+                  str(found))
+            check("a pre-rebrand store is listed and flagged as legacy",
+                  len(listed) == 1 and listed[0]["name"] == "ghost:1b"
+                  and listed[0]["legacy_store"] is True,
+                  json.dumps(listed, default=str))
+            # the current store must win when the same model is in both
+            cur = (legacy_home / ".alpaccaroo" / "models" / "ollama"
+                   / "library" / "ghost" / "1b")
+            cur.mkdir(parents=True)
+            (cur / "model.gguf").write_bytes(b"newer")
+            (cur / "manifest.json").write_text(json.dumps(
+                {"name": "ghost:1b", "source": "ollama",
+                 "model_file": "model.gguf", "size": 5,
+                 "pulled_at": "2026-02-02T00:00:00Z"}), "utf-8")
+            again = _store.find_local(ref)
+            check("the current store wins over the pre-rebrand one",
+                  again is not None and again.model_path == cur / "model.gguf"
+                  and len(_store.list_models()) == 1,
+                  str(again))
+            # pull must never write into the legacy store
+            check("store_dir still points writes at the current home",
+                  ref.store_dir() == cur)
+            os.environ["ALPACCAROO_HOME"] = str(legacy_home / ".alpaccaroo")
+            check("an explicit ALPACCAROO_HOME disables the legacy fallback",
+                  _store.legacy_models_roots() == [])
+        finally:
+            _store.Path.home = saved_home_fn
+            if saved_env is None:
+                os.environ.pop("ALPACCAROO_HOME", None)
+            else:
+                os.environ["ALPACCAROO_HOME"] = saved_env
 
         # ---- nickname sanitizing -----------------------------------------
         check("nickname sanitizing strips ANSI escapes",

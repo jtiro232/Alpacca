@@ -605,6 +605,101 @@ def _init() -> dict:
                 out6[rb] = acc
 
     @njit(parallel=True, fastmath=True, cache=True)
+    def _matvec_q4k_q5k_pair(qp, sc4, mn4, dh4, dmh4,
+                             qp5, qh5, sc5, mn5, dh5, dmh5,
+                             lut, xq, ascale, bsums, out4, out5):
+        # Package K: the same one-parallel-region trick as the Q4_K+Q6_K
+        # pair above, for the pairing a **Q4_K_S** file produces. Q4_K_S
+        # stores attn_v as Q5_K (03-RESULTS round 5 measured that census),
+        # so a Q4_K_S model's attention group is Q4_K q/k beside a Q5_K v
+        # and fell through to per-matrix dispatch, getting nothing.
+        #
+        # Each branch is the body of _matvec_q4k_int / _matvec_q5k_int
+        # unchanged - same j-outer walk, same premultiplied int16 codes,
+        # same one reduce per 256 weights - so a row's accumulation order is
+        # the one the per-matrix kernels use and the result is bit-identical
+        # by construction rather than by inspection.
+        rows4 = qp.shape[0]
+        rows5 = qp5.shape[0]
+        nblk = ascale.shape[0]
+        for r in prange(rows4 + rows5):
+            if r < rows4:
+                acc = np.float32(0.0)
+                for b in range(nblk):
+                    p0 = b * 128
+                    x0 = b * 256
+                    s0 = np.int16(sc4[r, b, 0])
+                    s1 = np.int16(sc4[r, b, 1])
+                    s2 = np.int16(sc4[r, b, 2])
+                    s3 = np.int16(sc4[r, b, 3])
+                    s4 = np.int16(sc4[r, b, 4])
+                    s5 = np.int16(sc4[r, b, 5])
+                    s6 = np.int16(sc4[r, b, 6])
+                    s7 = np.int16(sc4[r, b, 7])
+                    blk_i = np.int32(0)
+                    for j in range(32):
+                        v0 = qp[r, p0 + j]
+                        v1 = qp[r, p0 + 32 + j]
+                        v2 = qp[r, p0 + 64 + j]
+                        v3 = qp[r, p0 + 96 + j]
+                        blk_i = np.int32(
+                            blk_i
+                            + np.int32(np.int16(s0 * np.int16(v0 & np.uint8(15)))) * np.int32(xq[x0 + j])
+                            + np.int32(np.int16(s1 * np.int16(v0 >> np.uint8(4)))) * np.int32(xq[x0 + 32 + j])
+                            + np.int32(np.int16(s2 * np.int16(v1 & np.uint8(15)))) * np.int32(xq[x0 + 64 + j])
+                            + np.int32(np.int16(s3 * np.int16(v1 >> np.uint8(4)))) * np.int32(xq[x0 + 96 + j])
+                            + np.int32(np.int16(s4 * np.int16(v2 & np.uint8(15)))) * np.int32(xq[x0 + 128 + j])
+                            + np.int32(np.int16(s5 * np.int16(v2 >> np.uint8(4)))) * np.int32(xq[x0 + 160 + j])
+                            + np.int32(np.int16(s6 * np.int16(v3 & np.uint8(15)))) * np.int32(xq[x0 + 192 + j])
+                            + np.int32(np.int16(s7 * np.int16(v3 >> np.uint8(4)))) * np.int32(xq[x0 + 224 + j]))
+                    min_i = np.int32(0)
+                    for t in range(8):
+                        min_i = np.int32(min_i + np.int32(mn4[r, b, t])
+                                         * bsums[b * 8 + t])
+                    acc += ascale[b] * (lut[dh4[r, b]] * np.float32(blk_i)
+                                        - lut[dmh4[r, b]] * np.float32(min_i))
+                out4[r] = acc
+            else:
+                rb = r - rows4
+                acc = np.float32(0.0)
+                for b in range(nblk):
+                    p0 = b * 128
+                    h0 = b * 32
+                    x0 = b * 256
+                    s0 = np.int16(sc5[rb, b, 0])
+                    s1 = np.int16(sc5[rb, b, 1])
+                    s2 = np.int16(sc5[rb, b, 2])
+                    s3 = np.int16(sc5[rb, b, 3])
+                    s4 = np.int16(sc5[rb, b, 4])
+                    s5 = np.int16(sc5[rb, b, 5])
+                    s6 = np.int16(sc5[rb, b, 6])
+                    s7 = np.int16(sc5[rb, b, 7])
+                    blk_i = np.int32(0)
+                    for j in range(32):
+                        v0 = qp5[rb, p0 + j]
+                        v1 = qp5[rb, p0 + 32 + j]
+                        v2 = qp5[rb, p0 + 64 + j]
+                        v3 = qp5[rb, p0 + 96 + j]
+                        hh = qh5[rb, h0 + j]
+                        blk_i = np.int32(
+                            blk_i
+                            + np.int32(np.int16(s0 * np.int16((v0 & np.uint8(15)) | ((hh & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + j])
+                            + np.int32(np.int16(s1 * np.int16((v0 >> np.uint8(4)) | (((hh >> np.uint8(1)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 32 + j])
+                            + np.int32(np.int16(s2 * np.int16((v1 & np.uint8(15)) | (((hh >> np.uint8(2)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 64 + j])
+                            + np.int32(np.int16(s3 * np.int16((v1 >> np.uint8(4)) | (((hh >> np.uint8(3)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 96 + j])
+                            + np.int32(np.int16(s4 * np.int16((v2 & np.uint8(15)) | (((hh >> np.uint8(4)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 128 + j])
+                            + np.int32(np.int16(s5 * np.int16((v2 >> np.uint8(4)) | (((hh >> np.uint8(5)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 160 + j])
+                            + np.int32(np.int16(s6 * np.int16((v3 & np.uint8(15)) | (((hh >> np.uint8(6)) & np.uint8(1)) << np.uint8(4))))) * np.int32(xq[x0 + 192 + j])
+                            + np.int32(np.int16(s7 * np.int16((v3 >> np.uint8(4)) | ((hh >> np.uint8(7)) << np.uint8(4))))) * np.int32(xq[x0 + 224 + j]))
+                    min_i = np.int32(0)
+                    for t in range(8):
+                        min_i = np.int32(min_i + np.int32(mn5[rb, b, t])
+                                         * bsums[b * 8 + t])
+                    acc += ascale[b] * (lut[dh5[rb, b]] * np.float32(blk_i)
+                                        - lut[dmh5[rb, b]] * np.float32(min_i))
+                out5[rb] = acc
+
+    @njit(parallel=True, fastmath=True, cache=True)
     def _attention_decode(q3, K, V, scores, out, inv_sqrt):
         # Single-token grouped-query attention over the KV cache, one prange
         # worker per query head, softmax fused in. This exists because the
@@ -730,6 +825,7 @@ def _init() -> dict:
               "matmul_wide": _matmul_codes_wide,
               "quantize_acts": _quantize_acts,
               "matvec_q4k_q6k_pair": _matvec_q4k_q6k_pair,
+              "matvec_q4k_q5k_pair": _matvec_q4k_q5k_pair,
               "matvec_q4k_int": _matvec_q4k_int,
               "matvec_q5k_int": _matvec_q5k_int,
               "matvec_q6k_int": _matvec_q6k_int,
@@ -1032,6 +1128,26 @@ def matvec_q4k_q6k_pair(a, b, x, pre=None):
     return out_a, out_b
 
 
+def matvec_q4k_q5k_pair(a, b, x, pre=None):
+    """One dispatch for a native Q4_K matrix `a` and a native Q5_K matrix
+    `b` that share the input `x` - the pairing a Q4_K_S file produces.
+
+    Returns (out_a, out_b) float32. Both must have the same column count -
+    they are reading the same vector - which the caller has already checked.
+    """
+    st = _init()
+    np = st["np"]
+    xq, ascale, bsums = pre if pre is not None else quantize_acts(x)
+    rows_a, rows_b = a.rows, b.rows
+    _want(st, rows_a * a.cols + rows_b * b.cols)
+    out_a = np.empty(rows_a, np.float32)
+    out_b = np.empty(rows_b, np.float32)
+    st["matvec_q4k_q5k_pair"](a._qp, a._sci, a._mni, a._dh, a._dmh,
+                              b._qp, b._qh, b._sci, b._mni, b._dh, b._dmh,
+                              st["f16_lut"], xq, ascale, bsums, out_a, out_b)
+    return out_a, out_b
+
+
 def dequant_q5k_tile(qp, qh, sc, mn, dh, dmh, out=None):
     """Expand native Q5_K rows to a float32 (nr, cols) tile."""
     st = _init()
@@ -1163,6 +1279,40 @@ def warmup() -> None:
         rope_decode(np.zeros(8, dtype=np.float32),
                     np.zeros(2, dtype=np.float32),
                     np.zeros(2, dtype=np.float32), 2, 4, 4, style)
+    # The grouped pair kernels, which used to be missed here. Package D
+    # added _matvec_q4k_q6k_pair in round 4 without a warmup entry, so on a
+    # cold Numba cache it compiled lazily inside the FIRST DECODE TOKEN of
+    # any Q4_K_M model. Measured on machine C (round 5, qwen2.5-3B Q4_K_M,
+    # ctx 4096, cold short-short): one token at 1865.4 ms against a 91.3 ms
+    # worst case warm - and p50 did not move (82.0 vs 83.0), because a
+    # single slow token cannot shift a median. Only the mean-based
+    # decode tok/s showed it, 7.24 against 12.12.
+    #
+    # This is the same defect round 3 fixed for dense models ("the first
+    # decode token paid a 0.68 s in-token JIT compile"). tests/smoke.py
+    # pins it structurally now - every dispatcher in _state must have a
+    # compiled signature after warmup - so the next kernel cannot
+    # reintroduce it by being added without a line here.
+    #
+    # These call the compiled functions rather than the public wrappers
+    # because the wrappers take QuantizedMatrix objects; the array dtypes
+    # and layouts below are the ones qmatrix builds, so the signature
+    # compiled here is the one a real dispatch uses.
+    xq256, asc256, bs256 = quantize_acts(x256)
+    u8 = np.zeros((2, 128), dtype=np.uint8)
+    sc8 = np.zeros((2, 1, 8), dtype=np.uint8)
+    u16 = np.zeros((2, 1), dtype=np.uint16)
+    out2 = np.empty(2, np.float32)
+    st["matvec_q4k_q6k_pair"](u8, sc8, sc8, u16, u16,
+                              np.zeros((2, 256), dtype=np.int8),
+                              np.zeros((2, 16), dtype=np.int8), u16,
+                              st["f16_lut"], xq256, asc256, bs256,
+                              out2, np.empty(2, np.float32))
+    st["matvec_q4k_q5k_pair"](u8, sc8, sc8, u16, u16,
+                              u8, np.zeros((2, 32), dtype=np.uint8),
+                              sc8, sc8, u16, u16,
+                              st["f16_lut"], xq256, asc256, bs256,
+                              out2, np.empty(2, np.float32))
     # every warmup shape above is tiny, so _want left the pool at one
     # thread; hand it back sized for real work
     _want_full(st)

@@ -138,11 +138,19 @@ def _is_native_quant(W) -> bool:
 
 
 def _pair_indices(Ws, native):
-    """(index of the Q4_K matrix, index of the Q6_K matrix) when the group
-    holds exactly one of each in native mode and they agree on width, else
-    None. Shape-gated on purpose: the grouped kernel is compiled for this
-    one dtype pairing, and everything else must fall through unchanged."""
-    i4 = i6 = None
+    """(Q4_K index, partner index, partner mode) when the group holds
+    exactly one native Q4_K beside exactly one native Q5_K or Q6_K and the
+    two agree on width, else None.
+
+    Two pairings are compiled, because two are what real files produce: a
+    **Q4_K_M** file gives Q4_K attn_q/attn_k beside a Q6_K attn_v, and a
+    **Q4_K_S** file gives the same group with a Q5_K attn_v. Shape- and
+    dtype-gated on purpose - two partners, one of each kind, or a mode with
+    no compiled pairing all fall through to the per-matrix dispatches
+    unchanged, which is why adding a pairing is additive and cannot break
+    the models that do not have it."""
+    i4 = ip = None
+    kind = ""
     for i, (W, f) in enumerate(zip(Ws, native)):
         if not f:
             continue
@@ -150,15 +158,15 @@ def _pair_indices(Ws, native):
             if i4 is not None:
                 return None      # two Q4_Ks are already fused at load
             i4 = i
-        elif W._mode == "q6k_int":
-            if i6 is not None:
-                return None
-            i6 = i
+        elif W._mode in ("q5k_int", "q6k_int"):
+            if ip is not None:
+                return None      # no compiled three-way pairing
+            ip, kind = i, W._mode
         else:
-            return None          # a Q5_K in the group: no compiled pairing
-    if i4 is None or i6 is None or Ws[i4].cols != Ws[i6].cols:
+            return None          # a native mode with no compiled pairing
+    if i4 is None or ip is None or Ws[i4].cols != Ws[ip].cols:
         return None
-    return i4, i6
+    return i4, ip, kind
 
 
 def matvec_group(Ws, x):
@@ -196,14 +204,15 @@ def matvec_group(Ws, x):
             pre = _k.quantize_acts(x)
             pair = _pair_indices(Ws, native)
             if pair is not None and _k.group_kernel_enabled():
-                # Package D: the whole group in one parallel region. Only
-                # the exact Q4_K+Q6_K shape a Q4_K_M file produces (q/k
-                # quantized to Q4_K beside a Q6_K v); everything else keeps
-                # the per-matrix dispatches below.
-                i4, i6 = pair
+                # Packages D and K: the whole group in one parallel region.
+                # Only the two compiled dtype pairings - Q4_K+Q6_K from a
+                # Q4_K_M file and Q4_K+Q5_K from a Q4_K_S one; everything
+                # else keeps the per-matrix dispatches below.
+                i4, ip, kind = pair
                 out = [None] * len(Ws)
-                out[i4], out[i6] = _k.matvec_q4k_q6k_pair(Ws[i4], Ws[i6],
-                                                          x, pre)
+                pair_fn = (_k.matvec_q4k_q6k_pair if kind == "q6k_int"
+                           else _k.matvec_q4k_q5k_pair)
+                out[i4], out[ip] = pair_fn(Ws[i4], Ws[ip], x, pre)
                 for i, (W, f) in enumerate(zip(Ws, native)):
                     if out[i] is None:
                         out[i] = W.matvec(x, pre) if f else matvec(W, x)

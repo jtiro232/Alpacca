@@ -25,6 +25,26 @@ def models_root() -> Path:
     return alpaccaroo_home() / "models"
 
 
+# Homes written by a pre-rebrand install. The alpacca -> alpaccaroo rename
+# moved models_root(), which makes an existing user's pulled models
+# invisible: `list` shows nothing and `run` silently re-downloads gigabytes.
+# These are consulted READ-ONLY - `pull` always writes to the current home -
+# so an upgrade keeps working without moving anyone's files behind them.
+LEGACY_HOME_NAMES = (".alpacca",)
+
+
+def legacy_models_roots() -> list[Path]:
+    if os.environ.get("ALPACCAROO_HOME"):
+        return []        # an explicit home means exactly that home
+    home = Path.home()
+    roots = []
+    for name in LEGACY_HOME_NAMES:
+        root = home / name / "models"
+        if root != models_root() and root.is_dir():
+            roots.append(root)
+    return roots
+
+
 def _nicknames_file() -> Path:
     return alpaccaroo_home() / "model-nicknames.json"
 
@@ -61,8 +81,8 @@ class ModelRef:
         s = self.name if self.ns == "library" else f"ollama:{self.ns}/{self.name}"
         return f"{s}:{self.tag}" if self.tag != "latest" else s
 
-    def store_dir(self) -> Path:
-        root = models_root()
+    def store_dir(self, root: "Path | None" = None) -> Path:
+        root = models_root() if root is None else root
         if self.source == "hf":
             return root / "hf" / _sanitize(self.ns) / _sanitize(self.name) / \
                    _sanitize(self.tag or "default")
@@ -124,16 +144,25 @@ class LocalModel:
     manifest: dict = field(default_factory=dict)
 
 
+def installed_dir(ref: ModelRef) -> "Path | None":
+    """The directory actually holding this model: the current store first,
+    then any pre-rebrand one. Returns None when it is installed nowhere."""
+    for root in [models_root(), *legacy_models_roots()]:
+        d = ref.store_dir(root)
+        if (d / "manifest.json").exists():
+            return d
+    return None
+
+
 def find_local(ref: ModelRef) -> LocalModel | None:
     if ref.source == "file":
         assert ref.path is not None
         return LocalModel(model_path=ref.path) if ref.path.exists() else None
-    d = ref.store_dir()
-    mf = d / "manifest.json"
-    if not mf.exists():
+    d = installed_dir(ref)
+    if d is None:
         return None
     try:
-        manifest = json.loads(mf.read_text("utf-8"))
+        manifest = json.loads((d / "manifest.json").read_text("utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     model_file = manifest.get("model_file", "")
@@ -409,12 +438,15 @@ def human_size(n: float) -> str:
 
 def list_models() -> list[dict]:
     out = []
-    root = models_root()
-    if not root.exists():
+    roots = [r for r in [models_root(), *legacy_models_roots()] if r.exists()]
+    if not roots:
         return out
     nicknames = _read_nicknames()
     model_to_nickname = {target: nickname for nickname, target in nicknames.items()}
-    for mf in sorted(root.rglob("manifest.json")):
+    seen: set[str] = set()
+    manifests = [(root, mf) for root in roots
+                 for mf in sorted(root.rglob("manifest.json"))]
+    for root, mf in manifests:
         d = mf.parent
         try:
             manifest = json.loads(mf.read_text("utf-8"))
@@ -431,6 +463,11 @@ def list_models() -> list[dict]:
             canonical = parse_model_ref(name).display()
         except ValueError:
             canonical = name
+        # the current store wins: a model present in both is listed once,
+        # from the copy find_local would actually open
+        if canonical in seen:
+            continue
+        seen.add(canonical)
         out.append({
             "name": name,
             "nickname": (model_to_nickname.get(canonical)
@@ -439,6 +476,7 @@ def list_models() -> list[dict]:
             "size": int(size),
             "pulled_at": manifest.get("pulled_at", ""),
             "dir": d,
+            "legacy_store": root != models_root(),
         })
     out.sort(key=lambda m: m["name"])
     return out
@@ -447,9 +485,12 @@ def list_models() -> list[dict]:
 def remove_model(ref: ModelRef) -> bool:
     if ref.source == "file":
         raise ValueError("refusing to delete a raw file path; remove it yourself if intended")
-    d = ref.store_dir()
-    if not (d / "manifest.json").exists():
+    d = installed_dir(ref)
+    if d is None:
         return False
+    # prune back to whichever store the model was actually found in
+    root = next((r for r in [models_root(), *legacy_models_roots()]
+                 if d.is_relative_to(r)), models_root())
     name = ref.display()
     for f in sorted(d.rglob("*"), reverse=True):
         f.unlink() if f.is_file() else f.rmdir()
@@ -462,7 +503,7 @@ def remove_model(ref: ModelRef) -> bool:
         pass
     try:
         parent = d.parent
-        while parent != models_root() and parent.exists() and not any(parent.iterdir()):
+        while parent != root and parent.exists() and not any(parent.iterdir()):
             parent.rmdir()
             parent = parent.parent
     except OSError:

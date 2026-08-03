@@ -283,7 +283,14 @@ def cmd_list(_args) -> int:
           f"{'SOURCE':<8}  {'SIZE':<10}  PULLED")
     for m in models:
         print(f"{_pad(m['name'], width)}  {_pad(nicks[m['name']], nick_width)}  "
-              f"{m['source']:<8}  {human_size(m['size']):<10}  {m['pulled_at']}")
+              f"{m['source']:<8}  {human_size(m['size']):<10}  {m['pulled_at']}"
+              f"{'  (legacy store)' if m.get('legacy_store') else ''}")
+    if any(m.get("legacy_store") for m in models):
+        from .store import legacy_models_roots
+        roots = ", ".join(str(r) for r in legacy_models_roots())
+        print(f"\nsome models still live in a pre-rebrand store ({roots}); "
+              f"they are read from there as-is. Move them under "
+              f"{models_root()} to consolidate.")
     return 0
 
 
