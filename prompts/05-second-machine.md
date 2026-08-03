@@ -126,9 +126,13 @@ The stability spread decides how cautious your method must be:
 - Do not merge anything that is faster per call and unmeasured per token.
   Round 4 shipped exactly one such change and it lost 22 of 25 end-to-end
   rounds.
-- Do not push, publish, or otherwise change remotes unless the user
-  explicitly authorises that in the fresh instance. Local commits are fine
-  when they make the work reviewable.
+- **You are authorised to commit and push to `Alpaccaroo2`.** That
+  authorisation is scoped: push to `Alpaccaroo2` or to a branch created
+  from it for this work, and nothing else. Do not push to `main`,
+  `Alpaccaroo`, or unrelated branches; do not force-push, rewrite
+  published history, delete remote branches, or change the remote URL.
+  Push reviewable increments instead of saving everything for one final
+  lump.
 
 ## Work packages
 
@@ -325,8 +329,9 @@ Unchanged from round 4, and all currently green:
 - Do not remove fallback paths to chase a benchmark.
 - Do not hard-code device names, core counts, or OS branches outside
   `_platform.py`.
-- Do not push to GitHub, create releases, or edit remote repository state
-  unless the user explicitly asks for it in that instance.
+- Do not push to GitHub branches outside the scoped `Alpaccaroo2` work,
+  create releases, change repository settings, or edit unrelated remote
+  state unless the user explicitly asks for that separate action.
 
 ## Recommended order of work
 
@@ -352,5 +357,28 @@ under a machine-named subfolder such as `prompts/05-artifacts/<machine>/`
 and link them from `prompts/05-RESULTS.md`. If an artifact is too large,
 record the command, the summary table, and where the local file lives.
 
-Commit locally to `Alpaccaroo2` or a branch from it as work becomes
-reviewable. Push only after explicit user approval.
+Commit and push to `Alpaccaroo2` or to a branch created from it as work
+becomes reviewable. This prompt is the explicit approval for that scoped
+push authority.
+
+### If the push fails, read this before spending time on it
+
+Round 4 lost time to credential ambiguity. Separate read access from write
+access before debugging anything deeper:
+
+```sh
+git ls-remote --heads origin      # succeeds => the credential can READ
+git push origin Alpaccaroo2       # 403 => it cannot WRITE this branch
+```
+
+- If read works but push is denied, assume the machine is authenticated as
+  the wrong GitHub account or lacks write permission. Ask the user to fix
+  the GitHub identity or permission; do not work around it by pushing to an
+  unrelated branch or account.
+- If Git cannot prompt for credentials because the harness has no
+  controlling terminal, ask the user to run the push in a real terminal or
+  preconfigure a credential with write access to this repository.
+- Do not read secrets out of credential stores, paste tokens into logs, mint
+  OAuth tokens through unrelated apps, or change the remote URL to embed a
+  token. If no safe credential path is available, leave local commits and
+  report the exact branch and commit SHA.
