@@ -129,11 +129,19 @@ python tests/bench.py --model qwen3bmed --profile-json perf.json
 **Cold and warm are different workloads and are never quoted as one
 another.**
 
-- `cold` - the model's first use in this process: GGUF open and unpack, the
-  JIT compiling or loading its cache, the first touch of every weight page.
-  This is what a one-shot `alpaccaroo run` pays.
+- `cold` - a freshly loaded model: GGUF open and unpack, the JIT compiling
+  or loading its cache, the first touch of every weight page. This is what
+  a one-shot `alpaccaroo run` pays.
 - `warm` - the same model after a full discarded pass, KV cache reset. This
   is what `alpaccaroo serve` or an interactive session pays per turn.
+
+One caveat worth knowing before quoting a cold number: a sweep loads the
+model once per `--model` and per `--ctx`, so `--ctx 2048,4096` produces
+**two** `cold` rows - but only the first is cold in the operating system's
+eyes. The second reloads the same file through a warm page cache and will
+report a load time several times lower (measured 1.23 s then 0.33 s for the
+same 18 MiB file). Compare cold load times across processes, not across
+rows of one sweep.
 
 Model references resolve **locally first** - nicknames, installed canonical
 names and file paths all resolve without touching the network - and a
@@ -257,8 +265,9 @@ CLI is unchanged for anyone who does not ask for it. With no URL it uses
 `$ALPACCAROO_HOST:$ALPACCAROO_PORT`, the same variables `serve` reads.
 
 Because the server streams text rather than token counts, `--connect`
-reports stream chunks per second rather than implying a tok/s it cannot
-observe.
+reports the number of stream chunks and the elapsed seconds -
+`[41 chunks in 12.3s]` - rather than implying a tok/s it cannot observe.
+A chunk is one streamed delta, which is usually but not always one token.
 
 The `cold` and `warm` bench phases measure exactly these two workflows.
 
@@ -484,6 +493,90 @@ but only one real model end to end. The plan's benchmark matrix asks for
 Linux, AMD, mini-PC and desktop classes, and a CUDA device. `--json` and
 `--csv` carry everything needed to merge results from those machines into
 one table; nothing above should be read as characterising them.
+
+---
+
+## 7. What is left
+
+The tools are built and the reference machine is characterised. What
+remains is mostly *coverage* and one real optimisation. In rough order of
+expected value:
+
+**1. Q6_K 6-bit packing - the only large lever left.** Q6_K codes are
+stored unpacked at 1.066 bytes per weight where the format itself needs
+0.82. On a Q4_K_M qwen2.5-3B, Q6_K carries 31% of the weights, so packing
+is worth roughly **10% of the bytes a token touches** - and decode is
+bandwidth-bound, so bytes per weight is the lever that actually moves.
+`quants.py` already flags it ("the 6-bit code packing stays future work").
+It needs a new pack/unpack plus a kernel that reads the packed form, and it
+should be held to the same bit-identity bar as Packages D and E.
+
+**2. Run the benchmark matrix.** The harness exists; the data does not.
+Cheapest wins first, because two more real models are *already installed*
+on the reference machine and were never benchmarked:
+
+```powershell
+alpaccaroo bench --model bartllama3b --shapes short-short,long-long --json llama3b.json
+alpaccaroo bench --model hermes8b   --shapes short-short,long-long --json hermes8b.json
+```
+
+Then the parts that need other hardware: Linux, an AMD Zen part, a desktop
+or server CPU that holds its clocks, and a CUDA device. Also unmeasured on
+any machine: Q5_K_M and F16/F32 dense storage, and contexts 2048/8192 on a
+real model.
+
+**3. Validate Package E on a model that actually triggers it.** The default
+threshold is 131072 weights. qwen2.5-3B's *smallest* decode matvec is
+524288, so the narrow-dispatch path never engages on it - every measurement
+of it here is per-call, not end-to-end. A model with narrow GQA (n_kv 1,
+head_dim 64, embd 2048 gives exactly 131072) would exercise it. Until then,
+treat the feature as measured-in-isolation only.
+
+**4. Extend the grouped kernel to Q4_K+Q5_K.** Package D covers the
+Q4_K+Q6_K pairing a Q4_K_M file produces. A **Q4_K_S** file stores attn_v
+as Q5_K, so it falls back to per-matrix dispatch and gets nothing. The
+kernel is a mechanical copy of the existing one with the Q5_K branch
+substituted, and `_pair_indices` already refuses unknown pairings safely.
+
+**5. Two open questions, both needing a machine that holds its clocks.**
+Do not attempt either on a laptop that `--stability` reports as unsteady:
+
+  - *Why did the activation-quantization threshold regress?* It lost 22 of
+    25 end-to-end rounds; the obvious cause (thread-pool resize) was tested
+    directly and found to cost nothing. The knob ships off. Either explain
+    it or leave it off.
+  - *Should the kernels use 512-bit registers?* `tune --asm` shows LLVM
+    emitting `vpdpwssd` on 256-bit ymm and never zmm. On a downclocking
+    Tiger Lake that is plausibly correct; on a part that sustains AVX-512
+    clocks it may be leaving throughput on the table.
+
+**6. Track 1 leftovers, deliberately not done.** Fusing top-k into the
+output projection, and top-p over a reduced candidate set. Measured ceiling
+on qwen2.5-3B: the sampler is 1.67 ms of a 1264 ms token and the logits
+materialisation is ~0.2 ms, so the whole track is worth **~0.15%** here.
+Revisit only if a profile on faster hardware shows the sampler above a few
+percent - the fused greedy path already took the cheap 4.76x.
+
+**7. The GPU tier is untouched and was not exercised.** `cuda.py` has zero
+changes on this branch, and the GPU branch of `matvec_group` returns before
+any new code runs, so Track 7's "CPU work must not block GPU gains"
+guardrail holds by construction rather than by testing. Nobody has run this
+branch on a CUDA device; do that before trusting it there.
+
+### Two claims that were wrong, and are now fixed
+
+Recorded because the same drift is easy to reintroduce:
+
+- The docs said `--connect` reports "chunks per second". It reports chunks
+  and elapsed seconds. Fixed above.
+- The docs defined `cold` as "the model's first use in this process", which
+  stops being true the moment a sweep has more than one `--ctx` or
+  `--model`: each combination reloads, but only the first is cold to the
+  page cache (1.23 s then 0.33 s for the same file). Fixed above.
+
+`README.md`'s "what did not help" note about fusing attn_q+attn_k launches
+refers to *load-time row fusion* on a different machine, not to Package D's
+grouped kernel - different mechanism, and not a contradiction.
 
 ---
 
