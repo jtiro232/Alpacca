@@ -1,0 +1,277 @@
+{
+  "threads": 8,
+  "per_token_matvec_seconds": {
+    "1": 0.11379451412358321,
+    "4": 0.042675707052694634,
+    "8": 0.02913596855069045,
+    "16": 0.053839271000470035
+  },
+  "measurements": [
+    {
+      "threads": 1,
+      "label": "ffn_gate_up",
+      "dtype": "Q8_0",
+      "rows": 16384,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.0030718479974893853,
+      "weights": 33554432,
+      "gweights_per_s": 10.923207146780689
+    },
+    {
+      "threads": 1,
+      "label": "ffn_down",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 8192,
+      "per_token_calls": 16,
+      "seconds": 0.001592070999322459,
+      "weights": 16777216,
+      "gweights_per_s": 10.537982292963012
+    },
+    {
+      "threads": 1,
+      "label": "output",
+      "dtype": "Q8_0",
+      "rows": 128256,
+      "cols": 2048,
+      "per_token_calls": 1,
+      "seconds": 0.02399099399917759,
+      "weights": 262668288,
+      "gweights_per_s": 10.948620470206624
+    },
+    {
+      "threads": 1,
+      "label": "attn_qk",
+      "dtype": "Q8_0",
+      "rows": 2560,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.0004952199960825965,
+      "weights": 5242880,
+      "gweights_per_s": 10.586971530781147
+    },
+    {
+      "threads": 1,
+      "label": "attn_output",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.0003579500043997541,
+      "weights": 4194304,
+      "gweights_per_s": 11.717569348919056
+    },
+    {
+      "threads": 1,
+      "label": "attn_v",
+      "dtype": "Q8_0",
+      "rows": 512,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 9.563101048115641e-05,
+      "weights": 1048576,
+      "gweights_per_s": 10.964811463605901
+    },
+    {
+      "threads": 4,
+      "label": "ffn_gate_up",
+      "dtype": "Q8_0",
+      "rows": 16384,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.001154469995526597,
+      "weights": 33554432,
+      "gweights_per_s": 29.064793481007335
+    },
+    {
+      "threads": 4,
+      "label": "ffn_down",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 8192,
+      "per_token_calls": 16,
+      "seconds": 0.0005514660006156191,
+      "weights": 16777216,
+      "gweights_per_s": 30.422938098216495
+    },
+    {
+      "threads": 4,
+      "label": "output",
+      "dtype": "Q8_0",
+      "rows": 128256,
+      "cols": 2048,
+      "per_token_calls": 1,
+      "seconds": 0.009292539005400613,
+      "weights": 262668288,
+      "gweights_per_s": 28.26657901003624
+    },
+    {
+      "threads": 4,
+      "label": "attn_qk",
+      "dtype": "Q8_0",
+      "rows": 2560,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.000191854007425718,
+      "weights": 5242880,
+      "gweights_per_s": 27.32744585504651
+    },
+    {
+      "threads": 4,
+      "label": "attn_output",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.00014604699390474707,
+      "weights": 4194304,
+      "gweights_per_s": 28.718865673712916
+    },
+    {
+      "threads": 4,
+      "label": "attn_v",
+      "dtype": "Q8_0",
+      "rows": 512,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 4.2611005483195186e-05,
+      "weights": 1048576,
+      "gweights_per_s": 24.608102721573527
+    },
+    {
+      "threads": 8,
+      "label": "ffn_gate_up",
+      "dtype": "Q8_0",
+      "rows": 16384,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.0007263180013978854,
+      "weights": 33554432,
+      "gweights_per_s": 46.19799032299971
+    },
+    {
+      "threads": 8,
+      "label": "ffn_down",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 8192,
+      "per_token_calls": 16,
+      "seconds": 0.0003943979972973466,
+      "weights": 16777216,
+      "gweights_per_s": 42.53879612718021
+    },
+    {
+      "threads": 8,
+      "label": "output",
+      "dtype": "Q8_0",
+      "rows": 128256,
+      "cols": 2048,
+      "per_token_calls": 1,
+      "seconds": 0.007674128995859064,
+      "weights": 262668288,
+      "gweights_per_s": 34.227765540784496
+    },
+    {
+      "threads": 8,
+      "label": "attn_qk",
+      "dtype": "Q8_0",
+      "rows": 2560,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.00010008999379351735,
+      "weights": 5242880,
+      "gweights_per_s": 52.38165975727708
+    },
+    {
+      "threads": 8,
+      "label": "attn_output",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 8.966999303083867e-05,
+      "weights": 4194304,
+      "gweights_per_s": 46.77488932733076
+    },
+    {
+      "threads": 8,
+      "label": "attn_v",
+      "dtype": "Q8_0",
+      "rows": 512,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 3.088898665737361e-05,
+      "weights": 1048576,
+      "gweights_per_s": 33.946597589328526
+    },
+    {
+      "threads": 16,
+      "label": "ffn_gate_up",
+      "dtype": "Q8_0",
+      "rows": 16384,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.0024295390030601993,
+      "weights": 33554432,
+      "gweights_per_s": 13.811028329957042
+    },
+    {
+      "threads": 16,
+      "label": "ffn_down",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 8192,
+      "per_token_calls": 16,
+      "seconds": 0.00021370498870965093,
+      "weights": 16777216,
+      "gweights_per_s": 78.50643123167455
+    },
+    {
+      "threads": 16,
+      "label": "output",
+      "dtype": "Q8_0",
+      "rows": 128256,
+      "cols": 2048,
+      "per_token_calls": 1,
+      "seconds": 0.007917430993984453,
+      "weights": 262668288,
+      "gweights_per_s": 33.17594914304545
+    },
+    {
+      "threads": 16,
+      "label": "attn_qk",
+      "dtype": "Q8_0",
+      "rows": 2560,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 0.00011645100312307477,
+      "weights": 5242880,
+      "gweights_per_s": 45.022196970333546
+    },
+    {
+      "threads": 16,
+      "label": "attn_output",
+      "dtype": "Q8_0",
+      "rows": 2048,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 7.98920082161203e-05,
+      "weights": 4194304,
+      "gweights_per_s": 52.49966916157315
+    },
+    {
+      "threads": 16,
+      "label": "attn_v",
+      "dtype": "Q8_0",
+      "rows": 512,
+      "cols": 2048,
+      "per_token_calls": 16,
+      "seconds": 3.052799729630351e-05,
+      "weights": 1048576,
+      "gweights_per_s": 34.34801142775806
+    }
+  ],
+  "default_threads": 8,
+  "speedup_vs_default": 1.0
+}
