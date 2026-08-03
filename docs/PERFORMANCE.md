@@ -187,7 +187,7 @@ Every optimization here is measurable and disableable.
 | `ALPACCAROO_AUTOTUNE=1` | apply a cached `alpaccaroo tune` result at load. Never benchmarks. |
 | `ALPACCAROO_SERIAL_MATVEC_ELEMS` | weight count at or below which a matvec runs on one thread (default 131072) |
 | `ALPACCAROO_SERIAL_QUANTIZE_COLS` | column count at or below which activation quantization runs on one thread. **Default 0 (off)** - see section 5, it wins per call and loses end to end |
-| `ALPACCAROO_GROUP_KERNEL=0` | disable the grouped Q4_K+Q6_K kernel |
+| `ALPACCAROO_GROUP_KERNEL=0` | disable the grouped kernels (Q4_K+Q6_K from a Q4_K_M file, Q4_K+Q5_K from a Q4_K_S one) |
 | `ALPACCAROO_KERNELS=0` | disable the JIT kernels entirely |
 | `ALPACCAROO_INT_DOT=0` | keep the kernels, revert to f32-scale storage |
 | `ALPACCAROO_FUSE=0` | disable load-time row fusion of same-dtype neighbours |
@@ -480,6 +480,35 @@ downclocking Tiger Lake part not obviously the wrong choice. It was not
 pursued here because this machine is bandwidth-bound, not
 instruction-bound - but on a part that sustains its AVX-512 clocks it is
 the first thing to re-measure.
+
+### The same census on a CPU with no VNNI at all (round 5, machine C)
+
+An AMD Ryzen 7 7730U (znver3, Zen 3) has no AVX-512 and no VNNI in any
+form, which makes it the useful control for the paragraph above:
+
+| kernel | vpdpwssd | vpdpbusd | vpmaddwd | vpmullw | vpmuldq | ymm | zmm |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `matvec_q4k_int` | **0** | 0 | 32 | 32 | **0** | 66 | 0 |
+| `matvec_q5k_int` | **0** | 0 | 14 | 0 | **0** | 234 | 0 |
+| `matvec_q6k_int` | **0** | 0 | 32 | 32 | **0** | 38 | 0 |
+
+`vpdpwssd` is absent because the hardware cannot execute it. **`vpmuldq`
+is also 0**, and that is the result worth having: the
+`np.int32(acc + i32*i32)` re-cast idiom is still defeating Numba's int64
+promotion on a CPU generation that predates the instruction it was
+discovered for, and LLVM falls back cleanly to 256-bit `vpmaddwd`.
+
+So the idiom is **not a VNNI trick**. What it does is keep the contraction
+in 32-bit lanes; VNNI is what LLVM folds that into *when the part has it*.
+On a part without it the same idiom is the difference between `vpmaddwd`
+and 8-lane 64-bit multiplies, which is why it must survive any future edit
+whether or not the target has VNNI. `03-RESULTS.md` §6.7 tells this as an
+AVX-512 story because that is the machine it was discovered on; the
+portable statement is this one.
+
+Machine C sustains 25.4-26.8 GB/s (spread 1.06x over 70 s - it holds its
+clocks, unlike the reference machine above) and decodes qwen2.5-3B Q4_K_M
+at 11.2-12.3 tok/s warm. There is no zmm question to ask on it.
 
 One trap, handled: numba refuses to disassemble code it loaded from its
 on-disk cache and returns an empty listing, which reads as "no SIMD at
