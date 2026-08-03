@@ -273,7 +273,11 @@ to physical cores, override with ALPACCAROO_THREADS).
 
 Read `prompts/03-RESULTS.md` first: it is the experiment log with every
 number, and several expensive lessons are recorded there so they are not
-repeated. The short version:
+repeated. Then `prompts/04-RESULTS.md`, which logs the portable-performance
+round on very different hardware (a bandwidth-starved laptop rather than
+this one's 60 GB/s wall) and carries the continuation plan; it also records
+which of 03's verdicts reopen when the ALU/bandwidth ratio inverts. The
+short version:
 
 - **Numba promotes scalar integer arithmetic to int64.** Every integer
   kernel here depends on the re-cast idiom `acc = np.int32(acc + ...)`

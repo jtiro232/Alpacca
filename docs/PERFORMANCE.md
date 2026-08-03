@@ -498,18 +498,36 @@ one table; nothing above should be read as characterising them.
 
 ## 7. What is left
 
-The tools are built and the reference machine is characterised. What
-remains is mostly *coverage* and one real optimisation. In rough order of
-expected value:
+> The authoritative continuation plan is **`prompts/04-RESULTS.md`**, in the
+> same experiment-log format as `03-RESULTS.md`, alongside the plan it
+> executed (`prompts/04-portable-performance.md`). Read both before
+> starting - and read `03-RESULTS.md` too, because several avenues below
+> are re-openings of things it measured shut on very different hardware.
+> This section is the summary.
 
-**1. Q6_K 6-bit packing - the only large lever left.** Q6_K codes are
-stored unpacked at 1.066 bytes per weight where the format itself needs
-0.82. On a Q4_K_M qwen2.5-3B, Q6_K carries 31% of the weights, so packing
-is worth roughly **10% of the bytes a token touches** - and decode is
-bandwidth-bound, so bytes per weight is the lever that actually moves.
-`quants.py` already flags it ("the 6-bit code packing stays future work").
-It needs a new pack/unpack plus a kernel that reads the packed form, and it
-should be held to the same bit-identity bar as Packages D and E.
+The tools are built and the reference machine is characterised. What
+remains is mostly *coverage* and one re-opened optimisation. In rough order
+of expected value:
+
+**1. Q6_K 6-bit packing - reopened, but not for the reason it looks like.**
+Q6_K codes are stored unpacked at 1.066 bytes per weight where the format
+needs 0.82; on a Q4_K_M qwen2.5-3B that is ~10% of the bytes a token
+touches.
+
+`prompts/03-RESULTS.md` **already measured this shut** - packed 52.1 Gw/s
+against unpacked 52.2, because the 6-bit unpack ALU exactly cancels the
+bandwidth saving. That verdict was correct on the machine that produced it,
+which sustains **59-60 GB/s**. The reference machine here sustains
+**2.2-4.0 GB/s** with comparable per-core ALU: the ratio the verdict rested
+on is inverted roughly twentyfold, and a trade that is a wash when
+bandwidth is cheap should win when bandwidth is the binding constraint.
+03-RESULTS says as much - the avenue reopens if the ALU/bandwidth balance
+changes.
+
+So: re-run that microbenchmark on a bandwidth-starved machine **before**
+implementing anything. If it wins there, it is a storage mode chosen by
+measured ALU:bandwidth ratio, not a global switch - and it must clear the
+same bit-identity bar as Packages D and E.
 
 **2. Run the benchmark matrix.** The harness exists; the data does not.
 Cheapest wins first, because two more real models are *already installed*
