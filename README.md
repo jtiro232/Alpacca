@@ -763,6 +763,27 @@ and the roadmap orders the work that serves it.
 
 **Landed recently**
 
+- A measurement architecture for performance work: a decode profiler that
+  names which kernel ran each matrix (`alpaccaroo run --profile`), a
+  benchmark harness with cold/warm separation and a clock-stability probe
+  (`alpaccaroo bench`), an opt-in autotuner (`alpaccaroo tune`), a codegen
+  census (`alpaccaroo tune --asm`), and CLI reconnect to a resident server
+  (`alpaccaroo run --connect`). It produced **no end-to-end speedup** on the
+  machine it was built against - which it says plainly - but it made the
+  next question decidable: decode there is 94.2% weight-matrix products and
+  0.05% Python. Measured negatives, including one of its own changes that
+  was reverted after losing 22 of 25 end-to-end rounds, are in
+  `prompts/04-RESULTS.md`; the tooling reference is `docs/PERFORMANCE.md`.
+- The GPU tier: `alpaccaroo/cuda.py`, our own Python kernels JIT-compiled
+  for CUDA, with device-resident prefill, batched GQA attention, a
+  device-resident decode chain, and an opt-in half-precision K/V mirror
+  (`ALPACCAROO_KV_F16`) as a VRAM dial.
+- Ollama-native API, so the official client works unmodified, beside the
+  OpenAI-compatible surface.
+- Guaranteed-JSON decoding (`json_only`): every emitted fragment is a prefix
+  of one syntactically valid JSON value, on any backend at any temperature.
+- Multi-slot prefix cache, so interleaved conversations keep their K/V
+  instead of re-prefilling whenever the server switches between them.
 - Fused quantized *matmul* kernels, so a batched forward pass costs what the
   batch asks for instead of a full-model dequantize. Time-to-first-token on
   Llama-3.1-8B Q4_K_M drops 16.6x for a 1-token prefill and 2.3-2.7x for the
@@ -778,10 +799,14 @@ and the roadmap orders the work that serves it.
   JIT-compiled by `numba==0.65.1`; when active, the CLI
   keeps weights quantized by default because that is the fastest and
   smallest path.
-- Quantized int8 weight storage for Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/
-  Q4_K/Q5_K/Q6_K: blocks unpacked once at load to ~1.1-1.3 bytes per weight,
-  nothing re-dequantized per token (2.9x decode over the previous engine);
-  other formats fall back to dense float32 and say so at load.
+- Quantized weight storage with nothing re-dequantized per token (2.9x
+  decode over the previous engine). Q4_K/Q5_K/Q6_K keep the file's own block
+  fields and stream at **0.578 / 0.703 / 1.070** bytes per weight;
+  Q2_K/Q3_K/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 take the int8-codes path at ~1.125,
+  and the IQ family still falls back to dense float32 and says so at load.
+  Note the inversion this leaves, since decode is bandwidth-bound: a Q4_0
+  file streams roughly twice the bytes of a Q4_K one at the same nominal
+  precision, and a Q2_K file is smaller on disk but no cheaper to decode.
 - The dense-weight budget (`ALPACCAROO_DENSE_WEIGHT_MB`): spend RAM on BLAS
   speed exactly where it pays, FFN projections first - and the CLI sizes
   it automatically from available RAM (cgroup-aware in containers,
@@ -809,12 +834,37 @@ and the roadmap orders the work that serves it.
   optional raw-quant storage, so air-gapped stdlib mode can hold
   1B-class models in normal RAM.
 - *Performance within the constraint:* refine the densify ranking with
-  per-matrix measurements, keep shaving prefill and per-token overhead,
-  evaluate an f16 KV cache option if it proves simple and safe.
+  per-matrix measurements (now one `alpaccaroo bench` invocation rather
+  than a guess), keep shaving prefill and per-token overhead, and extend
+  the opt-in f16 K/V option from VRAM to the **host** cache, which is still
+  float32 and whose cost grows with context.
 - *Operational UX:* clearer RAM/budget messaging, Windows polish, better
   guidance for split GGUFs and unsupported architectures.
 - *Server:* broaden OpenAI-compatible behavior while staying on
   `http.server` and usable fully offline.
+- *Architecture for speed:* on hardware with bandwidth the kernels already
+  sit close to the memory wall, so what remains is structural rather than
+  more kernel tuning. Each of these is recorded with its evidence in
+  `prompts/03-RESULTS.md`, `prompts/04-RESULTS.md` and
+  `docs/PERFORMANCE.md`, and none should be started without re-reading them:
+  - *Concurrent generation.* `serve` holds one lock for the whole process.
+    A token reads the entire model however many sequences are decoding, so
+    batching concurrent requests costs almost no extra bandwidth and is the
+    largest throughput lever in the project. It does nothing for
+    single-user latency, and that trade should be made explicitly.
+  - *Native integer-dot kernels for the non-K quants*, to close the
+    inversion noted above; the pattern already exists three times over for
+    Q4_K/Q5_K/Q6_K.
+  - *Speculative decoding, re-evaluated where bandwidth binds.* Round 3
+    measured it capped at ~1.10x, but that was an ALU-saturation argument
+    on a 60 GB/s machine; a bandwidth-starved one has idle ALU to verify
+    drafts with.
+  - *Q6_K 6-bit packing*, on the same conditional reasoning: a measured
+    wash at 60 GB/s, worth re-measuring where bandwidth is the constraint.
+  - *Fusing the per-token non-weight work* (attention, rope, norms,
+    sampling, activation quantization) that costs ~8-9 ms on a fast machine
+    against llama.cpp's ~1-2 ms - a large share of the token there, and
+    almost nothing on a slow one.
 
 **Non-goals**
 
