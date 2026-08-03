@@ -126,9 +126,12 @@ The stability spread decides how cautious your method must be:
 - Do not merge anything that is faster per call and unmeasured per token.
   Round 4 shipped exactly one such change and it lost 22 of 25 end-to-end
   rounds.
-- Do not push, publish, or otherwise change remotes unless the user
-  explicitly authorises that in the fresh instance. Local commits are fine
-  when they make the work reviewable.
+- **You are authorised to commit and push to `Alpaccaroo2`.** That
+  authorisation is scoped: push to `Alpaccaroo2` (or a branch you create
+  from it) and nothing else. Do not push to `main`, `Alpaccaroo`, or any
+  other branch; do not force-push, rewrite published history, delete
+  remote branches, or change the remote URL. Push work as it becomes
+  reviewable rather than in one lump at the end.
 
 ## Work packages
 
@@ -352,5 +355,36 @@ under a machine-named subfolder such as `prompts/05-artifacts/<machine>/`
 and link them from `prompts/05-RESULTS.md`. If an artifact is too large,
 record the command, the summary table, and where the local file lives.
 
-Commit locally to `Alpaccaroo2` or a branch from it as work becomes
-reviewable. Push only after explicit user approval.
+Commit and push to `Alpaccaroo2` (or a branch from it) as work becomes
+reviewable - you have authority for that branch, and only that branch.
+
+### If the push fails, read this before spending time on it
+
+Round 4 lost about an hour here. The two failure modes, and how to tell
+them apart in one command:
+
+```sh
+git ls-remote --heads origin      # succeeds => your credential can READ
+git push origin Alpaccaroo2       # 403 => it cannot WRITE
+```
+
+- **`403 ... denied to <someone-else>`** - the machine has a stored
+  credential for the wrong GitHub account. It authenticates fine and can
+  read a public repo, which makes it look like a permissions bug in the
+  repo when it is an identity mismatch. On Windows, clear it with
+  `cmdkey /delete:LegacyGeneric:target=git:https://github.com` and push
+  again to be re-prompted; elsewhere check `~/.git-credentials`, `~/.netrc`
+  and `gh auth status`.
+- **`could not read Password ... terminal prompts disabled`, or
+  `/dev/tty: No such device or address`** - your harness has no controlling
+  terminal, so the credential helper cannot prompt at all: not a browser
+  flow, not a device code. No amount of retrying fixes it. Either have the
+  user run the push in a real terminal, or get a Personal Access Token
+  stored **before** you start (`Contents: Read and write` on this repo is
+  the only permission needed).
+
+Do not mint OAuth tokens through a third-party app registration to work
+around this, and do not read secrets out of a credential store into your
+transcript. If neither route is available, commit locally and say so
+plainly - `git bundle create <file> main..HEAD` produces a portable copy
+the user can push from anywhere.
