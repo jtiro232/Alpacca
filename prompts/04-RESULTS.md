@@ -135,6 +135,11 @@ so the risk is bounded - but it is unvalidated in situ and this log says so.
 
 ## Round 5: what is left
 
+> Written up as an executable plan in **`prompts/05-second-machine.md`**,
+> with bootstrap steps, work packages and acceptance criteria. This
+> section is the reasoning behind it; that file is the instruction.
+
+
 ### 1. Q6_K 6-bit packing - REOPENED, but read this first
 
 `03-RESULTS.md` NEGATIVE 1 measured this shut on machine A: packed 52.1
