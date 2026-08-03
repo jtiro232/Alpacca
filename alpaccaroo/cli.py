@@ -228,6 +228,39 @@ def _load_model(local: LocalModel, args):
     return m
 
 
+def _profile_wanted(args) -> bool:
+    return bool(getattr(args, "profile", False)
+                or getattr(args, "profile_json", None))
+
+
+def _profile_begin(args):
+    """Start the profiler BEFORE the model loads, so model_load time and the
+    per-role execution paths land in the same record as decode."""
+    if not _profile_wanted(args):
+        return None
+    from . import profiling
+    p = profiling.enable()
+    p.measure_overhead()
+    return p
+
+
+def _profile_end(args, profiler, model=None) -> None:
+    if profiler is None:
+        return
+    import json
+
+    from . import profiling
+    profiling.disable()
+    snap = profiling.finish_snapshot(profiler, model)
+    dest = getattr(args, "profile_json", None)
+    if dest:
+        Path(dest).write_text(json.dumps(snap, indent=2, default=str),
+                              encoding="utf-8")
+        print(f"profile written to {dest}", file=sys.stderr)
+    if getattr(args, "profile", False):
+        print(profiling.format_report(snap), file=sys.stderr)
+
+
 def cmd_pull(args) -> int:
     from .pull import pull_model
     pull_model(parse_model_ref(resolve_model_input(args.model)),
@@ -297,46 +330,79 @@ def cmd_show(args) -> int:
 def cmd_run(args) -> int:
     local, model_name = _resolve_or_pull(args.model)
     _apply_manifest_defaults(local, args)
-    model = _load_model(local, args)
-    params = _sampler_params(args)
+    profiler = _profile_begin(args)
+    model = None
+    try:
+        model = _load_model(local, args)
+        params = _sampler_params(args)
 
-    from . import chat
-    if args.prompt:
-        prompt = " ".join(args.prompt)
-        messages = []
-        if args.system:
-            messages.append({"role": "system", "content": args.system})
-        messages.append({"role": "user", "content": prompt})
-        res = chat.chat_once(model, messages, params, args.n_predict,
-                             stream=lambda s: print(s, end="", flush=True))
-        print()
-        print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]", file=sys.stderr)
+        from . import chat
+        if args.prompt:
+            prompt = " ".join(args.prompt)
+            messages = []
+            if args.system:
+                messages.append({"role": "system", "content": args.system})
+            messages.append({"role": "user", "content": prompt})
+            res = chat.chat_once(model, messages, params, args.n_predict,
+                                 stream=lambda s: print(s, end="", flush=True))
+            print()
+            print(f"[{res.tokens} tokens, {res.tok_per_sec:.1f} tok/s]",
+                  file=sys.stderr)
+            return 0
+        chat.interactive(model, params, system=args.system,
+                         n_predict=args.n_predict, model_name=model_name,
+                         model_path=str(local.model_path))
         return 0
-    chat.interactive(model, params, system=args.system, n_predict=args.n_predict,
-                     model_name=model_name, model_path=str(local.model_path))
-    return 0
+    finally:
+        # a Ctrl-C mid-generation still gets its report: the tokens it did
+        # decode are exactly the ones worth explaining
+        _profile_end(args, profiler, model)
 
 
 
 def cmd_serve(args) -> int:
     local, model_name = _resolve_or_pull(args.model)
     _apply_manifest_defaults(local, args)
-    model = _load_model(local, args)
-    from .serve import serve
-    host = args.host or os.environ.get("ALPACCAROO_HOST", "127.0.0.1")
-    port = args.port if args.port is not None else int(os.environ.get("ALPACCAROO_PORT", "8080"))
-    serve(model, model_name, host, port, defaults=_sampler_params(args))
-    return 0
+    profiler = _profile_begin(args)
+    model = None
+    try:
+        model = _load_model(local, args)
+        from .serve import serve
+        host = args.host or os.environ.get("ALPACCAROO_HOST", "127.0.0.1")
+        port = (args.port if args.port is not None
+                else int(os.environ.get("ALPACCAROO_PORT", "8080")))
+        serve(model, model_name, host, port, defaults=_sampler_params(args))
+        return 0
+    finally:
+        # a resident server aggregates every request into one record, which
+        # is the honest way to read a long-lived process's decode cost
+        _profile_end(args, profiler, model)
 
 
 
 def cmd_doctor(_args) -> int:
-    from . import tensor
+    from . import profiling, tensor
     print(f"alpaccaroo {__version__} (from-scratch python engine)")
     print(f"python:      {sys.version.split()[0]} ({sys.executable})")
     print(f"backend:     {tensor.backend_name()}"
           + ("  (optional accelerator active)" if tensor.HAS_NUMPY
              else "  (pip install numpy for big speedups)"))
+    # the coarse label above cannot tell an einsum fallback from the
+    # integer-dot kernels, and those differ by more than 2x
+    print(f"path:        {tensor.backend_detail()}")
+    rt = profiling.runtime_info()
+    cpu = rt["cpu"]
+    print(f"cpu:         {cpu.get('model') or 'unknown'} | "
+          f"{rt.get('physical_cores') or '?'} physical / "
+          f"{rt.get('logical_cores') or '?'} logical cores")
+    print(f"cpu flags:   {', '.join(cpu.get('features') or []) or 'none detected'}"
+          f"  (via {cpu.get('source')})")
+    blas = rt["blas"]
+    print(f"blas:        {blas.get('name') or 'unknown'} | threads "
+          f"{blas.get('threads') if blas.get('threads') is not None else '?'}"
+          + (f" ({blas['parallel']})" if blas.get("parallel") else ""))
+    print(f"kernels:     {rt['kernels']} | threads "
+          f"{rt.get('numba_threads') or '?'}")
     from . import cuda
     print(f"gpu:         {cuda.doctor_line()}")
     root = models_root()
@@ -349,6 +415,11 @@ def cmd_doctor(_args) -> int:
     n = len(list_models())
     print(f"installed:   {n} model(s)" + ("" if n else " - try `alpaccaroo pull llama3.2:1b`"))
     return 0
+
+
+def cmd_bench(args) -> int:
+    from .bench import main as bench_main
+    return bench_main(args.bench_args)
 
 
 def cmd_tokenize(args) -> int:
@@ -818,6 +889,10 @@ def _add_model_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--n-predict", "-n", type=int, default=-1,
                    help="max tokens to generate (-1 = until end)")
     p.add_argument("--system", "-sys", default="", help="system prompt")
+    p.add_argument("--profile", action="store_true",
+                   help="print a decode time/execution-path breakdown at exit")
+    p.add_argument("--profile-json", metavar="PATH", default=None,
+                   help="write the same breakdown to PATH as JSON")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -829,6 +904,12 @@ def main(argv: list[str] | None = None) -> int:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass
+    tail = sys.argv[1:] if argv is None else list(argv)
+    if tail and tail[0] == "bench":
+        # delegated before argparse sees it: `--help`, `--model x --model y`
+        # and every other bench flag belong to bench's own parser
+        from .bench import main as bench_main
+        return bench_main(tail[1:])
     ap = argparse.ArgumentParser(
         prog="alpaccaroo",
         description="alpaccaroo - LLMs in your terminal, implemented in pure Python",
@@ -904,6 +985,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("doctor", help="check the installation")
     p.set_defaults(func=cmd_doctor)
+
+    # listed for `alpaccaroo --help`, but never parsed here: main() hands the
+    # whole tail to alpaccaroo.bench so its twenty flags (and its own --help)
+    # stay in one place instead of being mirrored into this parser
+    p = sub.add_parser("bench", add_help=False,
+                       help="benchmark prefill/decode, cold and warm "
+                            "(see `alpaccaroo bench --help`)")
+    p.set_defaults(func=cmd_bench, bench_args=[])
 
     args = ap.parse_args(argv)
     if not args.command:

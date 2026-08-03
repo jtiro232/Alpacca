@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+from time import perf_counter as _perf
 
 try:
     import numpy as _np
@@ -34,6 +35,7 @@ from .qmatrix import (  # noqa: E402  (re-exported quantized-matrix surface)
     hot_cache_stats,
 )
 from .quants import QK, QK_K  # noqa: E402,F401  (block sizes, for callers/tests)
+from . import profiling as _profiling  # noqa: E402  (no alpaccaroo imports at its top)
 
 
 # Flipped by alpaccaroo.cuda when the first weight matrix reaches VRAM, so
@@ -45,6 +47,31 @@ def backend_name() -> str:
     if _GPU_ACTIVE:
         return "gpu (cuda)"
     return "numpy" if HAS_NUMPY else "pure-python"
+
+
+def backend_detail() -> str:
+    """The coarse label plus what actually executes matrix products.
+
+    ``backend numpy`` cannot distinguish a NumPy einsum fallback from our
+    JIT'd integer-dot kernels, and those differ by more than 2x. This
+    names the tier; :func:`alpaccaroo.profiling.model_paths` names the
+    per-matrix path once a model is loaded.
+    """
+    if _GPU_ACTIVE:
+        return "gpu-cuda (host fallback: " + _cpu_backend_detail() + ")"
+    return _cpu_backend_detail()
+
+
+def _cpu_backend_detail() -> str:
+    if not HAS_NUMPY:
+        return "pure-python"
+    from . import kernels as _k
+    if not _k.available():
+        return "numpy (no kernels: einsum quantized matvec, BLAS dense)"
+    if _k.int_dot_enabled():
+        return f"numpy + alpaccaroo-kernels {_k.kernel_version()} (native integer-dot)"
+    return (f"numpy + alpaccaroo-kernels {_k.kernel_version()} "
+            f"(fused f32-scale, ALPACCAROO_INT_DOT off)")
 
 
 def _is_gpu_matrix(W) -> bool:
@@ -102,6 +129,14 @@ def matvec(W, x):
     return [sum(w * xv for w, xv in zip(row, x)) for row in W]
 
 
+def _is_native_quant(W) -> bool:
+    """True when W's matvec takes the integer-dot kernel, which is the one
+    path that can share a pre-quantized activation vector."""
+    return (isinstance(W, QuantizedMatrix)
+            and W._mode in ("q4k_int", "q5k_int", "q6k_int")
+            and W._dense_cache is None)
+
+
 def matvec_group(Ws, x):
     """Matvec several matrices against the SAME input vector.
 
@@ -121,16 +156,26 @@ def matvec_group(Ws, x):
                 # NumPy broadcasts that into an ambiguous truth value
                 return [W.matvec(x, dx) if _is_gpu_matrix(W)
                         else matvec(W, x) for W in Ws]
-        native = [W for W in Ws
-                  if isinstance(W, QuantizedMatrix)
-                  and getattr(W, "_mode", "codes") in ("q4k_int", "q5k_int",
-                                                       "q6k_int")
-                  and W._dense_cache is None]
-        if len(native) >= 2 and _HOT_WEIGHT_ENV not in os.environ:
+        # Precompute the flags rather than testing `W in native` per matrix:
+        # a group can legitimately MIX a dense ndarray with native quantized
+        # ones - ALPACCAROO_DENSE_WEIGHT_MB densifies attn_q one tier before
+        # attn_k/attn_v - and `ndarray in [QuantMatrix, ...]` evaluates
+        # `ndarray == QuantMatrix`, which NumPy broadcasts into "the truth
+        # value of an array is ambiguous". Same failure the gpu branch above
+        # documents; the marker-list form cannot hit it.
+        native = [_is_native_quant(W) for W in Ws]
+        if (sum(native) >= 2 and _HOT_WEIGHT_ENV not in os.environ
+                and len({W.cols for W, f in zip(Ws, native) if f}) == 1):
             from . import kernels as _k
+            p = _profiling.ACTIVE
+            t0 = _perf() if p is not None else 0.0
             pre = _k.quantize_acts(x)
-            return [W.matvec(x, pre) if W in native else matvec(W, x)
-                    for W in Ws]
+            out = [W.matvec(x, pre) if f else matvec(W, x)
+                   for W, f in zip(Ws, native)]
+            if p is not None:
+                p.add("matvec_grouped", _perf() - t0)
+                p.bump("matvec_grouped_matrices", sum(native))
+            return out
     return [matvec(W, x) for W in Ws]
 
 

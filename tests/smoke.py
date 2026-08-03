@@ -790,6 +790,26 @@ def main() -> None:
                 check(f"{_dt} shared-quantization matvec_group is bit-exact",
                       np.array_equal(np.asarray(grp[0]), solo) and
                       np.array_equal(np.asarray(grp[1]), solo))
+                # A dense ndarray sharing a group with two native matrices is
+                # exactly what ALPACCAROO_DENSE_WEIGHT_MB produces when the
+                # budget reaches attn_q but not attn_k/attn_v. Membership
+                # testing that ndarray against the native list raised "the
+                # truth value of an array is ambiguous"; the marker-list
+                # dispatch cannot.
+                # its own generator: drawing from `rng` would shift every
+                # later case's x and re-roll the tolerance checks below
+                wd = np.random.default_rng(4242).standard_normal(
+                    (5, _cols)).astype(np.float32)
+                mixed = T.matvec_group([wd, qm, qm], x)
+                check(f"{_dt} matvec_group tolerates a dense matrix in the group",
+                      np.array_equal(np.asarray(mixed[0]), wd @ x) and
+                      np.array_equal(np.asarray(mixed[1]), solo) and
+                      np.array_equal(np.asarray(mixed[2]), solo))
+                check(f"{_dt} path label names the running kernel",
+                      qm.path_label() == f"numba-int-{_dt.lower()[:2]}k"
+                      and qm_f32.path_label() in ("numba-codes-f32",
+                                                  "numpy-quant-einsum"),
+                      f"{qm.path_label()} / {qm_f32.path_label()}")
                 os.environ["ALPACCAROO_INT_MATMUL_MAX_BATCH"] = "0"
                 try:
                     X = rng.standard_normal((3, _cols)).astype(np.float32)
@@ -2385,6 +2405,121 @@ def main() -> None:
         check("tokenize via model name", "\u2581hello" in r.stdout or "hello" in r.stdout)
         r = run_cli("tokenize", "-m", "Tiny Buddy", "-p", "hello", env=env)
         check("tokenize resolves nickname", "\u2581hello" in r.stdout or "hello" in r.stdout)
+
+        # ---- profiler (Package A) ----------------------------------------
+        # The whole point of a profiler is that it measures the engine
+        # rather than perturbing it, so the pinned check is that greedy
+        # output is character-identical with it on and off.
+        plain = run_cli("run", "tiny", "profile me", "-n", "12", "--temp", "0",
+                        "--seed", "7", env=env)
+        prof_json = tmp / "profile.json"
+        profiled = run_cli("run", "tiny", "profile me", "-n", "12", "--temp", "0",
+                           "--seed", "7", "--profile",
+                           "--profile-json", str(prof_json), env=env)
+        check("profile mode does not change generated output",
+              plain.stdout == profiled.stdout,
+              f"plain={plain.stdout!r} profiled={profiled.stdout!r}")
+        check("profile report names the decode buckets and paths",
+              "decode breakdown" in profiled.stderr
+              and "execution paths" in profiled.stderr
+              and "output_proj" in profiled.stderr
+              and "orchestration" in profiled.stderr,
+              profiled.stderr[-1500:])
+        check("profile-json writes a file", prof_json.exists())
+        snap = json.loads(prof_json.read_text(encoding="utf-8"))
+        # generate() never forwards the last sampled token - nothing would
+        # read its logits - so a run that emits N tokens decodes N-1 of them
+        emitted = int(profiled.stderr.split("[", 1)[1].split(" tokens", 1)[0])
+        check("profile json carries the run's timing",
+              snap["tokens_decoded"] == max(emitted - 1, 0)
+              and snap["decode_seconds"] > 0
+              and snap["prefill_tokens"] > 0
+              and set(snap["token_latency_seconds"]) >=
+              {"min", "p50", "p95", "max"},
+              f"emitted={emitted} " + json.dumps(snap)[:500])
+        check("profile json carries the environment a run is comparable in",
+              snap["runtime"]["python"] and snap["runtime"]["backend_detail"]
+              and "logical_cores" in snap["runtime"]
+              and "features" in snap["runtime"]["cpu"]
+              and "threads" in snap["runtime"]["blas"],
+              json.dumps(snap.get("runtime", {}))[:600])
+        bd = snap["decode_breakdown_seconds"]
+        check("decode buckets never exceed the decode wall clock",
+              bd["orchestration"] >= -1e-3
+              and abs(sum(bd.values()) - snap["decode_seconds"]) < 1e-6,
+              json.dumps(bd))
+        # ---- benchmark harness (Package B) --------------------------------
+        # The acceptance criterion with teeth: a nickname that IS installed
+        # must never reach the network. The pre-harness bench.py parsed
+        # "Tiny Buddy" as an unknown registry name and pulled it.
+        bench_json = tmp / "bench.json"
+        bench_csv = tmp / "bench.csv"
+        r = run_cli("bench", "--model", "Tiny Buddy", "--prefill", "16",
+                    "--decode", "4", "--json", str(bench_json),
+                    "--csv", str(bench_csv), "--bench-lines", env=env)
+        check("bench resolves a nickname without pulling",
+              "BENCH " in r.stdout and "pulling" not in r.stderr,
+              r.stdout + r.stderr)
+        breport = json.loads(bench_json.read_text(encoding="utf-8"))
+        phases = {rec["phase"] for rec in breport["records"]}
+        check("bench separates cold from warm", phases == {"cold", "warm"},
+              str(phases))
+        brec = breport["records"][0]
+        check("bench records the numbers a comparison needs",
+              brec["prefill_tok_per_s"] > 0 and brec["decode_tok_per_s"] > 0
+              and brec["load_seconds"] > 0
+              and brec["time_to_first_token_seconds"] > 0
+              and set(brec["token_latency_seconds"]) >= {"p50", "p95"}
+              and brec["paths"],
+              json.dumps(brec)[:600])
+        check("bench records the machine the numbers came from",
+              breport["runtime"]["os"] and breport["runtime"]["arch"]
+              and "numpy" in breport["runtime"]
+              and "threads" in breport["runtime"]["blas"],
+              json.dumps(breport.get("runtime", {}))[:400])
+        check("warm rows carry no load time to misattribute",
+              all(rec["load_seconds"] is None
+                  for rec in breport["records"] if rec["phase"] == "warm"))
+        csv_head = bench_csv.read_text(encoding="utf-8").splitlines()[0]
+        check("bench csv flattens the environment into every row",
+              "decode_tok_per_s" in csv_head and "cpu_model" in csv_head
+              and "blas_threads" in csv_head and "token_latency_p95_s" in csv_head,
+              csv_head)
+        r = run_cli("bench", "--model", "definitely-not-installed:9b",
+                    "--prefill", "8", "--decode", "2", env=env, expect=1)
+        check("bench refuses to download an uninstalled model by default",
+              "not installed locally" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-400:])
+        r = run_cli("bench", "--model", "tiny", "--shapes", "nonsense",
+                    env=env, expect=1)
+        check("bench rejects an unknown shape with the valid ones listed",
+              "unknown shape" in (r.stdout + r.stderr)
+              and "long-long" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-300:])
+
+        from alpaccaroo import profiling as _profiling
+        check("every reported path label is a known one",
+              all(part in _profiling.PATH_LABELS
+                  for role in snap["paths"]["roles"].values()
+                  for part in role["path"].split("+")),
+              json.dumps(snap["paths"]["roles"]))
+        check("path report covers the roles decode actually walks",
+              {"token_embd", "attn_output", "ffn_down"} <=
+              set(snap["paths"]["roles"]),
+              json.dumps(sorted(snap["paths"]["roles"])))
+        # the pure tier prefills by looping forward(); those tokens must not
+        # be counted as decoded ones or the reported tok/s blends two loops
+        pure_json = tmp / "profile-pure.json"
+        pr = run_cli("run", "tiny", "profile me", "-n", "6", "--temp", "0",
+                     "--profile-json", str(pure_json),
+                     env={**env, "ALPACCAROO_PURE": "1"})
+        psnap = json.loads(pure_json.read_text(encoding="utf-8"))
+        pure_emitted = int(pr.stderr.split("[", 1)[1].split(" tokens", 1)[0])
+        check("pure tier does not count prefill tokens as decoded",
+              psnap["tokens_decoded"] == max(pure_emitted - 1, 0)
+              and psnap["prefill_tokens"] > psnap["tokens_decoded"]
+              and psnap["runtime"]["backend"] == "pure-python",
+              f"emitted={pure_emitted} " + json.dumps(psnap)[:400])
 
         old_home = os.environ.get("ALPACCAROO_HOME")
         try:

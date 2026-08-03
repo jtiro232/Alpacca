@@ -5,8 +5,10 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass, field
+from time import perf_counter as _perf
 from typing import TextIO
 
+from . import profiling as _prof
 from .model import Model
 from .sample import Sampler, SamplerParams
 from .tokenizer import StreamDecoder
@@ -212,6 +214,7 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
         guard = JsonGuard()
         table = token_bytes_table(model.tok)
     sampler = Sampler(params)
+    _profiler = _prof.ACTIVE
     # only the last repeat_last_n tokens can ever remain in the penalty
     # window, so skip the rest rather than walk a 16k prompt to fill 64 slots
     for t in prompt_ids[-max(params.repeat_last_n, 1):]:
@@ -257,7 +260,12 @@ def generate(model: Model, prompt_ids: list[int], params: SamplerParams,
             reason = "stop"   # a turn-start token: the reply is complete
             break
         n_tokens += 1
-        piece = dec.feed(tid)
+        if _profiler is not None:
+            _t = _perf()
+            piece = dec.feed(tid)
+            _profiler.add("tokenizer_stream", _perf() - _t)
+        else:
+            piece = dec.feed(tid)
         text += piece
         if guard is not None and guard.done:
             # the top-level value just closed; checked before stop strings so
@@ -332,7 +340,12 @@ def chat_once(model: Model, messages: list[dict], params: SamplerParams,
               stop_strings: list[str] | None = None, *,
               json_only: bool = False) -> GenerationResult:
     fmt = ChatFormat(model, detect_format(model.metadata))
+    p = _prof.ACTIVE
+    t0 = _perf() if p is not None else 0.0
     ids = fmt.render(messages)
+    if p is not None:
+        p.add("prompt_render", _perf() - t0)
+        p.set("chat_format", fmt.name)
     return generate(model, ids, params, n_predict, stream, stop_strings,
                     stop_tokens=fmt.stop_tokens(), json_only=json_only)
 

@@ -9,7 +9,9 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from time import perf_counter as _perf
 
+from . import profiling as _prof
 from . import tensor as T
 from .gguf import GGML_BLOCK_INFO, GGUFFile
 from .quants import dequantize
@@ -749,6 +751,12 @@ class Model:
                 m._use_gpu_batch_attention = True
                 m._use_gpu_chain = True
             m.load_seconds = time.time() - t0
+            p = _prof.ACTIVE
+            if p is not None:
+                p.add("model_load", m.load_seconds)
+                p.set("model_path", path)
+                p.set("model_describe", m.describe())
+                p.set("paths", _prof.model_paths(m))
             return m
         finally:
             gf.close()
@@ -1050,11 +1058,17 @@ class Model:
         """Process one token at the current position; returns logits."""
         if self.n_past >= self.n_ctx:
             raise RuntimeError(f"context window full ({self.n_ctx} tokens)")
+        p = _prof.ACTIVE
+        t0 = _perf() if p is not None else 0.0
         if self.hp.arch == "gemma3":
             logits = (self._forward_gemma3_np(token) if T.HAS_NUMPY
                       else self._forward_gemma3_pure(token))
         else:
             logits = self._forward_np(token) if T.HAS_NUMPY else self._forward_pure(token)
+        if p is not None and not p.in_prefill:
+            # one decode token, wall-clock: the sum of the buckets inside is
+            # always less, and the difference is what `orchestration` reports
+            p.token(_perf() - t0)
         self.cached_ids.append(token)
         return logits
 
@@ -1212,18 +1226,34 @@ class Model:
             if logits is not None:
                 self.n_past += 1
                 return logits
+        # One module read per token when profiling is off, and `add` stays
+        # None so every timing site below is a single truth test. The
+        # arithmetic is untouched either way: profiled and un-profiled runs
+        # emit identical logits, which tests/smoke.py pins down.
+        p = _prof.ACTIVE
+        add = p.add if p is not None else None
         hp = self.hp
         pos = self.n_past
         self._chain_invalidate(pos)  # the cache writes below are host-side
+        if add:
+            t0 = _perf()
         x = T.matrix_row(self.tok_embd, token)  # fresh float32 copy
         if hp.embed_scale != 1.0:
             x = x * hp.embed_scale
+        if add:
+            add("embedding", _perf() - t0)
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
 
         qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
+            if add:
+                t0 = _perf()
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             if ly.wqk is not None:
                 qk, v = T.matvec_group([ly.wqk, ly.wv], h)
                 q = qk[:qd]
@@ -1236,17 +1266,37 @@ class Model:
                 k = k + ly.bk
             if ly.bv is not None:
                 v = v + ly.bv
+            if add:
+                t1 = _perf()
+                add("attn_qkv", t1 - t0)
+                t0 = t1
             q = self._rope_np(q, hp.n_head, pos).reshape(hp.n_head, hp.head_dim)
             k = self._rope_np(k, hp.n_kv, pos).reshape(hp.n_kv, hp.head_dim)
             self.cache_k[li][pos] = k
             self.cache_v[li][pos] = v.reshape(hp.n_kv, hp.head_dim)
+            if add:
+                t1 = _perf()
+                add("rope", t1 - t0)
+                t0 = t1
 
             K = self.cache_k[li][:pos + 1]            # (t, n_kv, hd)
             V = self.cache_v[li][:pos + 1]
             att_out = self._attention_np(q, K, V, group, inv_sqrt)
+            if add:
+                t1 = _perf()
+                add("attention", t1 - t0)
+                t0 = t1
             x = x + T.matvec(ly.wo, att_out.reshape(-1))
+            if add:
+                t1 = _perf()
+                add("attn_out", t1 - t0)
+                t0 = t1
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             if ly.wgu is not None:
                 gu = T.matvec(ly.wgu, h)
                 gate = gu[:hp.n_ff]
@@ -1254,12 +1304,32 @@ class Model:
             else:
                 gate = T.matvec(ly.w_gate, h)
                 up = T.matvec(ly.w_up, h)
+            if add:
+                t1 = _perf()
+                add("ffn_gate_up", t1 - t0)
+                t0 = t1
             act = (T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
                    else gate / (1.0 + np.exp(-gate))) * up
+            if add:
+                t1 = _perf()
+                add("ffn_act", t1 - t0)
+                t0 = t1
             x = x + T.matvec(ly.w_down, act)
+            if add:
+                add("ffn_down", _perf() - t0)
 
         self.n_past += 1
-        return T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
+        if add:
+            t0 = _perf()
+        h = T.rmsnorm(x, self.out_norm, hp.rms_eps)
+        if add:
+            t1 = _perf()
+            add("norm", t1 - t0)
+            t0 = t1
+        logits = T.matvec(self.output, h)
+        if add:
+            add("output_proj", _perf() - t0)
+        return logits
 
     def _gemma3_layer_is_sliding(self, layer_index: int) -> bool:
         hp = self.hp
@@ -1445,16 +1515,29 @@ class Model:
         return self._softcap_logits(logits)
 
     def _forward_gemma3_np(self, token: int):
+        # same bucket contract as _forward_np; see the comment there
+        p = _prof.ACTIVE
+        add = p.add if p is not None else None
         hp = self.hp
         pos = self.n_past
         self._chain_invalidate(pos)  # same contract as _forward_np
+        if add:
+            t0 = _perf()
         x = T.matrix_row(self.tok_embd, token) * hp.embed_scale
+        if add:
+            add("embedding", _perf() - t0)
         inv_sqrt = hp.attention_scale
         group = hp.n_head // hp.n_kv
 
         qd = hp.n_head * hp.head_dim
         for li, ly in enumerate(self.layers):
+            if add:
+                t0 = _perf()
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             if ly.wqk is not None:
                 qk, v = T.matvec_group([ly.wqk, ly.wv], h)
                 q = qk[:qd]
@@ -1467,8 +1550,16 @@ class Model:
                 k = k + ly.bk
             if ly.bv is not None:
                 v = v + ly.bv
+            if add:
+                t1 = _perf()
+                add("attn_qkv", t1 - t0)
+                t0 = t1
             q = self._rmsnorm_heads_np(q, hp.n_head, ly.q_norm)
             k = self._rmsnorm_heads_np(k, hp.n_kv, ly.k_norm)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)   # gemma3's per-head q/k norms
+                t0 = t1
             sliding = self._gemma3_layer_is_sliding(li)
             q = self._rope_np_gemma3(q, hp.n_head, pos, sliding).reshape(
                 hp.n_head, hp.head_dim)
@@ -1476,26 +1567,71 @@ class Model:
                 hp.n_kv, hp.head_dim)
             self.cache_k[li][pos] = k
             self.cache_v[li][pos] = v.reshape(hp.n_kv, hp.head_dim)
+            if add:
+                t1 = _perf()
+                add("rope", t1 - t0)
+                t0 = t1
 
             start = max(0, pos - hp.sliding_window + 1) if sliding else 0
             K = self.cache_k[li][start:pos + 1]
             V = self.cache_v[li][start:pos + 1]
             att_out = self._attention_np(q, K, V, group, inv_sqrt)
+            if add:
+                t1 = _perf()
+                add("attention", t1 - t0)
+                t0 = t1
             att_proj = T.matvec(ly.wo, att_out.reshape(-1))
+            if add:
+                t1 = _perf()
+                add("attn_out", t1 - t0)
+                t0 = t1
             x = x + T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps)
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             if ly.wgu is not None:
                 gu = T.matvec(ly.wgu, h)
+                if add:
+                    t1 = _perf()
+                    add("ffn_gate_up", t1 - t0)
+                    t0 = t1
                 act = T.gelu_pytorch_tanh(gu[:hp.n_ff]) * gu[hp.n_ff:]
             else:
-                act = T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)) * T.matvec(ly.w_up, h)
+                gate = T.matvec(ly.w_gate, h)
+                up = T.matvec(ly.w_up, h)
+                if add:
+                    t1 = _perf()
+                    add("ffn_gate_up", t1 - t0)
+                    t0 = t1
+                act = T.gelu_pytorch_tanh(gate) * up
+            if add:
+                t1 = _perf()
+                add("ffn_act", t1 - t0)
+                t0 = t1
             ffn_out = T.matvec(ly.w_down, act)
+            if add:
+                t1 = _perf()
+                add("ffn_down", t1 - t0)
+                t0 = t1
             x = x + T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps)
+            if add:
+                add("norm", _perf() - t0)
 
         self.n_past += 1
-        logits = T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
-        return self._softcap_logits(logits)
+        if add:
+            t0 = _perf()
+        h = T.rmsnorm(x, self.out_norm, hp.rms_eps)
+        if add:
+            t1 = _perf()
+            add("norm", t1 - t0)
+            t0 = t1
+        logits = self._softcap_logits(T.matvec(self.output, h))
+        if add:
+            add("output_proj", _perf() - t0)
+        return logits
 
     def _forward_gemma3_pure(self, token: int):
         hp = self.hp
@@ -1639,18 +1775,32 @@ class Model:
         suffix = tokens[n:]
         self.last_prefill_forwarded = len(suffix)
         logits = None
-        if T.HAS_NUMPY:
-            raw = os.environ.get("ALPACCAROO_PREFILL_CHUNK", "256")
-            try:
-                chunk = max(1, int(raw))
-            except ValueError:
-                chunk = 256
-            for i in range(0, len(suffix), chunk):
-                logits = self.forward_batch(suffix[i:i + chunk],
-                                            want_logits=i + chunk >= len(suffix))
-        else:
-            for t in suffix:
-                logits = self.forward(t)
+        p = _prof.ACTIVE
+        if p is not None:
+            p.set("prefill_reused_prefix_tokens", n)
+        t0 = _perf() if p is not None else 0.0
+        if p is not None:
+            p.in_prefill = True
+        try:
+            if T.HAS_NUMPY:
+                raw = os.environ.get("ALPACCAROO_PREFILL_CHUNK", "256")
+                try:
+                    chunk = max(1, int(raw))
+                except ValueError:
+                    chunk = 256
+                for i in range(0, len(suffix), chunk):
+                    logits = self.forward_batch(suffix[i:i + chunk],
+                                                want_logits=i + chunk >= len(suffix))
+            else:
+                for t in suffix:
+                    logits = self.forward(t)
+        finally:
+            if p is not None:
+                p.in_prefill = False
+        if p is not None:
+            # the forwarded suffix only: a prefix hit costs no compute, and
+            # charging it here would report a tok/s the machine never did
+            p.prefill(len(suffix), _perf() - t0)
         return logits
 
     def describe(self) -> str:

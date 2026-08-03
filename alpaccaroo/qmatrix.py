@@ -231,6 +231,27 @@ class QuantMatrix:
     def shape(self) -> tuple[int, int]:
         return self.rows, self.cols
 
+    def path_label(self) -> str:
+        """Which kernel this matrix's matvec will actually run through.
+
+        One of alpaccaroo.profiling.PATH_LABELS. Reports what a call made
+        right now would do, so a hot-cached matrix says so rather than
+        naming the kernel its codes would otherwise have taken.
+        """
+        if not HAS_NUMPY:
+            return "pure-python-quant"
+        if self._dense_cache is not None:
+            return "numpy-dense-hotcache"
+        if self._mode == "q4k_int":
+            return "numba-int-q4k"
+        if self._mode == "q5k_int":
+            return "numba-int-q5k"
+        if self._mode == "q6k_int":
+            return "numba-int-q6k"
+        if not self._small and _kernels.available():
+            return "numba-codes-f32"
+        return "numpy-quant-batched" if self._small else "numpy-quant-einsum"
+
     def storage_nbytes(self) -> int:
         """Bytes held by the quantized representation (excl. hot cache)."""
         if HAS_NUMPY:

@@ -542,6 +542,24 @@ def available() -> bool:
     return bool(_init())
 
 
+def kernel_version() -> str:
+    """`numba==X` when the JIT is live, `off` otherwise - for backend labels."""
+    st = _init()
+    return f"numba=={st['numba_version']}" if st else "off"
+
+
+def threads() -> int:
+    """Threads the kernels' own pool will use, or 0 when they are inactive."""
+    st = _init()
+    if not st:
+        return 0
+    try:
+        import numba
+        return int(numba.get_num_threads())
+    except Exception:
+        return 0
+
+
 def status() -> str:
     st = _init()
     if st:

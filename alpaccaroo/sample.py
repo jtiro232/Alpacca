@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
+from time import perf_counter as _perf
 
+from . import profiling as _prof
 from . import tensor as T
 
 if T.HAS_NUMPY:
@@ -92,6 +94,16 @@ class Sampler:
         exclude (constrained decoding - see jsonform): they are masked to
         -inf on a private copy, so the caller's logits are never touched
         and repeated resampling of one position stays independent."""
+        prof = _prof.ACTIVE
+        if prof is not None:
+            t0 = _perf()
+            try:
+                return self._sample(logits, banned)
+            finally:
+                prof.add("sampler", _perf() - t0)
+        return self._sample(logits, banned)
+
+    def _sample(self, logits, banned=None) -> int:
         p = self.params
         if T.HAS_NUMPY:
             # np.array always copies, so the penalty below cannot mutate the
