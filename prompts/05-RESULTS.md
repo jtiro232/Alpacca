@@ -673,46 +673,85 @@ measuring, and it is the single most interesting unrun experiment here.
 
 ---
 
-## Summary: what this round did and did not establish
 
-**Established.**
+## Summary
 
-1. Machine C is the first of the three that **holds its clocks** (spread
-   1.06x over 70 s at 25.4-26.8 GB/s), which makes it the right machine for
-   the two questions round 4 could not answer. It answered neither, for
-   reasons unrelated to the machine.
-2. **H2 is closed by hardware**: Zen 3 has no AVX-512 and no VNNI, so there
-   is no zmm question here. The asm census is the portable result - **zero
+### Measured and settled
+
+1. **Machine C holds its clocks** - spread 1.06x over 70 s at 25.4-26.8
+   GB/s, the first of the three that does. That is what made the rest of
+   this round decidable.
+2. **H2 closed by hardware.** Zen 3 has no AVX-512 and no VNNI, so there is
+   no zmm question here. The portable result is the asm census: **zero
    `vpdpwssd` but also zero `vpmuldq`**, so the `np.int32(acc + i32*i32)`
-   re-cast idiom is still doing its job on a CPU generation that predates
-   the instruction it was discovered for. The idiom is not a VNNI trick; it
-   keeps the contraction in 32-bit lanes and LLVM falls back cleanly to
-   256-bit `vpmaddwd`. `docs/PERFORMANCE.md` currently frames it as an
-   AVX-512 VNNI story and should be corrected.
-3. **L is closed by hardware**: no CUDA device. `cuda.py` still has zero
-   changes on this branch and remains unexercised by anyone.
+   idiom is not a VNNI trick - it keeps the contraction in 32-bit lanes and
+   LLVM falls back cleanly to 256-bit `vpmaddwd`. `docs/PERFORMANCE.md` and
+   `README.md` have been corrected accordingly.
+3. **L closed by hardware.** No CUDA device; `cuda.py` remains unexercised
+   by anyone.
 4. **The benchmark matrix exists** for 0.5B/1B/3B across five shapes and
-   three context windows, with an 8B capacity boundary recorded rather than
-   forced.
-5. **The kernel-coverage gap**: three of the four runnable models spend
-   83-100% of their matvecs on `numba-codes-f32`, because Q8_0 has no
-   native path and because a model whose `embd` is not a multiple of 256
-   cannot be K-quantized. This is the finding most likely to redirect round
-   6.
-6. **A real user-visible defect**: a 1865 ms first decode token on Q4_K_M
-   models with a cold JIT cache, invisible to p50, caused by the Package D
-   pair kernel missing from `warmup()`.
-7. **A second defect**: the rebrand orphaned every existing user's model
-   store.
+   three context windows, with the 8B recorded as a capacity boundary.
+5. **Package J: the narrow-matrix dispatch loses.** Shipped enabled since
+   round 4, validated end-to-end for the first time here, and it costs 4%
+   (4/25) at the default threshold and 21% (0/25) when widened.
+6. **Package N: SMT loses, 0 wins in 51 rounds** across three models. The
+   physical-core default is confirmed; the *autotuner* is not, having
+   recommended SMT for two of three models and been sign-inverted on both.
+7. **Package H1: round 4's regression does not reproduce** on a machine with
+   steady clocks (6/15, median 1.0155). That bounds its cause to machine B
+   rather than to the knob.
+8. **Package K shipped**, bit-identical by construction, 553 checks green,
+   and its exactness check shown to fail under a mutated kernel.
+9. **Two defects found and fixed**: a 1865 ms first decode token on Q4_K_M
+   models with a cold JIT cache, and a rebrand that orphaned every existing
+   user's model store.
 
-**Not established, and not because the avenues failed.** Packages I, J,
-H1, M, N produced no numbers; Package K is unverified code. The machine
-stopped being able to execute `python3` or `git` at 23:02 UTC.
+### The one finding that outranks the rest
 
-**State to recover.** Pushed: `d164184` on `Alpaccaroo2` (Step 0 only).
-Uncommitted in `/home/ubuntu/alpaccaroo`, on a **volatile tmpfs**:
-`alpaccaroo/{kernels,tensor,store,cli}.py`, `tests/smoke.py`, and six
-benchmark JSONs plus this file under `prompts/05-artifacts/`. Round 6's
-first act should be to confirm whether that tree survived; if it did not,
-this log contains every number, and the two defects and the Package K
-design are described precisely enough to redo in an afternoon.
+Four configurations were checked per-call against whole-loop this round and
+the previous one. **All four over-credited the setting that reduces
+parallelism or dispatch count**, twice by enough to invert the sign. The
+per-call harness is not a scaled-down version of the decode loop, and the
+error is directional rather than random. Anything this project measures per
+call from here should be treated as a hypothesis until a sign test on the
+whole loop agrees.
+
+That has a concrete casualty: `alpaccaroo tune` measures per call and writes
+a cache that `ALPACCAROO_AUTOTUNE=1` applies verbatim. On this machine that
+pipeline would have cost a user 42% on the 3B and 63% on the 0.5B.
+
+### Recommended changes, not yet made
+
+Left for a round that can validate them on more than one machine:
+
+- `SERIAL_MATVEC_ELEMS_DEFAULT` -> **0**, keeping the knob and the tuner,
+  exactly the treatment round 4 gave the quantize threshold (Package J).
+- `alpaccaroo tune` should either validate end-to-end before writing a
+  recommendation, or label its output a hypothesis (Package N).
+
+### Still not done
+
+- **Package I** - the packed-Q6_K kernel and its microbenchmark are written
+  and bit-identity-checked by construction; see the artifact table.
+- **Package M** - the resident-server workflow.
+- **Package K has no end-to-end number**, because no installed model
+  exercises the pairing: it needs a Q4_K_S file whose `embd` is a multiple
+  of 256 (`Llama-3.2-1B-Instruct-Q4_K_S` is the cheapest). Qwen2.5-0.5B
+  Q4_K_S does **not** work - its only K-quant tensors are `ffn_down`, which
+  is a standalone dispatch rather than a shared-activation group.
+- **The 8B class** is unmeasured here, and it is what BTBK actually runs.
+  See `05-BTBK-POS-FIT.md`.
+
+### For the next engineer
+
+Everything needed to re-run this round is in
+`prompts/05-artifacts/ryzen7-7730u-ubuntu/`: the JSON for every row, and
+`harnesses/` with the end-to-end ABBA harness (`e2e_ab.py`, experiments
+`narrow` / `narrow_wide` / `threads` / `quantize` / `group`), the packed
+Q6_K microbenchmark, the GGUF census that found the Package J trigger
+model, and the tier comparison used for the POS assessment.
+
+The single cheapest way to check that this machine's results are not a
+fluke: run `e2e_ab.py qwen05bm narrow 25 24` on any other box. It takes
+about three minutes and it either reproduces a 4% loss on a default that
+ships enabled, or it does not.
