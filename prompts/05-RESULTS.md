@@ -497,6 +497,55 @@ once been validated end-to-end, and that measures as a regression the first
 time it is, is the conservative choice. Machine B's per-call numbers
 (1.30-1.90x for narrow shapes) were never validated end to end either.
 
+## Package N - the tuner recommends SMT, and end-to-end it is wrong
+
+Step 0's `alpaccaroo tune -m` said 16 logical threads beat the
+8-physical-core default by **1.22x** of per-token matvec cost on the 3B.
+The default exists on the documented reasoning that decode is
+bandwidth-bound and SMT siblings contend for the same load ports. This
+round's whole method says a per-call tuner prediction is not a per-token
+result, so it was validated before being believed.
+
+End-to-end, one process, one KV state, ABBA, greedy tokens identical:
+
+| model | tuner said | end-to-end rounds won by 16 threads | median ratio | verdict |
+|---|---|---:|---:|---|
+| qwen2.5-3B Q4_K_M | **16** (1.22x better) | **0 / 15** | **1.4233** | tuner **wrong**: 16 is 42% slower |
+| llama3.2:1b Q8_0 | 8 (16 was 1.85x worse) | **0 / 15** | 1.2619 | tuner right in direction |
+
+**SMT never wins end-to-end on this machine**, on either model. The
+physical-core default is correct here - which is the useful outcome from a
+default: confirmation.
+
+The uncomfortable part is the tuner. It was right when it said *do not*
+use SMT and wrong when it said *do*, and the model it was wrong about is
+the one whose shapes it was given. A user who followed its advice with
+`ALPACCAROO_AUTOTUNE=1` would have taken a **42% regression** on the 3B.
+
+That makes **three** independent knobs this round where a per-call
+measurement inverted end-to-end:
+
+| knob | per-call says | end-to-end says | rounds won |
+|---|---|---|---:|
+| `ALPACCAROO_SERIAL_QUANTIZE_COLS` (round 4) | 6-10% faster | 20% slower | 3/25 |
+| `ALPACCAROO_SERIAL_MATVEC_ELEMS` (Package J) | 14% faster | 4% slower | 4/25 |
+| thread count via `tune -m` (Package N) | 22% faster | 42% slower | 0/15 |
+
+Three for three. This is no longer a caution about one knob; **the
+per-call harness systematically over-credits configurations that reduce
+parallelism or dispatch count, and the error is large enough to invert the
+sign.** The likely common factor is that a microbenchmark hammers one
+shape with a hot cache and a settled pool, where a real token walks ~181
+dispatches across ~1.8 GiB of distinct weights - but that mechanism is
+*hypothesised, not measured*, and this log will not pretend otherwise.
+
+**Consequence for the tuner, which is the actionable part:**
+`alpaccaroo tune` currently measures per call and writes a cache that
+`ALPACCAROO_AUTOTUNE=1` applies verbatim. On this evidence that pipeline
+can make things materially worse. It should either measure end-to-end
+before writing a recommendation, or its output should be labelled as a
+hypothesis to be validated rather than a setting to apply.
+
 ## Packages not started: I, M
 
 All were scripted and ready; none produced a number. Recorded so round 6
