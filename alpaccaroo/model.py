@@ -1642,15 +1642,28 @@ class Model:
         return logits
 
     def _forward_gemma3_pure(self, token: int):
+        # same bucket and in_prefill contract as _forward_pure
+        p = _prof.ACTIVE
+        add = p.add if p is not None and not p.in_prefill else None
         hp = self.hp
         pos = self.n_past
+        if add:
+            t0 = _perf()
         x = T.scale(T.matrix_row(self.tok_embd, token), hp.embed_scale)
+        if add:
+            add("embedding", _perf() - t0)
         inv_sqrt = hp.attention_scale
         group = hp.n_head // hp.n_kv
         hd = hp.head_dim
 
         for li, ly in enumerate(self.layers):
+            if add:
+                t0 = _perf()
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             q = T.matvec(ly.wq, h)
             k = T.matvec(ly.wk, h)
             v = T.matvec(ly.wv, h)
@@ -1660,8 +1673,16 @@ class Model:
                 k = T.add(k, ly.bk)
             if ly.bv is not None:
                 v = T.add(v, ly.bv)
+            if add:
+                t1 = _perf()
+                add("attn_qkv", t1 - t0)
+                t0 = t1
             q = self._rmsnorm_heads_pure(q, hp.n_head, ly.q_norm)
             k = self._rmsnorm_heads_pure(k, hp.n_kv, ly.k_norm)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)   # gemma3's per-head q/k norms
+                t0 = t1
             sliding = self._gemma3_layer_is_sliding(li)
             base = hp.rope_base_swa if sliding else hp.rope_base
             freq_scale = 1.0 if sliding else hp.rope_freq_scale
@@ -1669,6 +1690,10 @@ class Model:
             k = self._rope_pure_base(k, hp.n_kv, pos, base, freq_scale)
             self.cache_k[li].append(k)
             self.cache_v[li].append(v)
+            if add:
+                t1 = _perf()
+                add("rope", t1 - t0)
+                t0 = t1
 
             start = max(0, pos - hp.sliding_window + 1) if sliding else 0
             att_out = [0.0] * (hp.n_head * hd)
@@ -1688,31 +1713,84 @@ class Model:
                     for d in range(hd):
                         acc[d] += wt * vt[d]
                 att_out[hh * hd:(hh + 1) * hd] = acc
+            if add:
+                t1 = _perf()
+                add("attention", t1 - t0)
+                t0 = t1
             att_proj = T.matvec(ly.wo, att_out)
+            if add:
+                t1 = _perf()
+                add("attn_out", t1 - t0)
+                t0 = t1
             x = T.add(x, T.rmsnorm(att_proj, ly.post_attn_norm, hp.rms_eps))
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
-            act = T.mul(T.gelu_pytorch_tanh(T.matvec(ly.w_gate, h)),
-                        T.matvec(ly.w_up, h))
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
+            gate = T.matvec(ly.w_gate, h)
+            up = T.matvec(ly.w_up, h)
+            if add:
+                t1 = _perf()
+                add("ffn_gate_up", t1 - t0)
+                t0 = t1
+            act = T.mul(T.gelu_pytorch_tanh(gate), up)
+            if add:
+                t1 = _perf()
+                add("ffn_act", t1 - t0)
+                t0 = t1
             ffn_out = T.matvec(ly.w_down, act)
+            if add:
+                t1 = _perf()
+                add("ffn_down", t1 - t0)
+                t0 = t1
             x = T.add(x, T.rmsnorm(ffn_out, ly.post_ffw_norm, hp.rms_eps))
+            if add:
+                add("norm", _perf() - t0)
 
         self.n_past += 1
-        logits = T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
-        return self._softcap_logits(logits)
+        if add:
+            t0 = _perf()
+        h = T.rmsnorm(x, self.out_norm, hp.rms_eps)
+        if add:
+            t1 = _perf()
+            add("norm", t1 - t0)
+            t0 = t1
+        logits = self._softcap_logits(T.matvec(self.output, h))
+        if add:
+            add("output_proj", _perf() - t0)
+        return logits
 
     def _forward_pure(self, token: int):
+        # Same bucket contract as _forward_np; see the comment there. Unlike
+        # the NumPy tier, which prefills through forward_batch, this one is
+        # also the prefill path (prefill() loops forward() without NumPy), so
+        # the buckets stay off while in_prefill or prompt tokens would be
+        # charged to the decode breakdown and it would exceed 100%.
+        p = _prof.ACTIVE
+        add = p.add if p is not None and not p.in_prefill else None
         hp = self.hp
         pos = self.n_past
+        if add:
+            t0 = _perf()
         x = T.matrix_row(self.tok_embd, token)
         if hp.embed_scale != 1.0:
             x = T.scale(x, hp.embed_scale)
+        if add:
+            add("embedding", _perf() - t0)
         inv_sqrt = 1.0 / math.sqrt(hp.head_dim)
         group = hp.n_head // hp.n_kv
         hd = hp.head_dim
 
         for li, ly in enumerate(self.layers):
+            if add:
+                t0 = _perf()
             h = T.rmsnorm(x, ly.attn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             q = T.matvec(ly.wq, h)
             k = T.matvec(ly.wk, h)
             v = T.matvec(ly.wv, h)
@@ -1722,10 +1800,18 @@ class Model:
                 k = T.add(k, ly.bk)
             if ly.bv is not None:
                 v = T.add(v, ly.bv)
+            if add:
+                t1 = _perf()
+                add("attn_qkv", t1 - t0)
+                t0 = t1
             q = self._rope_pure(q, hp.n_head, pos)
             k = self._rope_pure(k, hp.n_kv, pos)
             self.cache_k[li].append(k)
             self.cache_v[li].append(v)
+            if add:
+                t1 = _perf()
+                add("rope", t1 - t0)
+                t0 = t1
 
             att_out = [0.0] * (hp.n_head * hd)
             t_len = pos + 1
@@ -1745,16 +1831,49 @@ class Model:
                     for d in range(hd):
                         acc[d] += wt * vt[d]
                 att_out[hh * hd:(hh + 1) * hd] = acc
+            if add:
+                t1 = _perf()
+                add("attention", t1 - t0)
+                t0 = t1
             x = T.add(x, T.matvec(ly.wo, att_out))
+            if add:
+                t1 = _perf()
+                add("attn_out", t1 - t0)
+                t0 = t1
 
             h = T.rmsnorm(x, ly.ffn_norm, hp.rms_eps)
+            if add:
+                t1 = _perf()
+                add("norm", t1 - t0)
+                t0 = t1
             gate = T.matvec(ly.w_gate, h)
+            up = T.matvec(ly.w_up, h)
+            if add:
+                t1 = _perf()
+                add("ffn_gate_up", t1 - t0)
+                t0 = t1
             act = T.mul(T.gelu_pytorch_tanh(gate) if hp.arch in _GEMMA_ARCHES
-                        else T.silu(gate), T.matvec(ly.w_up, h))
+                        else T.silu(gate), up)
+            if add:
+                t1 = _perf()
+                add("ffn_act", t1 - t0)
+                t0 = t1
             x = T.add(x, T.matvec(ly.w_down, act))
+            if add:
+                add("ffn_down", _perf() - t0)
 
         self.n_past += 1
-        return T.matvec(self.output, T.rmsnorm(x, self.out_norm, hp.rms_eps))
+        if add:
+            t0 = _perf()
+        h = T.rmsnorm(x, self.out_norm, hp.rms_eps)
+        if add:
+            t1 = _perf()
+            add("norm", t1 - t0)
+            t0 = t1
+        logits = T.matvec(self.output, h)
+        if add:
+            add("output_proj", _perf() - t0)
+        return logits
 
     # ---- convenience -----------------------------------------------------
 
