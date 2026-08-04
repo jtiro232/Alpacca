@@ -1,0 +1,48 @@
+{
+  "rounds": 15,
+  "decode_tokens": 12,
+  "prefill_tokens": 16,
+  "variants": {
+    "threads-8-physical": {
+      "min": 0.9604558950086357,
+      "median": 1.0016819890006445,
+      "max": 1.0570634580071783,
+      "mean": 1.0067304154663967
+    },
+    "threads-16-smt": {
+      "min": 1.3094439310079906,
+      "median": 1.415820057009114,
+      "max": 1.9922830050054472,
+      "mean": 1.4509520888648695
+    }
+  },
+  "baseline": "threads-8-physical",
+  "ratios": {
+    "threads-16-smt": {
+      "median_vs_baseline": 1.4232864030859462,
+      "ratio_of_medians": 1.4134426619985907,
+      "best_vs_baseline": 1.3158044703930942,
+      "worst_vs_baseline": 1.9485235788273676,
+      "rounds_won": 0,
+      "rounds": 15,
+      "tokens_identical": true
+    }
+  },
+  "tokens_identical_all": true,
+  "token_ids": [
+    2038,
+    13,
+    2932,
+    4829,
+    311,
+    3960,
+    279,
+    4128,
+    11,
+    773,
+    1340,
+    4588
+  ],
+  "model": "qwen3bmed",
+  "experiment": "threads"
+}
