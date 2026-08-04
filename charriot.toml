@@ -1,0 +1,46 @@
+# Charriot config for alpaccaroo. Two workloads share this 12C/14T machine:
+# Born-to-be-King (latency) and the alpaccaroo engine serving it (throughput).
+#
+# The memory ceiling is the point. On 2026-08-04 an `alpaccaroo run` with no
+# NumPy dequantized a 3B model into Python float objects, reached 45 GB, and
+# triggered a machine-wide OOM kill (constraint=CONSTRAINT_NONE). NumPy fixed
+# the cause; this ceiling makes the next surprise a contained cgroup kill
+# instead of the kernel picking a victim.
+
+[charriot]
+# 12 physical cores; leave 2 for the desktop and compositor.
+reserve_cores = 2
+
+[[workload]]
+name = "engine"
+role = "throughput"
+command = [
+    "python3", "-m", "alpaccaroo", "serve",
+    "hf:NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M",
+    "--host", "127.0.0.1", "--port", "11435", "--ctx", "4096",
+]
+cwd = "/home/meedy-gonzalez/Alpacca"
+gpu = "auto"
+
+# 14 GiB: the 8B's quantized weights are 4.6 GB, so this leaves room for the
+# KV cache and a modest dense budget while keeping the engine to under a third
+# of the machine. Raise it only alongside ALPACCAROO_DENSE_WEIGHT_MB below.
+memory_max = "14G"
+
+# Charriot writes its physical-core budget here; alpaccaroo reads it as a
+# ceiling. Without this the engine calls os.cpu_count(), sees all 14 logical
+# CPUs regardless of its affinity mask, and oversubscribes its own partition.
+threads_env = "ALPACCAROO_THREADS"
+
+# alpaccaroo's auto dense budget reads /sys/fs/cgroup/memory.max, which is the
+# ROOT cgroup and reads "max" on a host — it does NOT see Charriot's leaf
+# ceiling, so it would size against all 43 GiB free and densify ~28 GiB of
+# float32 weights straight into a cgroup kill. Pin it explicitly until that
+# lookup is cgroup-relative. 0 keeps every weight quantized (~4.6 GB).
+# Inline table on purpose: a [workload.env] header here would swallow every
+# key below it into the env table.
+env = { ALPACCAROO_DENSE_WEIGHT_MB = "0" }
+
+provides_endpoint = "http://127.0.0.1:11435"
+ready_url = "http://127.0.0.1:11435/health"
+ready_timeout = 180

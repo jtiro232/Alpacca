@@ -198,9 +198,66 @@ Every optimization here is measurable and disableable.
 
 ### Thread controls
 
-The kernels default to **physical cores**, not logical CPUs: decode is
-memory-bandwidth-bound and SMT siblings contend for the same load ports.
-`ALPACCAROO_THREADS` overrides that and beats every other mechanism.
+The kernels default to the physical cores **worth using**, not logical
+CPUs: decode is memory-bandwidth-bound and SMT siblings contend for the
+same load ports. `ALPACCAROO_THREADS` overrides that and beats every other
+mechanism.
+
+"Worth using" is `_platform.worker_cores()`, and it is smaller than the
+physical core count in two cases:
+
+- **A hybrid CPU's slow tier.** `prange` splits a row loop into equal
+  static chunks, so a matvec finishes when its *slowest* thread does. A
+  core at half the clock of the rest does not contribute half a core of
+  throughput; it stalls every other thread waiting on its chunk. Tiers are
+  admitted fastest-first while a tier of `k` cores at relative speed `f`
+  beats the `n` already admitted: `work/(n+k)/f < work/n`, i.e.
+  `f > n/(n+k)`. A homogeneous machine is one tier at `f = 1` and is
+  unchanged.
+- **An affinity mask.** A pinned process still reads the whole machine out
+  of sysfs, so a pool sized from the topology oversubscribes its own
+  partition. `sched_getaffinity` is the only thing that knows.
+
+`alpaccaroo doctor` prints a `cores used:` line whenever this differs from
+the physical count, with the tiers it saw.
+
+### Hybrid CPUs: the measurement
+
+Reference machine D - Intel Core Ultra 5 125U (Meteor Lake), 12 physical /
+14 logical, three tiers: 2 P-cores @ 4.3 GHz (SMT), 8 E-cores @ 3.6 GHz,
+**2 LP-E cores @ 2.1 GHz**. Linux 7.0, Python 3.14.4, NumPy 2.4.2, Numba
+0.65.1, llvmlite 0.47.0. qwen2.5-3B-medieval Q4_K_M, ctx 4096, short-short,
+warm decode tok/s. Sustained bandwidth 28.1-28.7 GB/s, `--stability` spread
+1.02x (steady).
+
+Thread sweep, forward then reverse so a drift cannot read as a trend:
+
+| threads | 4 | 6 | 8 | **10** | 12 (all physical) | 14 (all logical) |
+|---|---|---|---|---|---|---|
+| fwd | 9.54 | 12.05 | 14.76 | **15.07** | 14.14 | 12.45 |
+| rev | 9.09 | 12.22 | 14.39 | **15.23** | 13.58 | 12.54 |
+
+The peak at 10 is exactly 2P + 8E: every physical core except the two
+2.1 GHz LP-E ones. The admission rule above returns 10 here.
+
+End to end, paired and alternating (A = 12, the old default; B = the new
+default, chosen by the code), 8 rounds:
+
+```
+A (12 thr)    14.175 tok/s mean
+B (default)   14.945 tok/s mean
+B faster in   8/8 rounds
+speedup       1.054x
+```
+
+The sweep says 1.093x and the paired A/B says 1.054x; the A/B ran on a
+machine already an hour into sustained load. **Quote 1.054x** - it is the
+one measured the way section 6 demands.
+
+Not yet measured: whether pinning the pool to the fast cores beats merely
+sizing it (the scheduler currently places the threads), and any hybrid part
+other than this one. Alder Lake 8P+8E is in `tests/smoke.py` as a recorded
+tier table only - the rule keeps all 16 there, and nobody has run it.
 
 Per dispatch, the pool is narrowed for matrices too small to repay a
 fan-out (section 6). This changes *who* computes each row, never *what* is
@@ -537,6 +594,40 @@ one table; nothing above should be read as characterising them.
 The tools are built and the reference machine is characterised. What
 remains is mostly *coverage* and one re-opened optimisation. In rough order
 of expected value:
+
+**0. Open defect: a cold Numba cache and a warm one do not agree.**
+Not a performance item, but it invalidates any A/B that straddles a
+recompile, so it comes first.
+
+With everything else fixed - same model, same seed, `--temp 0`, same
+`ALPACCAROO_THREADS`, same reported execution paths - the first run after
+the JIT cache is cleared produces **different logits** from every run
+after it. Both states are individually reproducible, so this is not a
+race:
+
+```sh
+rm -f alpaccaroo/__pycache__/*.nbi alpaccaroo/__pycache__/*.nbc
+python3 tests/logit_probe.py $M     # checksum(f64) = -120857.114795
+python3 tests/logit_probe.py $M     # checksum(f64) = -124325.624901
+python3 tests/logit_probe.py $M     # checksum(f64) = -124325.624901  (stable)
+```
+
+On a 10-token prefill of qwen2.5-3B the top-1 token was unchanged but the
+top-2 gap moved from 0.084 to 0.205; through the CLI on a different prompt
+it *did* flip the first token, and greedy decoding turned that into a
+completely different sentence. Ruled out so far: thread count (warm output
+is bit-identical across 1/4/10/12/14), execution-path selection (the
+`--profile` census is identical cold and warm), and a generic-CPU cache
+target (`NUMBA_CPU_NAME`/`CPU_FEATURES` are both `None`, so numba targets
+the host either way). Throughput is unaffected - cache-loaded measured
+13.4-14.5 tok/s against fresh-compiled 12.6-13.2 - so this costs
+correctness and reproducibility, not speed.
+
+The likely remaining suspect is `fastmath=True` permitting a different
+reassociation between a freshly compiled specialization and the cached
+artifact. Until it is explained, **warm the cache before any measurement
+or bit-identity check**, and treat `tests/smoke.py`'s parity checks as
+valid only within one cache state.
 
 **1. Q6_K 6-bit packing - reopened, but not for the reason it looks like.**
 Q6_K codes are stored unpacked at 1.066 bytes per weight where the format

@@ -420,6 +420,16 @@ def cmd_doctor(_args) -> int:
     print(f"cpu:         {cpu.get('model') or 'unknown'} | "
           f"{rt.get('physical_cores') or '?'} physical / "
           f"{rt.get('logical_cores') or '?'} logical cores")
+    # A hybrid CPU's slow tier, or an affinity mask, silently changes what
+    # the pool should be. Say so here rather than leaving the difference
+    # between "12 physical" and "threads 10" for the reader to puzzle out.
+    from . import _platform as _plat
+    _workers, _phys = _plat.worker_cores(), rt.get("physical_cores") or 0
+    if _workers and _phys and _workers != _phys:
+        _detail = ", ".join(f"{n}x{khz // 1000}MHz"
+                            for khz, n in _plat.core_tiers())
+        print(f"cores used:  {_workers} of {_phys} for the decode pool"
+              + (f"  (tiers {_detail})" if _detail else ""))
     print(f"cpu flags:   {', '.join(cpu.get('features') or []) or 'none detected'}"
           f"  (via {cpu.get('source')})")
     blas = rt["blas"]

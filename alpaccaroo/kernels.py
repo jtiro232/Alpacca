@@ -160,8 +160,11 @@ def _init() -> dict:
               file=sys.stderr)
         return _state
 
-    # Thread count: prefer physical cores for the bandwidth-bound decode
-    # loop unless the user chose explicitly (either knob wins over us).
+    # Thread count: prefer the cores worth using for the bandwidth-bound
+    # decode loop unless the user chose explicitly (either knob wins over
+    # us). worker_cores() is physical cores minus a hybrid CPU's slow tier
+    # and minus anything our affinity mask excludes - see _platform, where
+    # both the rule and the sweep behind it are recorded.
     threads_env = os.environ.get("ALPACCAROO_THREADS", "").strip()
     if threads_env:
         try:
@@ -169,7 +172,7 @@ def _init() -> dict:
         except (ValueError, RuntimeError):
             pass
     elif "NUMBA_NUM_THREADS" not in os.environ:
-        phys = _platform.physical_cores()
+        phys = _platform.worker_cores()
         if 0 < phys < numba.get_num_threads():
             try:
                 numba.set_num_threads(phys)

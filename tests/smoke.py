@@ -643,6 +643,48 @@ def main() -> None:
             check("alpaccaroo kernels stay inactive without the pinned numba",
                   not AK.available(), AK.status())
 
+        # ---- hybrid-CPU core admission -----------------------------------
+        # prange splits rows into equal static chunks, so a matvec ends when
+        # its slowest thread does. Tiers are admitted while f > n/(n+k).
+        # Recorded machines, so this runs anywhere rather than only on a
+        # hybrid part.
+        from alpaccaroo import _platform as AP
+        TIERS = [
+            # (label, tiers descending, expected)
+            ("homogeneous 8-core", [(3800000, 8)], 8),
+            ("6C Ryzen (the SMT case)", [(4200000, 6)], 6),
+            # 2P+8E+2LP-E: the two 2.1 GHz cores cost 9.3% when admitted
+            ("Meteor Lake 2P+8E+2LP-E",
+             [(4300000, 2), (3600000, 8), (2100000, 2)], 10),
+            # 8P+8E at 0.75 relative: f=0.75 > 8/16=0.5, so E cores earn it
+            ("Alder Lake 8P+8E", [(5200000, 8), (3900000, 8)], 16),
+            # one core at a quarter the clock never repays its chunk
+            ("1 fast + 1 quarter-speed", [(4000000, 1), (1000000, 1)], 1),
+            ("single core", [(4300000, 1)], 1),
+            ("nothing readable", [], 0),
+        ]
+        for label, tiers, want in TIERS:
+            got = AP.cores_from_tiers(tiers)
+            check(f"core admission: {label} -> {want}", got == want,
+                  f"got {got}")
+        # the live machine must stay inside its own topology
+        _w, _p = AP.worker_cores(), AP.physical_cores()
+        check("worker_cores never exceeds physical_cores", 0 < _w <= _p,
+              f"workers={_w} physical={_p}")
+        check("worker_cores never exceeds the affinity mask",
+              _w <= len(AP.available_cpus()),
+              f"workers={_w} allowed={len(AP.available_cpus())}")
+        # a pinned process must size its pool to the pin, not the machine
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import os, sys; sys.path.insert(0, '.')\n"
+             "os.sched_setaffinity(0, {0})\n"
+             "from alpaccaroo import _platform as P\n"
+             "print(P.worker_cores())"],
+            capture_output=True, text=True, cwd=str(REPO))
+        check("a process pinned to one CPU asks for one core",
+              r.stdout.strip() == "1", r.stdout + r.stderr)
+
         # ---- fused batched matmul vs the tiled dequantize+GEMM path -------
         # matmul_t used to dequantize the whole matrix on every call, so a
         # one-row batch cost as much as a 256-row one. The fused kernel below

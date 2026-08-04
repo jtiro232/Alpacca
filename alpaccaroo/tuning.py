@@ -47,7 +47,12 @@ def candidate_thread_counts() -> list[int]:
     from . import _platform
     logical = os.cpu_count() or 1
     physical = _platform.physical_cores() or logical
-    raw = [1, max(1, physical // 2), physical, logical]
+    # workers is the loader's own default and differs from `physical` on a
+    # hybrid CPU. Without it the ladder cannot even propose the count the
+    # engine actually runs: on a 2P+8E+2LP-E Meteor Lake the set was
+    # [1, 6, 12, 14] and the measured winner, 10, was not in it.
+    workers = _platform.worker_cores() or physical
+    raw = [1, max(1, workers // 2), workers, physical, logical]
     out: list[int] = []
     for n in raw:
         n = int(n)
