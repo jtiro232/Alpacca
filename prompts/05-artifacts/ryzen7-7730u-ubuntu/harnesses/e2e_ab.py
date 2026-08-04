@@ -113,6 +113,12 @@ EXPERIMENTS = {
         ("narrow-off", {"ALPACCAROO_SERIAL_MATVEC_ELEMS": "0"}, None),
         ("narrow-on-131072", {"ALPACCAROO_SERIAL_MATVEC_ELEMS": "131072"}, None),
     ],
+    # Dose-response for J: widen the threshold so MORE matrices go serial.
+    # If the regression tracks engagement, the loss grows.
+    "narrow_wide": lambda: [
+        ("narrow-off", {"ALPACCAROO_SERIAL_MATVEC_ELEMS": "0"}, None),
+        ("narrow-1048576", {"ALPACCAROO_SERIAL_MATVEC_ELEMS": "1048576"}, None),
+    ],
     # Package H1: the knob that won 6-10% per call and lost 22/25 end to end.
     "quantize": lambda: [
         ("quantize-off", {"ALPACCAROO_SERIAL_QUANTIZE_COLS": "0"}, None),

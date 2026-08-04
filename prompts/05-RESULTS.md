@@ -124,43 +124,47 @@ machine.
 
 ---
 
-## READ THIS FIRST: the round ended early, and why
+## An environment failure mid-round, and the repair
+
+Recorded because it cost real time and because the repair is reusable.
 
 At 23:02 UTC the machine's **live-USB medium detached mid-round**. `/cdrom`
-is still a mountpoint but is empty, `/dev/loop0`'s backing file
-(`/cdrom/casper/minimal.squashfs`) no longer exists, and there are no
-`/dev/sd*` devices at all - the stick physically left the bus.
+went empty, `/dev/loop0`'s backing file
+(`/cdrom/casper/minimal.squashfs`) ceased to exist, and no `/dev/sd*`
+device remained - the stick left the bus. Every page fault against the
+read-only squashfs lower layer began returning **SIGBUS**. Binaries whose
+pages were still cached kept working (`bash`, `gawk`, `sort`, `ls`);
+everything whose pages had been evicted died, including `python3`, `git`,
+`perl`, `openssl`, `wget`, `apt` and `dpkg`.
 
-The consequence is specific and total: every page fault against the
-read-only lower layer now returns **SIGBUS**. Binaries whose pages were
-still cached keep working (`bash`, `ls`, `gawk`, `sort`); everything whose
-pages had been evicted is dead:
+The repair, which took about fifteen minutes:
 
-```
-python3 -c "print('alive')"   -> Bus error (core dumped), rc 135
-git status --short            -> Bus error (core dumped), rc 135
-perl / openssl                -> Bus error (core dumped)
-```
+1. The overlay's **upper** layer is tmpfs and was never damaged - only the
+   squashfs lower layer died. Anything written to `/usr` therefore lands on
+   live storage and *shadows* the dead file.
+2. `cat /usr/bin/python3.14 > /tmp/...` **succeeded**, so the interpreter
+   itself was fully cached; the SIGBUS was coming from a shared library.
+   Copying its four dependencies one at a time identified them precisely:
+   `libc.so.6`, `libm.so.6`, `libz.so.1` and `ld-linux-x86-64.so.2` were
+   all unreadable. **glibc itself was the casualty.**
+3. `.deb` files on Ubuntu 26.04 are **zstd**-compressed and BusyBox has no
+   zstd, so package extraction was a dead end. But BusyBox *does* have
+   `wget`, and `cdimage.ubuntu.com` serves
+   `ubuntu-base-26.04-base-amd64.tar.gz` over **plain HTTP** - a gzip
+   tarball BusyBox can unpack, containing a byte-matching glibc 2.43.
+4. Copying those four files over the dead ones (`sudo cp` into `/usr`,
+   i.e. into the tmpfs upper layer) restored **the whole system** -
+   `python3`, `git` and everything else.
 
-Nothing in userspace or root can fix this - a device that is not in `/dev`
-cannot be remounted, and the evicted pages have no backing store to be
-re-read from. Freeing RAM prevents further eviction but restores nothing.
+The lesson worth keeping: on an overlay-on-squashfs live system, a lost
+lower layer is survivable as long as the upper layer is writable and one
+network-capable binary survives. Identify the *library*, not the program.
 
-**What this means for the results below.** Everything reported as measured
-was measured before 23:02 and is real. Everything else is reported as not
-done, and the reason is this, not a judgement about the avenue. In
-particular:
-
-- **Nothing after Step 0 could be committed or pushed.** `git` died before
-  the Package G artifacts and the Package K code were committed. The only
-  pushed commit of this round is `d164184` (Step 0). The working tree at
-  `/home/ubuntu/alpaccaroo` holds uncommitted changes to
-  `alpaccaroo/{kernels,tensor,store,cli}.py` and `tests/smoke.py`, plus six
-  benchmark JSONs under `prompts/05-artifacts/ryzen7-7730u-ubuntu/`. That
-  tree is on a **tmpfs-backed overlay and will not survive a reboot.**
-- **Package K and the two defect fixes are written but NOT verified.** The
-  smoke suite could not be run after they were written. They are described
-  below as unverified code, not as results.
+**Consequences for the log below.** The Package G matrix was measured
+before the failure; everything from Package J onward was measured after
+the repair, on the same machine, with `--stability` unchanged. The only
+row the failure damaged is noted in Package G (a contaminated cold-load
+number), and it is called out rather than quoted.
 
 ---
 
@@ -425,7 +429,75 @@ That model was never pulled - the environment died first.
 
 ---
 
-## Packages not started: I, J, H1, M, N
+## Package J - narrow-matrix dispatch: MEASURED, and it LOSES
+
+Round 4 shipped Package E **enabled** at a 131072-weight threshold and
+said plainly that it was "the least-validated thing on the branch" -
+qwen2.5-3B's smallest decode matvec is 524288, so the path never engaged
+on the only model measured end to end. Every number for it was per call.
+
+**The model that triggers it.** `Qwen2.5-0.5B-Instruct` has
+`attn_k`/`attn_v` of `128 x 896 = 114688` elements, below the threshold, on
+24 layers - 48 dispatches per token. `matvec_codes` applies `_want()` on the
+same rule, so the narrow path covers the Q5_0/Q8_0 code kernels too, not
+only the K-quant ones. That last point is new: the feature is documented in
+terms of the native integer kernels and in fact reaches further.
+
+End-to-end, one process, one KV state, 25 ABBA rounds, 24 decode tokens
+after a 64-token prefill, greedy:
+
+| configuration | rounds won | median per-round ratio | ratio of medians | tok/s |
+|---|---:|---:|---:|---:|
+| threshold 0 (path off) | baseline | - | - | **46.08** |
+| threshold 131072 (**the shipped default**) | **4 / 25** | **1.0398** | 1.0375 | 44.42 |
+| threshold 1048576 (more matrices serial) | **0 / 25** | **1.2079** | 1.2237 | 38.22 |
+
+Greedy token ids were **identical** in every configuration, so the path is
+bit-identical as designed. It is simply slower.
+
+4 of 25 is not a wandering clock on a machine whose spread is 1.06x, and
+the dose-response settles the mechanism: widening the threshold so that
+`attn_q`/`attn_output` (802816 elements) also go serial takes the loss from
+4% to **21%, 0 of 25 rounds**. The regression scales monotonically with how
+many matrices take the serial path, so **the serial path itself is the
+cost** - not a thread-pool resize, not an interaction.
+
+### The part that matters beyond this machine
+
+`alpaccaroo tune --crossover` on this machine measures the threshold at
+**exactly 131072**, agreeing with the built-in default:
+
+| shape | elements | serial/pool | verdict |
+|---|---:|---:|---|
+| Q4_K 64x2048 | 131072 | **0.86** | serial wins |
+| Q6_K 64x2048 | 131072 | **0.88** | serial wins |
+| Q4_K 128x2048 | 262144 | 2.21 | pool wins |
+| Q4_K 512x2048 | 1048576 | 4.19 | pool wins |
+
+So the per-call probe says serial wins at 131072 by 14%, and the
+end-to-end loop says enabling it there costs 4%. Both were measured on the
+same machine, minutes apart, with the same paired method.
+
+Note *where* they disagree. At 1048576 the per-call probe says pool wins by
+4.19x and end-to-end agrees emphatically (21% loss). The two methods agree
+in the large and diverge **exactly at the crossover** - which is precisely
+where a threshold is defined. **A threshold tuned on per-call data is
+calibrated in the one region where per-call data is least trustworthy.**
+
+That is the same shape of failure as round 4's NEGATIVE 1
+(`ALPACCAROO_SERIAL_QUANTIZE_COLS`: 6-10% per call, 22/25 lost end to end),
+now reproduced for a second, independent knob. It is no longer an anomaly
+about one setting; it is a property of the measurement method.
+
+**Recommendation:** `SERIAL_MATVEC_ELEMS_DEFAULT` should ship at **0**,
+keeping the knob and the tuner, exactly the treatment round 4 gave the
+quantize threshold. That is not tuning to this machine - 0 is the neutral
+setting, and turning off an enabled-by-default optimisation that has never
+once been validated end-to-end, and that measures as a regression the first
+time it is, is the conservative choice. Machine B's per-call numbers
+(1.30-1.90x for narrow shapes) were never validated end to end either.
+
+## Packages not started: I, M
 
 All were scripted and ready; none produced a number. Recorded so round 6
 does not re-derive the setup.

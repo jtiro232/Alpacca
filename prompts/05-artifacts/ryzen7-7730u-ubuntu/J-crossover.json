@@ -1,0 +1,103 @@
+{
+  "threshold_elements": 131072,
+  "pool_threads": 8,
+  "measurements": [
+    {
+      "dtype": "Q4_K",
+      "rows": 64,
+      "cols": 2048,
+      "elements": 131072,
+      "serial_over_pool": 0.858072857623734,
+      "serial_wins": true
+    },
+    {
+      "dtype": "Q4_K",
+      "rows": 128,
+      "cols": 2048,
+      "elements": 262144,
+      "serial_over_pool": 2.2051148410071155,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q4_K",
+      "rows": 256,
+      "cols": 2048,
+      "elements": 524288,
+      "serial_over_pool": 2.9898464650518393,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q4_K",
+      "rows": 512,
+      "cols": 2048,
+      "elements": 1048576,
+      "serial_over_pool": 4.185509475123401,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q4_K",
+      "rows": 1024,
+      "cols": 2048,
+      "elements": 2097152,
+      "serial_over_pool": 5.420529498290187,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q4_K",
+      "rows": 2048,
+      "cols": 2048,
+      "elements": 4194304,
+      "serial_over_pool": 3.9234674707047876,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 64,
+      "cols": 2048,
+      "elements": 131072,
+      "serial_over_pool": 0.8764047930141969,
+      "serial_wins": true
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 128,
+      "cols": 2048,
+      "elements": 262144,
+      "serial_over_pool": 2.3068309229827038,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 256,
+      "cols": 2048,
+      "elements": 524288,
+      "serial_over_pool": 3.2543731158569194,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 512,
+      "cols": 2048,
+      "elements": 1048576,
+      "serial_over_pool": 4.316931835724579,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 1024,
+      "cols": 2048,
+      "elements": 2097152,
+      "serial_over_pool": 4.992022854362104,
+      "serial_wins": false
+    },
+    {
+      "dtype": "Q6_K",
+      "rows": 2048,
+      "cols": 2048,
+      "elements": 4194304,
+      "serial_over_pool": 3.9792877994783593,
+      "serial_wins": false
+    }
+  ],
+  "builtin_default": 131072
+}
