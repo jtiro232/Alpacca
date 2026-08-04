@@ -233,8 +233,16 @@ Q6_K weights now stay in the *file's own* block fields - 4-bit split-nibble
 codes, 6-bit integer sub-scales, and float16 super-scales, 0.578 bytes per
 weight for Q4_K and 1.066 for Q6_K - and the decode kernel dots them
 against int8-quantized activations (per-256-block absmax/127 scale, our
-own Q8-style scheme) using AVX-512 VNNI integer instructions that LLVM
-emits from these Python loops. Llama-3.1-8B-Instruct decodes at
+own Q8-style scheme) using whatever integer contraction LLVM can emit for
+the host. On a part with AVX-512 VNNI that is `vpdpwssd`; on one without
+it - measured on a Zen 3 Ryzen 7 7730U, which has no VNNI in any form -
+LLVM falls back to 256-bit `vpmaddwd` and the kernels still run at the
+machine's bandwidth. What matters portably is that **neither emits
+`vpmuldq`**: the `np.int32(acc + i32*i32)` re-cast idiom keeps the
+contraction in 32-bit lanes on both, and without it Numba's int64
+promotion collapses the loop to 8-lane 64-bit multiplies. The idiom is
+not a VNNI trick, and `alpaccaroo tune --asm` will tell you which of the
+two your CPU got. Llama-3.1-8B-Instruct decodes at
 **9.9 tok/s (Q4_K_M, 5.0 GiB weight RAM) and 10.8 tok/s (Q4_K_S,
 4.6 GiB)** against 5.2 tok/s and 9.35 GiB before this work, and 11.9
 tok/s for Ollama/llama.cpp on the same machine - 90% of parity, with
@@ -405,6 +413,43 @@ What quantized storage does and does not buy here, measured honestly:
   native SIMD dot-product kernels - which is exactly what the optional
   pinned kernel tier below provides, while staying our own Python
   source.
+
+#### Three machines, and what generalises between them
+
+A tokens-per-second figure without its machine is not a measurement. Every
+number in this project now comes with one of these:
+
+| | machine A | machine B | machine C |
+|---|---|---|---|
+| CPU | Ryzen 5 7640HS (Zen 4) 6C/12T | Intel Tiger Lake 4C/8T | Ryzen 7 7730U (Zen 3) 8C/16T |
+| memory | DDR5 | LPDDR4x | DDR4 |
+| sustained bandwidth | **59-60 GB/s** | **2.2-4.0 GB/s** | **25.4-26.8 GB/s** |
+| clock stability (spread) | flat | 1.4-1.8x | **1.06x** |
+| AVX-512 / VNNI | yes | yes | **no** |
+| 3B Q4_K_M decode | - | 0.79 tok/s | **11.2-12.3 tok/s** |
+| 8B Q4_K_M decode | 9.9 tok/s | - | (does not fit) |
+
+Machine A is ALU-bound at a 60 GB/s wall, B is bandwidth-starved and
+thermally unstable, C sits between them and **holds its clocks**. If a
+change wins on only one of these, it belongs behind a flag or in the
+`alpaccaroo tune` cache, not in a default.
+
+Two results that transfer, both from `prompts/05-RESULTS.md`:
+
+- **A per-call win is not a per-token win, and the gap is worst exactly at
+  a threshold.** Two separate knobs have now been measured to win 6-14% in
+  isolation and *lose* end to end (`ALPACCAROO_SERIAL_QUANTIZE_COLS`, 22 of
+  25 rounds lost; `ALPACCAROO_SERIAL_MATVEC_ELEMS`, 21 of 25 lost). Both
+  were calibrated on per-call data at the crossover, which is the one
+  region where per-call and end-to-end measurements diverge.
+- **The native integer kernels cover less of the model population than they
+  look like they do.** They handle Q4_K/Q5_K/Q6_K. A Q8_0 file - what
+  `alpaccaroo pull llama3.2:1b` gives you - runs 100% on the generic
+  `numba-codes-f32` path, and a model whose embedding width is not a
+  multiple of 256 (Qwen2.5-0.5B's 896, for instance) cannot be K-quantized
+  at all by llama.cpp and lands 83% on the same fallback. Check with
+  `alpaccaroo run <model> --profile` before assuming which kernel you are
+  benchmarking.
 
 ### Spending RAM for speed: the dense-weight budget
 
@@ -763,6 +808,20 @@ and the roadmap orders the work that serves it.
 
 **Landed recently**
 
+- A third machine's worth of cross-device measurement (`prompts/05-RESULTS.md`):
+  the benchmark matrix for 0.5B/1B/3B across five prompt shapes and three
+  context windows, a grouped **Q4_K+Q5_K** kernel so Q4_K_S files get the
+  same one-dispatch treatment Q4_K_M files already had, and two defect
+  fixes it exposed - the first decode token of a Q4_K_M model was paying a
+  **1865 ms in-token JIT compile** because the round-4 pair kernel was
+  never added to `warmup()`, and the `alpacca` -> `alpaccaroo` rebrand had
+  moved the model store so an upgrading user's models went invisible and
+  silently re-downloaded. Both now have regression tests; the warmup one
+  pins the *property* (every compiled kernel must have a signature after
+  `warmup()`), so the next kernel cannot reintroduce it.
+  It also produced the round's most useful negative: the narrow-matrix
+  dispatch that has shipped **enabled** since round 4 was validated
+  end-to-end for the first time and **lost 21 of 25 rounds**.
 - A measurement architecture for performance work: a decode profiler that
   names which kernel ran each matrix (`alpaccaroo run --profile`), a
   benchmark harness with cold/warm separation and a clock-stability probe
