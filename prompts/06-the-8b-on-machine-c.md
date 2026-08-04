@@ -274,14 +274,26 @@ and timings both go strange).
 ## Step 6 - the pure-Python track (separate, and bounded)
 
 POS ships no numpy, so this is a real and separate goal - but be clear about
-its ceiling. Measured on machine C, Python 3.14, no numpy:
+its ceiling. Measured on machine C, Python 3.14, no numpy. Re-derive any of
+this with the committed harness rather than trusting the table:
 
-- **41.58 bytes per weight**, 100% `pure-python-dense`. A Q4_0 file at
-  0.655 B/w on disk expands **63x** at load.
+```sh
+python3 prompts/06-artifacts/ryzen7-7730u-ubuntu/harnesses/pure_tier_cost.py \
+    --model <some.gguf> --json out.json
+```
+
+Artifact: `prompts/06-artifacts/ryzen7-7730u-ubuntu/pure-tier-cost.json`.
+
+- **37 bytes per weight** resident, 100% `pure-python-dense` - a **71x
+  expansion** over the same weights on disk. (An earlier ad-hoc measurement
+  in this session read 41.6 B/w; it took its RSS baseline before importing
+  the engine, so it charged the import to the weights. 37 is the
+  conservative figure and the one the harness reproduces. README's
+  standing "~38 bytes per weight, measured" sits between them.)
 - **~27M weight-multiply-adds/s** end-to-end (2.17 tok/s on 12.5M weights),
-  cross-validated by microbenchmark at 29.1M/s.
+  cross-validated by microbenchmark at 29.1-29.4M/s.
 
-An 8B at this tier needs **334 GB** and ~297 s **per token**. It is not a
+An 8B at this tier needs **~300 GB** and **~273 s per token**. It is not a
 tuning problem and no stdlib trick closes two orders of magnitude. The pure
 tier's honest target is the **0.5-1B class**, not BTBK's 8B.
 
@@ -289,17 +301,22 @@ Three levers, all stdlib, with measured numbers:
 
 | change | effect |
 |---|---|
-| `math.sumprod` for the inner loop | 29.1 -> **91.0 M mul-add/s (3.1x)** |
-| `array('f')` storage | ~41.6 -> ~4 B/w (**9x memory**) but sumprod drops to 39.3 M/s |
+| `math.sumprod` for the inner loop | 29.4 -> **100.1 M mul-add/s (3.4x)** |
+| `array('f')` storage | ~37 -> ~4 B/w (**9x memory**) but sumprod falls to 43.8 M/s (1.5x) |
 | wire up the dead quantized pure path | ~0.58 B/w; see below |
+
+The microbenchmark moves a few percent run to run; treat the multipliers as
+~3.1-3.4x and ~1.35-1.5x rather than as constants.
 
 Notes a future instance will need:
 
 - `math.sumprod` is 3.12+, project floor is 3.10, so it needs a fallback.
-- It is **not** bit-identical to `sum(w*x for ...)`: 830/2000 mixed-magnitude
-  rows differ. It is *more* accurate (Neumaier-style accumulation), and the
-  cross-tier gate at `smoke.py:2656` is a **1e-3 tolerance**, not exact
-  equality - so it should pass. Verify, do not assume.
+- It is **not** bit-identical to `sum(w*x for ...)`: **830/2000 (41.5%)**
+  mixed-magnitude rows differ, counted by the harness above. It is *more*
+  accurate (Neumaier-style accumulation), and the cross-tier gate at
+  `smoke.py:2656` is a **1e-3 tolerance**, not exact equality - so it should
+  pass. Verify, do not assume. The thing to watch is not the tolerance but
+  whether any **greedy token id** moves on a real model.
 - Memory and speed pull against each other here: `array('f')` boxes a float
   per access, cutting sumprod's win from 3.1x to 1.35x. The roadmap does not
   say this.

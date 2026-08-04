@@ -1,0 +1,42 @@
+{
+  "python": "3.14.4",
+  "has_sumprod": true,
+  "inner_loop": {
+    "cols": 4096,
+    "rows": 64,
+    "rep": 20,
+    "current_list_genexpr": {
+      "seconds": 0.008902009199982786,
+      "m_muladd_per_s": 29.447734113834315
+    },
+    "sumprod_list": {
+      "seconds": 0.0026178928000263114,
+      "m_muladd_per_s": 100.13549828983268
+    },
+    "sumprod_array_f": {
+      "seconds": 0.005979032400000505,
+      "m_muladd_per_s": 43.84388350194889
+    },
+    "speedup_sumprod_list": 3.400448330005459,
+    "speedup_sumprod_array_f": 1.4888712093251133
+  },
+  "sumprod_divergence": {
+    "available": true,
+    "trials": 2000,
+    "differ": 830,
+    "fraction": 0.415
+  },
+  "model": {
+    "path": "big.gguf",
+    "file_bytes": 6544992,
+    "total_weights": 12533760,
+    "rss_baseline_mb": 27.015625,
+    "rss_peak_mb": 471.65234375,
+    "resident_bytes_attributable": 466235392.0,
+    "bytes_per_weight_resident": 37.1983660130719,
+    "bytes_per_weight_on_disk": 0.5221890318627451,
+    "expansion_x": 71.23544108228093,
+    "load_seconds": 1.181141409000702,
+    "backend_summary": "pure-python-dense 100%"
+  }
+}
