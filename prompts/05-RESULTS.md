@@ -588,16 +588,18 @@ hypothesis to be validated rather than a setting to apply.
 
 ## Packages not started: I, M
 
-All were scripted and ready; none produced a number. Recorded so round 6
-does not re-derive the setup.
+Only **I** and **M** produced no number. J, H1 and N were on this list when
+it was first written and have since been run in this same round; their rows
+below point at the sections that carry the results, so nothing here gets
+re-derived. Setup is recorded either way, so round 6 does not rebuild it.
 
 | package | state | what exists |
 |---|---|---|
-| **I** Q6_K packing | not run | A complete packed-Q6_K Numba kernel plus a paired microbenchmark harness was written (see below). |
-| **J** narrow dispatch | not run | The model that triggers it **was identified**: see below. |
-| **H1** activation quantize | not run | An end-to-end ABBA harness with a sign test was written. |
-| **M** resident server | not run | A six-stage `--connect` script was written, including a fallback-first ordering. |
-| **N** SMT threads | not run | Same harness; this was the round's most promising avenue. |
+| **I** Q6_K packing | **not run** | A complete packed-Q6_K Numba kernel plus a paired microbenchmark harness was written (see below). |
+| **J** narrow dispatch | **run - it LOSES**: 4% (4/25) at the default threshold, 21% (0/25) widened | "Package J - narrow-matrix dispatch: MEASURED, and it LOSES" above. The model that triggers it is identified below. |
+| **H1** activation quantize | **run - does not reproduce** here: 6/15, median 1.0155 | "Package H1 - the round-4 regression does not reproduce here" above. |
+| **M** resident server | **not run** | A six-stage `--connect` script was written, including a fallback-first ordering. |
+| **N** SMT threads | **run - SMT loses**: 0 wins in 51 rounds across three models | "Package N - the tuner recommends SMT, and end-to-end it is wrong" above. |
 
 The harnesses themselves are kept under
 `prompts/05-artifacts/ryzen7-7730u-ubuntu/harnesses/` so round 6 does not
@@ -632,8 +634,13 @@ K-quant ones. Both 0.5B files are installed and both were confirmed by
 header census. The A/B is `ALPACCAROO_SERIAL_MATVEC_ELEMS` 0 vs 131072 on
 `qwen05bm`, 25 ABBA rounds, and it is perhaps 3 minutes of machine time.
 
-**This is the cheapest unclaimed result on the branch.** Round 6 should run
-it first.
+That A/B **has since been run on this machine**, and the narrow dispatch
+lost: 4% (4/25) at the default threshold and 21% (0/25) widened. See the
+Package J section above for the numbers.
+
+What is still unclaimed is the same three minutes on a *different* box.
+That remains the cheapest check on the branch, because every round-5
+conclusion currently rests on machine C alone.
 
 ### Package N - the avenue this machine existed to test
 
@@ -642,15 +649,23 @@ Step 0's tuner says 16 logical threads beat the 8-physical-core default by
 Q8_0 1B. The physical-core default is a documented, reasoned rule, and on
 this part it is right for one model and wrong for another.
 
-It was deliberately **not** acted on, because this round's inherited lesson
-is that a per-call tuner prediction is not a per-token result - the
-activation-quantize knob won 6-10% per call and lost 22 of 25 end-to-end
-rounds. The end-to-end A/B was written and never run.
+It was deliberately **not** acted on from the tuner's word alone, because this
+round's inherited lesson is that a per-call tuner prediction is not a
+per-token result - the activation-quantize knob won 6-10% per call and lost
+22 of 25 end-to-end rounds.
 
-If it confirms, the right shape of the answer is almost certainly **not** a
-new global default - it is that the existing autotuner should be trusted on
-parts where `--stability` is steady, which is a much smaller and safer
-change than editing `SERIAL_MATVEC_ELEMS_DEFAULT`-style constants.
+**The end-to-end A/B has since been run, and it did not confirm.** SMT won
+0 of 51 rounds across three models, so the physical-core default stands
+unchanged. The finding landed on the *tuner* instead: it recommended SMT
+for two of the three models and was sign-inverted on both. See the Package N
+section above.
+
+So the change this points at is to `alpaccaroo tune` itself - validate
+end-to-end before writing a recommendation, or label the output a
+hypothesis - and not to any `SERIAL_MATVEC_ELEMS_DEFAULT`-style constant.
+Trusting the autotuner wherever `--stability` reports steady clocks is
+specifically what this result rules out: machine C holds its clocks to
+1.06x and the tuner was still sign-inverted twice.
 
 ### Package I - what was built
 
