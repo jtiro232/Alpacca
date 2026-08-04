@@ -1,0 +1,48 @@
+{
+  "rounds": 15,
+  "decode_tokens": 12,
+  "prefill_tokens": 16,
+  "variants": {
+    "quantize-off": {
+      "min": 0.9593830700032413,
+      "median": 1.024948239006335,
+      "max": 1.2269147979968693,
+      "mean": 1.0487658153346273
+    },
+    "quantize-8192": {
+      "min": 0.9806763069937006,
+      "median": 1.0062841100007063,
+      "max": 1.2021041370026069,
+      "mean": 1.0338081523329796
+    }
+  },
+  "baseline": "quantize-off",
+  "ratios": {
+    "quantize-8192": {
+      "median_vs_baseline": 1.0155182461504322,
+      "ratio_of_medians": 0.9817901740835975,
+      "best_vs_baseline": 0.8619899002864339,
+      "worst_vs_baseline": 1.0595113461300993,
+      "rounds_won": 6,
+      "rounds": 15,
+      "tokens_identical": true
+    }
+  },
+  "tokens_identical_all": true,
+  "token_ids": [
+    2038,
+    13,
+    2932,
+    4829,
+    311,
+    3960,
+    279,
+    4128,
+    11,
+    773,
+    1340,
+    4588
+  ],
+  "model": "qwen3bmed",
+  "experiment": "quantize"
+}

@@ -510,34 +510,74 @@ End-to-end, one process, one KV state, ABBA, greedy tokens identical:
 
 | model | tuner said | end-to-end rounds won by 16 threads | median ratio | verdict |
 |---|---|---:|---:|---|
-| qwen2.5-3B Q4_K_M | **16** (1.22x better) | **0 / 15** | **1.4233** | tuner **wrong**: 16 is 42% slower |
-| llama3.2:1b Q8_0 | 8 (16 was 1.85x worse) | **0 / 15** | 1.2619 | tuner right in direction |
+| qwen2.5-3B Q4_K_M | **16** (1.22x better) | **0 / 15** | **1.4233** | tuner **wrong**: 42% slower |
+| Qwen2.5-0.5B Q4_K_M | **16** (1.02x better) | **0 / 21** | **1.6291** | tuner **wrong**: 63% slower |
+| llama3.2:1b Q8_0 | 8 (16 was 1.85x worse) | 0 / 15 | 1.2619 | tuner right in direction |
 
-**SMT never wins end-to-end on this machine**, on either model. The
+**SMT never wins end-to-end on this machine: 0 wins in 51 rounds across
+three models, three quantization mixes and three model sizes.** The
 physical-core default is correct here - which is the useful outcome from a
-default: confirmation.
+default: confirmation, not a change.
 
-The uncomfortable part is the tuner. It was right when it said *do not*
-use SMT and wrong when it said *do*, and the model it was wrong about is
-the one whose shapes it was given. A user who followed its advice with
-`ALPACCAROO_AUTOTUNE=1` would have taken a **42% regression** on the 3B.
+The uncomfortable part is the tuner. It recommended 16 threads for **two of
+the three** models, and on both it was not merely imprecise but
+sign-inverted: it promised 1.02-1.22x better and delivered 1.63x and 1.43x
+worse. A user who followed it with `ALPACCAROO_AUTOTUNE=1` would have taken
+a 42% regression on the 3B and a **63% regression on the 0.5B**. It was
+right only where it advised leaving the default alone.
 
-That makes **three** independent knobs this round where a per-call
-measurement inverted end-to-end:
+Every knob this round where a per-call number was checked against the whole
+loop, the per-call number was **too optimistic** - twice by enough to
+invert the sign:
 
 | knob | per-call says | end-to-end says | rounds won |
 |---|---|---|---:|
-| `ALPACCAROO_SERIAL_QUANTIZE_COLS` (round 4) | 6-10% faster | 20% slower | 3/25 |
+| `ALPACCAROO_SERIAL_QUANTIZE_COLS` (round 4, machine B) | 6-10% faster | 20% slower | 3/25 |
 | `ALPACCAROO_SERIAL_MATVEC_ELEMS` (Package J) | 14% faster | 4% slower | 4/25 |
 | thread count via `tune -m` (Package N) | 22% faster | 42% slower | 0/15 |
+| `ALPACCAROO_SERIAL_QUANTIZE_COLS` (Package H1, machine C) | 6-10% faster | **no effect** | 6/15 |
 
-Three for three. This is no longer a caution about one knob; **the
-per-call harness systematically over-credits configurations that reduce
-parallelism or dispatch count, and the error is large enough to invert the
-sign.** The likely common factor is that a microbenchmark hammers one
-shape with a hot cache and a settled pool, where a real token walks ~181
-dispatches across ~1.8 GiB of distinct weights - but that mechanism is
-*hypothesised, not measured*, and this log will not pretend otherwise.
+**Every one of the four over-credits the configuration that reduces
+parallelism or dispatch count**, and the error is large enough to flip the
+sign in two of them. The common shape is that a microbenchmark hammers one
+matrix with a hot cache and a settled thread pool, where a real token walks
+~181 dispatches across the model's whole weight set - so anything that
+trades fan-out for lower per-call overhead looks better in isolation than
+it is in the loop. That mechanism is **hypothesised, not measured**, and
+this log will not pretend otherwise; what *is* measured is the direction of
+the error, four times out of four.
+
+## Package H1 - the round-4 regression does not reproduce here
+
+`ALPACCAROO_SERIAL_QUANTIZE_COLS=8192` cost machine B 22 of 25 end-to-end
+rounds at a median of 1.20x, and the mechanism was never established. The
+plan asked this machine - which holds its clocks - to explain it or to show
+it is safe only under tuner selection.
+
+Same A/B, same method, qwen2.5-3B Q4_K_M, 15 ABBA rounds:
+
+| | rounds won by 8192 | median of ratios | ratio of medians |
+|---|---:|---:|---:|
+| machine B (round 4) | **3 / 25** | 1.197 | 1.093 |
+| **machine C (this round)** | **6 / 15** | **1.0155** | 0.9818 |
+
+6 of 15 is the middle of the noise band, and the two summary statistics
+straddle 1.0 in opposite directions (1.0155 and 0.9818), which is what a
+null result looks like. **The regression does not reproduce on a machine
+with steady clocks.**
+
+That is a real answer to H1, though not the one the plan hoped for. It does
+not explain machine B's 22/25 - it *bounds* it. Whatever caused it is a
+property of that machine (4 cores, 2.2-4.0 GB/s, a 1.4-1.8x clock spread)
+rather than of the knob itself, because the identical knob on identical
+code is inert here. The obvious suspect remains dead either way: round 4
+probed thread-pool resize cost directly and measured none.
+
+**The knob stays at 0.** Neutral on this machine and harmful on that one is
+not a case for enabling it; it is a case for leaving it exactly where round
+4 put it. What has changed is that "it regresses" is now known to be
+machine-specific rather than universal, so a future machine that measures a
+win is not contradicting anything.
 
 **Consequence for the tuner, which is the actionable part:**
 `alpaccaroo tune` currently measures per call and writes a cache that
