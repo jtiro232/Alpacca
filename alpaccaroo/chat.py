@@ -335,6 +335,141 @@ def fit_to_context(fmt: "ChatFormat", messages: list[dict], n_ctx: int,
             del messages[keep]
 
 
+def _compact_text_to_token_budget(tokenizer, text: str, target: int) -> tuple[str, bool]:
+    """Keep the useful edges of one prompt section inside a token budget.
+
+    API callers commonly put a whole evolving game snapshot into one system
+    message, so dropping old message pairs is not enough.  This bounded,
+    deterministic compactor preserves the beginning (identity/instructions)
+    and the end (the newest truth/contract sections) and marks the omission.
+    """
+    text = str(text or "")
+    try:
+        target = max(1, int(target))
+    except (TypeError, ValueError):
+        target = 1
+    ids = tokenizer.encode(text, add_bos=False)
+    if len(ids) <= target:
+        return text, False
+
+    marker = "\n[older prompt context compacted]\n"
+    marker_ids = tokenizer.encode(marker, add_bos=False)
+    if target <= len(marker_ids) + 2:
+        # Tiny synthetic contexts (and defensive callers) cannot afford the
+        # marker; return the largest prefix that re-encodes inside the budget.
+        low, high, best = 0, min(target, len(ids)), ""
+        while low <= high:
+            middle = (low + high) // 2
+            value = tokenizer.decode(ids[:middle])
+            if len(tokenizer.encode(value, add_bos=False)) <= target:
+                best = value
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best, True
+
+    usable = max(2, target - len(marker_ids))
+    head = max(1, int(usable * 0.64))
+    tail = max(1, usable - head)
+
+    def candidate() -> str:
+        return tokenizer.decode(ids[:head]) + marker + tokenizer.decode(ids[-tail:])
+
+    value = candidate()
+    for _ in range(32):
+        if len(tokenizer.encode(value, add_bos=False)) <= target:
+            return value, True
+        excess = len(tokenizer.encode(value, add_bos=False)) - target
+        if head <= 1 and tail <= 1:
+            break
+        head = max(1, head - max(1, (excess + 1) // 2))
+        tail = max(1, tail - max(1, excess // 2))
+        value = candidate()
+
+    # The token boundary can re-tokenize after decoding.  Find the largest
+    # prefix that still fits rather than returning another over-budget value.
+    low, high, best = 0, min(target, len(ids)), ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = tokenizer.decode(ids[:middle])
+        if len(tokenizer.encode(candidate, add_bos=False)) <= target:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best, True
+
+
+def fit_messages_for_request(fmt: "ChatFormat", messages: list[dict], n_ctx: int,
+                             reserve: int = REPLY_RESERVE) -> tuple[list[dict], list[int], dict]:
+    """Fit API chat messages without allowing an avoidable context 400.
+
+    ``fit_to_context`` handles ordinary multi-turn chats.  Game clients often
+    send one large system snapshot plus one newest user turn, however, so this
+    helper additionally compacts the largest content section until the fully
+    rendered chat template leaves room for a reply.
+    """
+    work = [dict(message) for message in list(messages or [])]
+    try:
+        n_ctx = max(1, int(n_ctx))
+    except (TypeError, ValueError):
+        n_ctx = 1
+    try:
+        reserve = max(1, min(n_ctx - 1 if n_ctx > 1 else 1, int(reserve)))
+    except (TypeError, ValueError):
+        reserve = min(REPLY_RESERVE, max(1, n_ctx - 1))
+
+    ids, dropped = fit_to_context(fmt, work, n_ctx, reserve=reserve)
+    prompt_limit = max(1, n_ctx - reserve)
+    compacted = 0
+    tok = fmt.model.tok
+
+    for _ in range(max(8, len(work) * 8)):
+        if len(ids) <= prompt_limit:
+            break
+        candidates = []
+        newest_index = len(work) - 1
+        for index, message in enumerate(work):
+            content = str(message.get("content", "") or "")
+            content_tokens = len(tok.encode(content, add_bos=False))
+            if content_tokens <= 0:
+                continue
+            role = str(message.get("role", "") or "")
+            # Preserve the newest user turn longer than older/system context,
+            # but never permit it to make the request unrenderable.
+            preserve_bias = 64 if index == newest_index and role == "user" else 0
+            candidates.append((content_tokens, index, preserve_bias))
+        if not candidates:
+            break
+        _, index, preserve_bias = max(
+            candidates,
+            key=lambda row: (row[0] - row[2], row[0], -row[1]),
+        )
+        current = str(work[index].get("content", "") or "")
+        current_tokens = len(tok.encode(current, add_bos=False))
+        overflow = max(1, len(ids) - prompt_limit)
+        target = max(1, current_tokens - max(1, overflow + 16))
+        compacted_text, changed = _compact_text_to_token_budget(tok, current, target)
+        if not changed or compacted_text == current:
+            # Lower the target for a tokenizer boundary or a very small
+            # context where the first candidate still cannot be reduced.
+            target = max(1, min(current_tokens - 1, target - 8))
+            compacted_text, changed = _compact_text_to_token_budget(tok, current, target)
+        if not changed or compacted_text == current:
+            break
+        work[index]["content"] = compacted_text
+        compacted += 1
+        ids = fmt.render(work)
+
+    return work, ids, {
+        "dropped_messages": int(dropped),
+        "compaction_passes": int(compacted),
+        "prompt_tokens": len(ids),
+        "reply_reserve": int(reserve),
+        "fits": bool(len(ids) + reserve <= n_ctx),
+    }
+
+
 def chat_once(model: Model, messages: list[dict], params: SamplerParams,
               n_predict: int = -1, stream=None,
               stop_strings: list[str] | None = None, *,

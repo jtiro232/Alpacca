@@ -100,6 +100,29 @@ def _stop_from(body: dict) -> list[str]:
     return []
 
 
+def _chat_reply_reserve(n_predict: int) -> int:
+    """Leave a bounded answer budget when fitting an API prompt."""
+    try:
+        requested = int(n_predict)
+    except (TypeError, ValueError):
+        requested = 0
+    if requested <= 0:
+        return 256
+    return max(128, min(512, requested))
+
+
+def _fit_api_messages(model: Model, messages: list[dict], n_predict: int) -> tuple[list[dict], dict]:
+    """Fit a chat request to the resident model before rendering it."""
+    fmt = chat.ChatFormat(model, chat.detect_format(model.metadata))
+    fitted, _ids, info = chat.fit_messages_for_request(
+        fmt,
+        messages,
+        model.n_ctx,
+        reserve=_chat_reply_reserve(n_predict),
+    )
+    return fitted, info
+
+
 # -- Ollama-native API helpers ----------------------------------------------
 
 def _accepts_json_only(fn) -> bool:
@@ -229,6 +252,22 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
         def log_message(self, fmt, *args):
             print(f"[serve] {self.address_string()} {fmt % args}", file=sys.stderr)
 
+        def handle_one_request(self):
+            """Treat a client closing an idle keep-alive socket as normal.
+
+            The BTBK watchdog and short-lived health probes can close an HTTP
+            connection after receiving a response.  BaseHTTPRequestHandler
+            otherwise prints a full traceback while reading the next request,
+            even though no generation failed and the server remains healthy.
+            Route/generation exceptions are still handled by ``do_POST`` and
+            are intentionally not swallowed here.
+            """
+            try:
+                return super().handle_one_request()
+            except (ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+                self.log_message("client closed idle keep-alive connection")
+
         # -- helpers -----------------------------------------------------
 
         def send_json(self, obj, status=200):
@@ -247,6 +286,34 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 return json.loads(self.rfile.read(n).decode("utf-8"))
             except json.JSONDecodeError:
                 return {}
+
+        def log_generation(self, path: str, result, total_ns: int) -> None:
+            """Record model timing without exposing prompt or response text.
+
+            BTBK's correspondence watchdog observes the client-side request
+            lifecycle, while this server knows the split between prompt
+            evaluation and decode.  Keeping both measurements lets future
+            playtests distinguish a long prefill from a slow/blocked handoff.
+            """
+            try:
+                total_ms = max(0.0, float(total_ns or 0) / 1_000_000.0)
+                decode_ms = max(0.0, float(getattr(result, "seconds", 0.0) or 0.0) * 1000.0)
+                prompt_ms = max(0.0, total_ms - decode_ms)
+                self.log_message(
+                    "generation path=%s prompt_tokens=%s completion_tokens=%s "
+                    "stop=%s total_ms=%.1f prompt_ms=%.1f decode_ms=%.1f",
+                    path,
+                    int(getattr(result, "prompt_tokens", 0) or 0),
+                    int(getattr(result, "tokens", 0) or 0),
+                    str(getattr(result, "stop_reason", "") or ""),
+                    total_ms,
+                    prompt_ms,
+                    decode_ms,
+                )
+            except Exception:
+                # Timing is diagnostic only; never change an otherwise valid
+                # generation response because logging failed.
+                pass
 
         # -- routes ------------------------------------------------------
 
@@ -300,9 +367,11 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             params = _params_from(body, defaults)
             n_predict = _int_param(body, ("n_predict", "max_tokens"), 256)
             stop = _stop_from(body)
+            t0 = time.perf_counter_ns()
             with lock:
                 ids = model.tok.encode(prompt)
                 res = chat.generate(model, ids, params, n_predict, stop_strings=stop)
+            self.log_generation("/completion", res, time.perf_counter_ns() - t0)
             self.send_json({
                 "content": res.text,
                 "tokens_predicted": res.tokens,
@@ -311,10 +380,20 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             })
 
         def chat_completions(self, body: dict):
+            t0 = time.perf_counter_ns()
             messages = _messages_from(body)
             params = _params_from(body, defaults)
             n_predict = _int_param(body, ("max_tokens", "max_completion_tokens"), 512)
             stop = _stop_from(body)
+            messages, fit_info = _fit_api_messages(model, messages, n_predict)
+            if fit_info.get("dropped_messages") or fit_info.get("compaction_passes"):
+                self.log_message(
+                    "chat prompt fitted: dropped=%s compacted=%s prompt_tokens=%s reserve=%s",
+                    fit_info.get("dropped_messages", 0),
+                    fit_info.get("compaction_passes", 0),
+                    fit_info.get("prompt_tokens", 0),
+                    fit_info.get("reply_reserve", 0),
+                )
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 
@@ -342,6 +421,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                             res = chat.chat_once(model, messages, params, n_predict,
                                                  stream=lambda s: piece({"content": s}),
                                                  stop_strings=stop)
+                        self.log_generation("/v1/chat/completions", res,
+                                            time.perf_counter_ns() - t0)
                         piece({}, finish=_finish_reason(res))
                     except Exception as e:
                         # the 200 and the first delta are already on the wire, so
@@ -359,6 +440,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
 
             with lock:
                 res = chat.chat_once(model, messages, params, n_predict, stop_strings=stop)
+            self.log_generation("/v1/chat/completions", res,
+                                time.perf_counter_ns() - t0)
             self.send_json({
                 "id": rid, "object": "chat.completion", "created": created,
                 "model": model_name,
@@ -439,6 +522,15 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                     body, {"message": {"role": "assistant", "content": ""}})
             messages = _messages_from(body)
             params, n_predict, stop = _ollama_options(body, defaults)
+            messages, fit_info = _fit_api_messages(model, messages, n_predict)
+            if fit_info.get("dropped_messages") or fit_info.get("compaction_passes"):
+                self.log_message(
+                    "chat prompt fitted: dropped=%s compacted=%s prompt_tokens=%s reserve=%s",
+                    fit_info.get("dropped_messages", 0),
+                    fit_info.get("compaction_passes", 0),
+                    fit_info.get("prompt_tokens", 0),
+                    fit_info.get("reply_reserve", 0),
+                )
             kwargs = {"json_only": True} if _wants_json(body) and _CHAT_JSON_ONLY else {}
             t0 = time.perf_counter_ns()
 
@@ -459,6 +551,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                                 model, messages, params, n_predict,
                                 stream=lambda s: self.ndline(line_for(s)),
                                 stop_strings=stop, **kwargs)
+                        self.log_generation("/api/chat", res,
+                                            time.perf_counter_ns() - t0)
                         self.ndline(line_for("", self.ollama_usage(
                             res, time.perf_counter_ns() - t0)))
                     except Exception as e:
@@ -474,6 +568,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
             with lock:
                 res = chat.chat_once(model, messages, params, n_predict,
                                      stop_strings=stop, **kwargs)
+            self.log_generation("/api/chat", res,
+                                time.perf_counter_ns() - t0)
             self.send_json(line_for(res.text, self.ollama_usage(
                 res, time.perf_counter_ns() - t0)))
 
@@ -523,6 +619,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                                 stream=lambda s: self.ndline(line_for(s)),
                                 stop_strings=stop, stop_tokens=stop_tokens,
                                 **kwargs)
+                        self.log_generation("/api/generate", res,
+                                            time.perf_counter_ns() - t0)
                         final = line_for("", self.ollama_usage(
                             res, time.perf_counter_ns() - t0))
                         final["context"] = []  # no per-request state is kept
@@ -538,6 +636,8 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 res = chat.generate(model, encode(), params, n_predict,
                                     stop_strings=stop, stop_tokens=stop_tokens,
                                     **kwargs)
+            self.log_generation("/api/generate", res,
+                                time.perf_counter_ns() - t0)
             out = line_for(res.text, self.ollama_usage(
                 res, time.perf_counter_ns() - t0))
             out["context"] = []

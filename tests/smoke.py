@@ -30,6 +30,18 @@ sys.path.insert(0, str(REPO))
 PASS = 0
 
 
+def _configure_utf8_console() -> None:
+    """Keep Unicode fixture labels printable on Windows CP1252 consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def check(label: str, ok: bool, detail: str = "") -> None:
     global PASS
     if ok:
@@ -56,6 +68,7 @@ def run_cli(*args, env=None, expect=0,
 
 
 def main() -> None:
+    _configure_utf8_console()
     tmp = Path(tempfile.mkdtemp(prefix="alpaccaroo-smoke-"))
     server = None
     # The storage-policy checks below assert exact HOST placement (which
@@ -1532,6 +1545,8 @@ def main() -> None:
         (legacy_dir / "manifest.json").write_text(json.dumps(
             {"name": "ghost:1b", "source": "ollama", "model_file": "model.gguf",
              "size": 15, "pulled_at": "2026-01-01T00:00:00Z"}), "utf-8")
+        (legacy_home / ".alpacca" / "model-nicknames.json").write_text(json.dumps(
+            {"nicknames": {"ghost-alias": "ghost:1b"}}), "utf-8")
         (legacy_home / ".alpaccaroo" / "models").mkdir(parents=True)
         saved_home_fn = _store.Path.home
         saved_env = os.environ.get("ALPACCAROO_HOME")
@@ -1549,6 +1564,14 @@ def main() -> None:
                   len(listed) == 1 and listed[0]["name"] == "ghost:1b"
                   and listed[0]["legacy_store"] is True,
                   json.dumps(listed, default=str))
+            check("a pre-rebrand nickname resolves its legacy model",
+                  _store.resolve_model_input("ghost-alias") == "ghost:1b",
+                  _store.resolve_model_input("ghost-alias"))
+            (legacy_home / ".alpaccaroo" / "model-nicknames.json").write_text(json.dumps(
+                {"nicknames": {"ghost-alias": "ghost:current"}}), "utf-8")
+            check("the current nickname file wins over the legacy file",
+                  _store.resolve_model_input("ghost-alias") == "ghost:current",
+                  _store.resolve_model_input("ghost-alias"))
             # the current store must win when the same model is in both
             cur = (legacy_home / ".alpaccaroo" / "models" / "ollama"
                    / "library" / "ghost" / "1b")
@@ -1569,6 +1592,11 @@ def main() -> None:
             os.environ["ALPACCAROO_HOME"] = str(legacy_home / ".alpaccaroo")
             check("an explicit ALPACCAROO_HOME disables the legacy fallback",
                   _store.legacy_models_roots() == [])
+            os.environ["ALPACCAROO_HOME"] = str(legacy_home / "isolated-home")
+            check("an explicit ALPACCAROO_HOME disables legacy nicknames",
+                  _store.legacy_nickname_files() == []
+                  and _store.resolve_model_input("ghost-alias") == "ghost-alias",
+                  _store.resolve_model_input("ghost-alias"))
         finally:
             _store.Path.home = saved_home_fn
             if saved_env is None:
@@ -2261,7 +2289,7 @@ def main() -> None:
         # a prompt of exactly n_ctx returned tokens=0/text='' with no signal.
         print("== context window ==")
         from alpaccaroo import chat as chat_mod
-        from alpaccaroo.chat import ChatFormat, fit_to_context, generate
+        from alpaccaroo.chat import ChatFormat, fit_messages_for_request, fit_to_context, generate
         ctx_model = Model.load(str(srv / "model.gguf"), n_ctx=32, progress=False)
         check("effective context window is reported next to the trained one",
               "ctx 32 of 256" in ctx_model.describe(), ctx_model.describe())
@@ -2377,6 +2405,22 @@ def main() -> None:
         _, cant = fit_to_context(fmt_ctx, huge, ctx_model.n_ctx, reserve=8)
         check("fitting keeps the newest turn even when it cannot fit",
               cant == 0 and len(huge) == 1)
+
+        api_messages = [
+            {"role": "system", "content": "identity and rules " * 180},
+            # Keep the newest fixture within the tiny raw-template context so
+            # the assertion tests preservation, not an impossible reply
+            # budget for a 32-token model.
+            {"role": "user", "content": "newest"},
+        ]
+        fitted_api, api_ids, api_fit = fit_messages_for_request(
+            fmt_ctx, api_messages, ctx_model.n_ctx, reserve=8)
+        check("API fitting compacts one oversized system message",
+              api_fit["compaction_passes"] > 0
+              and api_fit["fits"]
+              and len(api_ids) + 8 <= ctx_model.n_ctx
+              and fitted_api[-1]["content"] == "newest",
+              json.dumps(api_fit))
 
         # the REPL must survive a turn that cannot be answered: before, the
         # RuntimeError propagated out of cmd_run and took the conversation

@@ -228,6 +228,32 @@ def _hf_list_gguf(org: str, repo: str) -> list[dict]:
     return files
 
 
+def _hf_list_or_empty(org: str, repo: str) -> list[dict]:
+    """List a repo, treating only a missing repo as an empty result.
+
+    A previous version swallowed every HTTP/network error here and later
+    reported the misleading message "no .gguf files".  That made an offline
+    or blocked Hugging Face connection look like a bad model repository.
+    """
+    try:
+        return _hf_list_gguf(org, repo)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return []
+        raise RuntimeError(
+            f"Hugging Face returned HTTP {e.code} while listing "
+            f"{org}/{repo} at {_hf_endpoint()}") from e
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(
+            f"cannot reach Hugging Face at {_hf_endpoint()} while listing "
+            f"{org}/{repo}: {reason}") from e
+    except OSError as e:
+        raise RuntimeError(
+            f"cannot access Hugging Face at {_hf_endpoint()} while listing "
+            f"{org}/{repo}: {e}") from e
+
+
 def _basename(path: str) -> str:
     return path.rsplit("/", 1)[-1]
 
@@ -298,20 +324,14 @@ def _hf_collect_parts(files: list[dict], chosen: dict) -> list[dict]:
 def _pull_hf(ref: ModelRef, force: bool, verify: bool) -> LocalModel:
     print(f"fetching file list for {ref.ns}/{ref.name}", file=sys.stderr)
     repo = ref.name
-    try:
-        files = _hf_list_gguf(ref.ns, repo)
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
-        files = []
+    files = _hf_list_or_empty(ref.ns, repo)
     if not files and not repo.lower().endswith("-gguf"):
         # safetensors repos usually have a "<repo>-GGUF" sibling
         alt = repo + "-GGUF"
         print(f"no GGUF files in {ref.ns}/{repo} - trying {ref.ns}/{alt}", file=sys.stderr)
-        try:
-            files = _hf_list_gguf(ref.ns, alt)
-            if files:
-                repo = alt
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
-            pass
+        files = _hf_list_or_empty(ref.ns, alt)
+        if files:
+            repo = alt
     if not files:
         raise RuntimeError(
             f"no .gguf files in {ref.ns}/{ref.name} - alpaccaroo runs GGUF models "
