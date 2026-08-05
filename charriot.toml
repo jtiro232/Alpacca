@@ -34,9 +34,18 @@ threads_env = "ALPACCAROO_THREADS"
 
 # alpaccaroo's auto dense budget reads /sys/fs/cgroup/memory.max, which is the
 # ROOT cgroup and reads "max" on a host — it does NOT see Charriot's leaf
-# ceiling, so it would size against all 43 GiB free and densify ~28 GiB of
-# float32 weights straight into a cgroup kill. Pin it explicitly until that
-# lookup is cgroup-relative. 0 keeps every weight quantized (~4.6 GB).
+# ceiling, so it sizes against all the free RAM on the machine rather than
+# against this workload's share.
+#
+# With the alpaccaroo-kernels tier installed that lookup no longer decides
+# anything: the CLI keeps weights quantized whenever the kernels are active
+# (they stream 0.58-1.07 B/weight against dense float32's 4, so densifying
+# is a pessimisation), and the 8B settles at ~10.2 GiB resident. This pin
+# just states that intent so the config does not depend on which tier
+# happens to be installed — 0 is also what the auto-budget would choose.
+# Without the kernels it is load-bearing: the auto-budget would size from
+# the machine's free RAM and densify ~28 GiB straight into a cgroup kill.
+#
 # Inline table on purpose: a [workload.env] header here would swallow every
 # key below it into the env table.
 env = { ALPACCAROO_DENSE_WEIGHT_MB = "0" }
