@@ -49,6 +49,28 @@ def _nicknames_file() -> Path:
     return alpaccaroo_home() / "model-nicknames.json"
 
 
+def legacy_nickname_files() -> list[Path]:
+    """Return pre-rebrand nickname files that may still contain aliases.
+
+    The model store already reads pre-rebrand model directories, but the
+    nickname map is data too.  Ignoring ``~/.alpacca/model-nicknames.json``
+    makes an installed model such as ``qwenmed3b`` look like an unknown
+    Ollama name after the package rename.  Legacy nickname files are read
+    only; writes always target the current home through ``_write_nicknames``.
+    An explicit ``ALPACCAROO_HOME`` remains an isolated store by design.
+    """
+    if os.environ.get("ALPACCAROO_HOME"):
+        return []
+    home = Path.home()
+    current = _nicknames_file()
+    paths = []
+    for name in LEGACY_HOME_NAMES:
+        path = home / name / "model-nicknames.json"
+        if path != current and path.is_file():
+            paths.append(path)
+    return paths
+
+
 def _sanitize(part: str) -> str:
     out = re.sub(r"[^A-Za-z0-9._+-]", "_", part)
     return out if out not in ("", ".", "..") else "_"
@@ -203,8 +225,7 @@ def _quarantine_nicknames(path: Path, err: Exception) -> None:
           file=sys.stderr)
 
 
-def _read_nicknames() -> dict[str, str]:
-    path = _nicknames_file()
+def _read_nickname_file(path: Path, *, quarantine: bool) -> dict[str, str]:
     try:
         data = json.loads(path.read_text("utf-8"))
     except OSError:   # missing, unreadable, a directory - nothing to quarantine
@@ -214,7 +235,11 @@ def _read_nicknames() -> dict[str, str]:
         # JSON would otherwise fail every command that touches the map.
         # The file is readable but unusable - the next write would replace it,
         # so put it out of harm's way rather than destroying the only copy.
-        _quarantine_nicknames(path, e)
+        if quarantine:
+            _quarantine_nicknames(path, e)
+        else:
+            print(f"alpaccaroo: warning: {path} is unreadable ({e}); "
+                  f"model nicknames are being ignored", file=sys.stderr)
         return {}
     if isinstance(data, dict) and isinstance(data.get("nicknames"), dict):
         data = data["nicknames"]
@@ -231,6 +256,20 @@ def _read_nicknames() -> dict[str, str]:
         except ValueError:
             continue
     return out
+
+
+def _read_nicknames() -> dict[str, str]:
+    """Read current aliases, falling back to pre-rebrand aliases.
+
+    Legacy entries are loaded first so the current file wins on collisions.
+    The current file keeps the existing quarantine behavior; legacy files are
+    never moved or overwritten because they are migration sources of truth.
+    """
+    current = _nicknames_file()
+    merged = {}
+    for path in [*legacy_nickname_files(), current]:
+        merged.update(_read_nickname_file(path, quarantine=path == current))
+    return merged
 
 
 def _write_nicknames(nicknames: dict[str, str]) -> None:
