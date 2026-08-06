@@ -395,6 +395,7 @@ def serve(model: Model, model_name: str, host: str = "127.0.0.1", port: int = 80
                 )
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
+            t0 = time.perf_counter_ns()
 
             if body.get("stream"):
                 self.send_response(200)
